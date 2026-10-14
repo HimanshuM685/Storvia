@@ -2,8 +2,16 @@
   "name": "@storvia/sdk",
   "version": "0.1.0",
   "description": "TypeScript client for the Storvia Drive-first file storage API",
-  "license": "UNLICENSED",
-  "private": true,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shovan04/storvia.git",
+    "directory": "sdk/ts"
+  },
+  "bugs": {
+    "url": "https://github.com/shovan04/storvia/issues"
+  },
+  "homepage": "https://github.com/shovan04/storvia#readme",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",

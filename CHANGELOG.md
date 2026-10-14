@@ -17,6 +17,91 @@ Related documents:
 
 ---
 
+## 2026-10-14 — Open source the project: Apache-2.0 licence and public README
+
+Commit: *docs: add Apache-2.0 licence and rewrite the README for open source*
+
+### Why
+
+The owner intends to publish the repository. That requires a licence, and the
+existing README was written for a single reader continuing one piece of work rather
+than for an outside contributor who has never seen the project.
+
+### Decisions settled in this milestone
+
+| Decision | Value | Why |
+|---|---|---|
+| Licence | Apache License 2.0 | Permissive, and the explicit patent grant matters for a project integrating third-party storage APIs that someone may deploy commercially |
+
+MIT was the other candidate and is also permissive. Apache-2.0 was chosen because the
+patent grant is explicit, which is the relevant concern for an infrastructure
+project wrapping other vendors' APIs.
+
+**Not chosen: AGPL-3.0.** It would require anyone offering the service over a network
+to publish their modifications. That may be what the owner wants, but it is a
+business decision rather than a technical default, so it was not applied unilaterally.
+
+### Added
+
+- `LICENSE` — the verbatim Apache License 2.0 text, with the appendix copyright line
+  filled in as "Copyright 2026 Storvia contributors". The text was copied from a
+  known-unmodified Apache-2.0 file rather than transcribed, to avoid the corruption
+  that hand-copying a legal document invites.
+
+### Changed
+
+- `README.md` rewritten for an outside audience. It now leads with what the product
+  does and what it deliberately refuses to do, rather than opening with internal
+  project state. Specific changes:
+  - Added a licence badge and corrected the Go and TypeScript version badges. The Go
+    version was initially written as "1.24+" from memory and corrected to 1.27 to
+    match `go.mod`.
+  - Added an explicit table of what the no-copies rule costs a user: a failed download
+    during a Drive outage, fallback files staying on S3 permanently, and no recovery
+    after the loss of the only file. This belongs in the README rather than only in
+    the planning documents, because it is the first thing an adopter needs to know.
+  - Added requirements, quick start, Google OAuth setup, SDK usage, the API surface,
+    and a security-model section.
+  - Added contributing guidance pointing at `AGENTS.md` and the storage contract.
+  - Added a licence section naming Apache-2.0 and stating why, plus the licences of
+    the direct dependencies. **These were verified by reading each module's licence
+    file**, not from memory: AWS SDK for Go v2 is Apache-2.0, `pgx` is MIT,
+    `modernc.org/sqlite` and `go-redis` are BSD-3-Clause.
+  - Kept the status table honest. It states plainly that the S3 adapter has never been
+    run against a real bucket and that no path has touched a live Google account or
+    PostgreSQL.
+- `sdk/ts/package.json` — `license` changed from `UNLICENSED` to `Apache-2.0`, and
+  `private: true` removed so the package can actually be published. Added repository,
+  bugs, and homepage fields.
+
+### Verification gaps
+
+No code changed, so no provider or database verification is implicated. The
+dependency licence claims in the README were checked against the licence file in each
+module's directory under the module cache.
+
+Still outstanding for a public repository, and worth adding before the first release
+tag:
+
+- A `SECURITY.md` with a private disclosure contact. This project handles Google
+  refresh tokens and enforces tenant isolation, so a disclosure route is expected
+  rather than optional.
+- A `CONTRIBUTING.md` expanding the short section currently in the README.
+- GitHub issue and pull request templates.
+- A decision on publishing the SDKs to their public registries
+  (`github.com/shovan04/storvia/sdk/go` and `@storvia/sdk` on npm). The TypeScript
+  package name is currently unscoped and unclaimed.
+
+### Next step, in order
+
+Unchanged from the previous entry, and still ahead of any release work:
+
+1. Apply `migrations/postgres/0001_init.sql` to a real PostgreSQL instance.
+2. Implement the Drive resumable upload verbs.
+3. Run the M3 smoke test against a controlled Google account.
+
+---
+
 ## 2026-10-14 — Documentation: add the durable change log
 
 Commit: *docs: add CHANGELOG.md and make the changelog rule explicit*
