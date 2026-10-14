@@ -113,6 +113,43 @@ The service starts and serves health checks even when Google credentials are abs
 reporting the gap through `GET /v1/storage/status` rather than refusing to boot. A
 container that cannot start cannot explain why it is unready.
 
+### Container
+
+```sh
+docker build --target runtime --build-arg VERSION=1.0.0 -t storvia-api .
+
+docker run --rm -p 8080:8080 \
+  -e STORVIA_SESSION_SIGNING_KEY="$(openssl rand -base64 48)" \
+  -e STORVIA_ENCRYPTION_KEY="$(openssl rand -hex 32)" \
+  -e STORVIA_DATABASE_DSN="postgres://storvia:pass@host:5432/storvia?sslmode=require" \
+  storvia-api
+```
+
+The image is three stages: build, test, runtime. Only the runtime stage ships, and it
+is `distroless/static` — no shell, no package manager, running as a non-root user.
+Migrations are compiled into the binary, so there is no schema directory to copy and
+no chance of shipping a stale one.
+
+Secrets are supplied at run time only. Never pass one as a build argument or `COPY`
+it into the image: both leave a readable layer behind.
+
+A full local stack with Postgres and Redis:
+
+```sh
+docker compose up --build
+```
+
+This deliberately runs Postgres rather than SQLite. The two dialects differ in the
+job-lease query, identifier handling, and boolean representation, so the cheapest way
+to catch a migration that works locally and fails in production is to develop against
+the real thing.
+
+> The `Dockerfile` has **not been built**. No Docker daemon was available in the
+> environment where it was written. It is written against Go 1.27.1 and the module's
+> verified properties — the static build and the embedded migrations were both
+> confirmed directly — but treat the first `docker build` as a check to run, not a
+> step already done.
+
 ### Configuration
 
 Configuration is split deliberately:

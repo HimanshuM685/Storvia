@@ -17,6 +17,74 @@ Related documents:
 
 ---
 
+## 2026-10-14 — Containerization: Dockerfile, .dockerignore, compose stack
+
+Commit: *build: add multi-stage Dockerfile, .dockerignore, and a compose stack*
+
+### Why
+
+The project had no container definition, so it could not be deployed anywhere that
+expects an image.
+
+### Added
+
+- `Dockerfile` — three stages. `build` compiles a static binary, `test` runs vet,
+  unit tests, and the race detector so a failing suite fails the build rather than
+  producing an unchecked image, and `runtime` ships only the binary on
+  `distroless/static-debian12:nonroot`, which has no shell, no package manager, and
+  runs as a non-root user.
+- `.dockerignore` — excludes `.env*`, keys, local databases, build output, and
+  `node_modules` from the build context. Anything matched is invisible to the daemon,
+  which is the only reliable way to guarantee a credential cannot end up in a layer.
+- `docker-compose.yml` — Postgres, Redis, and the API, with health-gated startup so
+  migrations do not run against a database that is still booting.
+
+### Changed
+
+- `cmd/storvia-api/main.go` — added `version` and `commit` variables and a `-commit`
+  flag so `-ldflags "-X main.version=..."` actually has something to set. Previously
+  the `-version` output was a hardcoded string and the linker flag in the Dockerfile
+  would have been silently ignored, since the Go linker does not error on a `-X` for a
+  symbol that does not exist. The flag now reports the injected value, verified by
+  building with and without the ldflags.
+- `AGENTS.md` — added the rule that every meaningful change must also update the
+  author's private working memory, alongside the public changelog entry.
+- `README.md` — added a container section, including an explicit statement that the
+  image has not been built.
+
+### Verified, and not verified
+
+Verified directly:
+
+- `CGO_ENABLED=0 GOOS=linux go build` produces a working static binary, which is what
+  permits a distroless runtime. This works because the SQLite driver is a pure-Go
+  translation and needs no cgo.
+- Migrations are compiled in via `embed.FS`, confirmed by reading the directive, so
+  the runtime image needs no schema directory.
+- The version and commit ldflags now take effect.
+- `make check` passes.
+
+**Not verified: the Docker image has never been built.** No Docker daemon was
+available in the environment where the Dockerfile was written. The base image tags,
+the `RUN --mount=type=cache` BuildKit syntax, and the compose health-check invocation
+are all unexercised. The first `docker build` is a check to run.
+
+### Notes for whoever runs the build first
+
+- `golang:1.27-alpine` must exist on Docker Hub. If it does not, pin to the exact
+  patch tag.
+- The runtime stage has no shell and no `curl`, so an in-image `HEALTHCHECK` using
+  `curl` would silently never run. The health check therefore invokes the binary's
+  own `-check` flag, which validates configuration and exits.
+- The compose stack deliberately uses Postgres rather than SQLite.
+
+### Next step, in order
+
+Unchanged: run the PostgreSQL migration against a real instance, implement the Drive
+resumable upload verbs, then run the M3 smoke test against a controlled account.
+
+---
+
 ## 2026-10-14 — Attribution, SECURITY.md, and CONTRIBUTING.md
 
 Commit: *docs: add SECURITY.md and CONTRIBUTING.md, attribute copyright to shovan04*

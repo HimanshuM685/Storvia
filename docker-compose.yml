@@ -1,0 +1,89 @@
+# Local development stack.
+#
+# This runs Postgres rather than SQLite on purpose. SQLite is fine for a single
+# process, but the two dialects genuinely differ in the job-lease query,
+# identifier handling, and boolean representation. Running the development stack
+# against Postgres is the cheapest way to catch a migration that passes locally
+# and fails in production.
+#
+# Usage:
+#   docker compose up --build
+#   docker compose exec api /app/storvia-api -config /app/config/config.development.json -check
+
+name: storvia
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: storvia
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-storvia-dev-password}
+      POSTGRES_DB: storvia
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # The API must not start migrating before Postgres accepts connections.
+      test: ["CMD-SHELL", "pg_isready -U storvia -d storvia"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    # Access tokens and Drive circuit state are shared across instances. With a
+    # single replica the in-memory cache is equivalent; this is here so the
+    # multi-instance path is exercised before it is needed in production.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      target: runtime
+      args:
+        VERSION: dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      STORVIA_DATABASE_DSN: postgres://storvia:${POSTGRES_PASSWORD:-storvia-dev-password}@postgres:5432/storvia?sslmode=disable
+      STORVIA_REDIS_ADDRESS: redis:6379
+      STORVIA_REDIS_PASSWORD: ""
+      STORVIA_SESSION_SIGNING_KEY: ${STORVIA_SESSION_SIGNING_KEY:?set STORVIA_SESSION_SIGNING_KEY in .env}
+      STORVIA_ENCRYPTION_KEY: ${STORVIA_ENCRYPTION_KEY:?set STORVIA_ENCRYPTION_KEY in .env}
+      STORVIA_GOOGLE_CLIENT_ID: ${STORVIA_GOOGLE_CLIENT_ID:-}
+      STORVIA_GOOGLE_CLIENT_SECRET: ${STORVIA_GOOGLE_CLIENT_SECRET:-}
+      STORVIA_GOOGLE_REDIRECT_URI: ${STORVIA_GOOGLE_REDIRECT_URI:-http://localhost:8080/v1/storage/connections/google-drive/callback}
+      STORVIA_R2_ACCESS_KEY_ID: ${STORVIA_R2_ACCESS_KEY_ID:-}
+      STORVIA_R2_SECRET_ACCESS_KEY: ${STORVIA_R2_SECRET_ACCESS_KEY:-}
+    volumes:
+      - ./config:/app/config:ro
+    # The distroless runtime has no shell and no curl, so the health check runs the
+    # binary's own validation instead of probing an HTTP endpoint.
+    healthcheck:
+      test:
+        - CMD
+        - /app/storvia-api
+        - -config
+        - /app/config/config.production.json
+        - -check
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

@@ -1,0 +1,53 @@
+# Keep the build context small and keep secrets out of it.
+#
+# Anything matched here is invisible to the Docker daemon, which means it cannot
+# end up in a layer. That is the only reliable way to guarantee a credential does
+# not ship, as opposed to being unlikely to.
+
+# Secrets. These must never reach the daemon in the first place.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Version control and tooling
+.git
+.gitignore
+.github/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local databases. The container must never mount the host's database file.
+*.db
+*.db-shm
+*.db-wal
+
+# Private working notes
+PRIVATE-MEMORY.md
+*.private.md
+
+# Build output and caches. The image is built from source inside the daemon, so
+# host binaries are not just useless but potentially the wrong architecture.
+bin/
+dist/
+storvia-api
+coverage.out
+*.prof
+sdk/ts/node_modules/
+sdk/ts/dist/
+sdk/ts/*.tsbuildinfo
+
+# Documentation is not needed to run the service. The changelog, contributing
+# guide, and security policy have no business in a runtime image.
+docs/
+*.md
+!README.md
+
+# Docker's own files
+Dockerfile
+.dockerignore
+docker-compose.yml
