@@ -232,6 +232,46 @@ Important findings:
 - These features make AWS S3 a stronger fit than R2 when immutable retention, broad compliance controls, or advanced replication are requirements.
 - The provider-neutral application boundary should use the common S3 subset and expose advanced features through capability flags.
 
+## Go implementation references
+
+### 19. Go `net/http` package
+
+**Source:** Go standard library, `net/http`
+**URL:** <https://pkg.go.dev/net/http>
+
+Implementation notes:
+
+- Reuse configured `http.Client`/`Transport` instances rather than creating a client per request.
+- Pass request-scoped contexts through provider calls so API cancellation and deadlines reach outbound requests.
+- Close response bodies on every path and stream file content rather than buffering it in memory.
+- Configure server read/write/header/idle timeouts deliberately; upload deadlines are separate from Drive preflight deadlines.
+
+### 20. AWS SDK for Go v2 retries and timeouts
+
+**Source:** AWS SDK for Go v2 developer guide, “Retries and Timeouts”
+**URL:** <https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/configure-retries-timeouts.html>
+
+Implementation notes:
+
+- The SDK has configurable retryers and a default bounded retry policy, but the application coordinator still needs one overall operation budget.
+- The application must pass contexts with deadlines to SDK calls and handle cancellation without opening a second provider write.
+- Avoid infinite retries or multiplying SDK retries with coordinator retries; the AWS documentation warns that unbounded retries can create runaway work and billing.
+
+### 21. Google Drive resumable upload protocol
+
+**Source:** Google for Developers, “Upload file data”
+**URL:** <https://developers.google.com/workspace/drive/api/guides/manage-uploads>
+
+Implementation notes:
+
+- Drive resumable uploads provide a session URI and confirmed byte range for recovery.
+- After an interrupted request, query the session and use the returned range; do not assume the previous request was fully accepted.
+- A session `404` means the session must restart from the beginning; it does not authorize writing the same logical object to S3 without first resolving whether any provider write committed.
+
+## Current project decision record
+
+The current user-confirmed rule is narrower than some earlier research recommendations: Drive is the normal primary; S3-compatible storage is only for Drive unavailability; and Storvia does not maintain duplicate application-managed file copies. This is a single-location availability strategy, not an independent backup strategy. See [storage-policy.md](storage-policy.md) for error classification and the remaining trade-off.
+
 ## Community Wisdom
 
 The community evidence is useful but thin and anecdotal: the most relevant posts were implementation write-ups, not independent benchmarks or Google policy guidance. The consistent theme was that Drive's happy path is straightforward, while synchronization state, stale IDs, retries, and quota behavior require real design.

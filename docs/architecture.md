@@ -1,452 +1,314 @@
-# Proposed architecture
+# Proposed Go architecture
 
-This document turns the research into an implementation approach for a backend that catalogs application files in a database while storing the file bytes in the authenticated user's Google Drive by default, with policy-controlled AWS S3 or Cloudflare R2 fallback and optional replication.
+**Updated:** 2026-10-14
 
-## 1. System model
+**Status:** Design, not implemented. [Storage policy](storage-policy.md) defines the confirmed direction and conservative routing rules. The schema, package boundaries, and API below are implementation proposals.
+
+## 1. Components and authority
 
 ```text
-                                  +----------------------+
-                                  |  Google OAuth / Drive |
-                                  +----------+-----------+
-                                             |
-                                             | authorization code,
-                                             | access + refresh tokens
-                                             v
-+-------------+       +----------------------+---------------------+
-| Web/mobile  |<----->| Application API / storage service         |
-| client      |       | - user/session authorization              |
-+------+------+       | - OAuth callback and token refresh       |
-       |              | - Drive folder/file operations            |
-       |              | - provider routing and health             |
-       |              | - upload session coordinator              |
-       |              | - private download proxy                 |
-       |              +------------+------------------+------------+
-       |                           |                  |
-       |                           |                  |
-       v                           v                  v
-  upload chunks              +-----+------+     +-----+------+
-  or proxy stream            | App DB     |     | Job queue  |
-                             | catalog    |     | retries    |
-                             +------------+     +------------+
-                                      |
-                                      v
-                              provider object IDs,
-                             status, hashes,
-                             ownership metadata
+Client
+  |
+  v
+Go HTTP API: authentication, tenant checks, validation, streaming
+  |
+  v
+Upload coordinator + Drive availability classifier
+  |                       |
+  v                       v
+Drive adapter         S3-compatible adapter
+(normal writes)       (eligible outage writes only)
+  \                       /
+   \--- one location -----/
+
+Go API + workers -> metadata DB
+                   objects, uploads, attempts, jobs, health evidence
 ```
 
-The application database is authoritative for **which application user owns a logical object**, which provider is currently primary, and which replicas are ready. Each provider is authoritative for **whether its object still exists and what provider metadata it currently has**. The systems are reconciled; neither provider is assumed to be perfectly immutable.
+- The database controls ownership, idempotency, selected location, and durable workflow state.
+- The selected provider controls actual bytes and provider metadata. Reconciliation observes that provider; it never copies payloads elsewhere.
+- Workers resolve ambiguous results, confirm deletion, and clean abandoned uploads. There are no content-copy or migration workers.
+- Read-only preflight is an availability hint, not a guarantee that the next Drive write succeeds. Pin writes as soon as session initiation may have been sent.
 
-## 1.1 Provider roles and fallback semantics
+## 2. Identity, OAuth, and secrets
 
-Google Drive is the default primary for user-visible, user-owned files. AWS S3 or Cloudflare R2 may be selected as a fallback for a new upload when Drive is unavailable, full, revoked, or blocked. The provider is selected before the upload begins; an in-progress Drive resumable session cannot be converted into an S3 multipart upload.
+- Keep application sign-in separate from Drive authorization. Resolve the tenant/user from a verified application session, never from a supplied `user_id`.
+- Start with `drive.file` for app-created files in a visible folder; do not broaden scope to list unrelated Drive contents. Hidden app data is not part of the proposed MVP.
+- Exchange codes server-side; validate one-time OAuth state, exact redirect URI, browser-session binding, and PKCE where supported by the selected flow. Redirect to a clean URL afterward.
+- Encrypt refresh tokens with an externally managed encryption key. Persist scopes and connection status; keep access tokens short-lived and server-side.
+- Handle refresh under a per-connection lock; preserve a valid refresh token when a response omits it. `invalid_grant` requires reconnection, not fallback.
+- Company-managed S3 credentials are secret references, separate from per-user OAuth connections. Never send raw credentials to clients.
+- Redact tokens, codes, session URIs, signed URLs, user file names where sensitive, and raw error bodies in logs/traces.
 
-Failover and replication are separate policies:
+For the proposed visible folder, create `Storvia/` in the user's My Drive at connection setup. Save the folder ID; names are not unique. If the user deletes the folder, request explicit recovery rather than silently creating a replacement or falling back to S3. Folder creation needs its own idempotency/reconciliation handling.
 
-- **Failover** preserves the logical object but stores the new provider copy in S3/R2. It does not protect an existing Drive-only copy from later user deletion.
-- **Replication** creates a second verified provider copy for selected objects. It improves recoverability but creates a company-controlled copy that must be disclosed and included in deletion, retention, and disconnect policy.
+## 3. Single-location database model
 
-Reads use the provider recorded for the ready replica. The application must not blindly try Drive and then S3 unless both copies exist and the fallback policy explicitly permits that behavior.
+Proposed relational tables; PostgreSQL is recommended but not yet selected by the user. Do not introduce `storage_object_replicas` or primary/backup roles.
 
-## 2. Identity and Drive authorization
-
-### Do not conflate sign-in with storage consent
-
-Google sign-in answers: "Who is this person?"  
-Drive OAuth authorization answers: "May this application manage specific files in this person's Drive?"
-
-The lowest-friction flow is:
-
-1. Let the user create an application account with the company's normal identity flow.
-2. Offer **Connect Google Drive** as an explicit capability during onboarding or when the first backup/report is created.
-3. Explain that files will be written to the user's Drive, count against the user's Drive quota, and remain governed by Drive permissions.
-4. Request only the scopes needed for the selected feature.
-5. Record the granted scopes returned by Google. If a user declines a scope, keep the account usable and disable only Drive-backed features.
-
-Google's server-side OAuth flow requires an exact redirect URI, a random `state` value checked on callback, and `access_type=offline` when the backend needs to act while the user is away. The authorization code should be processed on the backend and followed by a redirect to a clean URL.
-
-### Scope choice
-
-| Scope | Use | Recommendation |
-|---|---|---|
-| `https://www.googleapis.com/auth/drive.file` | Create new files and modify files created/opened/shared with the app | Default for a visible application folder and app-created files. |
-| `https://www.googleapis.com/auth/drive.appdata` | App-only hidden application data | Use only for small configuration/sync state that users should not browse or share. |
-| `https://www.googleapis.com/auth/drive` | All Drive files | Avoid for this product unless a reviewed feature genuinely needs it. It is a restricted scope with substantially heavier verification/security implications. |
-
-The exact scope behavior must be validated in a proof of concept with the chosen Google Picker/folder UX. Do not silently switch to the broad `drive` scope because a narrow-scope call failed without first understanding which file was created/opened by the app.
-
-### Token handling
-
-Store only what the backend needs:
-
-- Google subject identifier (`sub`), not an email address as the durable identity key;
-- encrypted refresh token;
-- granted scope set;
-- token status and last successful refresh time;
-- connection state and revocation time.
-
-Access tokens are short-lived and should be held in memory only as needed. Refresh tokens are long-lived credentials and should be encrypted using a KMS/envelope-encryption design or the company's existing secrets/data protection service. Never log them, put them in URLs, return them to the browser, or commit them to source control.
-
-## 3. Drive folder layout
-
-For user-visible files, create one application-owned folder in the user's My Drive:
+### Connections and fallback configuration
 
 ```text
-My Drive/
-└── Company App/
-    ├── reports/
-    ├── uploads/
-    └── exports/
+drive_connections
+  id, tenant_id, user_id, google_subject
+  encrypted_refresh_token, key_reference, granted_scopes
+  root_folder_id, changes_cursor
+  status: connected | reauth_required | disconnected | blocked
+  last_success_at, created_at, updated_at
+
+storage_backends
+  id, scope: deployment | tenant, tenant_id (required for tenant scope)
+  provider: s3_compatible, vendor: aws_s3 | cloudflare_r2 | other
+  endpoint, region, bucket, credential_reference
+  status: active | disabled, capabilities, created_at, updated_at
 ```
 
-Keep the hierarchy shallow. The user may rename, move, share, or delete it. Store the folder ID and re-discover/recreate only under an explicit recovery policy; do not identify it by name alone because names are not unique.
+The deployment chooses one fallback backend initially. Tenant eligibility is enforced even for a shared bucket. Only trusted operator configuration can select endpoints; prevent SSRF through client-controlled endpoints or redirects.
 
-Use `appDataFolder` only when the user should not interact with the files. It is hidden from the Drive UI and accessible only to the app, but it cannot be shared, moved between storage spaces, or trashed through the API. That makes it a poor home for reports that the user is expected to find and download.
-
-### File naming and identity
-
-- Generate application logical IDs server-side.
-- Generate collision-resistant Drive names; do not use a user-provided name as the only identity.
-- Store a provider object pointer (`drive_file_id` for Drive or bucket/key for S3/R2), never a path, as a replica attribute.
-- Treat the Drive file ID as stable while the file exists; names and parent folders are mutable.
-- Optionally store an application object ID in Drive's private application properties when supported, but keep the database mapping authoritative.
-
-## 4. Database model
-
-The following is provider-neutral pseudocode. Adapt names and types to the company's database conventions.
-
-### `storage_connections`
+### Objects
 
 ```text
-id                         UUID / bigint primary key
-user_id                    application user foreign key
-provider                   enum('google_drive')
-provider_subject           Google OIDC sub, unique per provider
-encrypted_refresh_token   ciphertext / key reference
-granted_scopes             JSON array
-root_folder_id             nullable Drive file ID
-status                     connected | reauth_required | revoked | disconnected
-last_refresh_at            timestamp nullable
-last_success_at            timestamp nullable
-created_at, updated_at     timestamps
+storage_objects
+  id, tenant_id, user_id, logical_key, original_name, mime_type
+  expected_size, verified_size, checksum_algorithm, verified_checksum
+  provider: null | google_drive | s3_compatible
+  drive_connection_id (nullable), backend_id (nullable)
+  provider_file_id (nullable), provider_object_key (nullable)
+  status: pending | uploading | outcome_unknown | ready | blocked |
+          failed | deleting | deleted | missing
+  fallback_reason (nullable), selected_at, verified_at
+  row_version, created_at, updated_at, deleted_at
 ```
 
-Constraints:
+Constraints and checks:
 
-- unique `(user_id, provider)`;
-- unique `(provider, provider_subject)` where the product allows one connection per Google account;
-- never expose `encrypted_refresh_token` through application APIs.
+- A ready object has exactly one complete provider location, with matching verified size. Pending objects may have no location yet.
+- A Drive location has a tenant/user-matching Drive connection and file ID, with no S3 backend/key. An S3 location has one authorized backend/key and no Drive file pointer.
+- Unique provider identity per connection/backend; unique `(tenant_id, user_id, logical_key)`.
+- A ready location does not change on Drive recovery. API callers use logical IDs, not bucket keys or Drive file IDs as authority.
+- No file bodies in the metadata database. A checksum alone is neither a file copy nor sufficient ownership proof.
 
-User OAuth connections and company-managed S3/R2 credentials are different concerns. Keep S3/R2 access keys in a separate backend configuration or secret reference; do not model them as user OAuth connections.
-
-### `storage_backends`
+### Uploads, attempts, and jobs
 
 ```text
-id                         UUID / bigint primary key
-scope                      system | tenant
-provider                   enum('aws_s3', 'cloudflare_r2')
-endpoint                   provider endpoint
-bucket                     bucket name
-region                     nullable provider region (`auto` for R2)
-credential_ref             secret-manager/KMS reference, never raw credentials
-capabilities               JSON object for provider-specific feature support
-status                     active | draining | disabled
-created_at, updated_at     timestamps
+storage_uploads
+  id, object_id, tenant_id, user_id, idempotency_key, request_fingerprint
+  active_attempt_id, state, row_version, created_at, updated_at
+
+upload_attempts
+  id, upload_id, provider, connection_or_backend_reference
+  planned_provider_identity, encrypted_session_uri, multipart_upload_id
+  state: selected | initiating | active | verifying | outcome_unknown |
+         completed | cleanup_pending | aborted | failed
+  mutation_may_have_started, confirmed_offset, expected_size
+  parts_metadata, last_sanitized_error, operation_generation
+  lease_owner, lease_expires_at, created_at, updated_at
+
+storage_jobs
+  id, object_id, attempt_id, kind: reconcile | delete | cleanup
+  state, run_after, lease_owner, lease_expires_at, attempts, last_error
 ```
 
-### `storage_objects`
+Use a unique `(tenant_id, user_id, idempotency_key)` and bind the key to immutable request metadata. Reusing a key with different data returns conflict. Keep its mapping while an object/result or unresolved attempt still exists; retry-key expiry must not permit a duplicate provider write.
+
+Enforce one active or unresolved attempt per logical upload and keep historical attempts as metadata only. A DB lease expiring does not cancel an in-flight remote request. A replacement worker must reconcile that attempt before issuing any new mutation; row versions alone cannot fence a write already accepted by Drive.
+
+## 4. Go package layout
+
+Proposed module layout; keep provider details behind interfaces and keep HTTP handlers thin:
 
 ```text
-id                         application logical object ID
-user_id                    application user foreign key
-logical_key                app-generated key, not a user path
-original_name              user-facing name
-mime_type                  allow-listed declared type
-size_bytes                 expected/verified size
-checksum                   optional verified digest
-status                     pending | uploading | ready | degraded | failed | deleting | deleted | missing
-category                   upload | report | export | backup
-created_at, updated_at     timestamps
-deleted_at                 nullable timestamp
+cmd/storvia-api/main.go
+internal/
+  app/              dependency wiring and lifecycle
+  auth/             application sessions, tenant/user identity
+  httpapi/          routes, request decoding, response/error mapping
+  storage/
+    model/          logical objects, uploads, attempts, provider states
+    policy/         error classification, routing, retry budgets, transitions
+    service/        use cases and transaction boundaries
+    provider/       interfaces and capability-neutral types
+      drive/        OAuth, folders, resumable upload, media download
+      s3compat/     S3 API adapter, multipart/presigned operations
+  persistence/      repositories and migrations
+  jobs/             reconciliation, cleanup, leases, bounded retries
+  secrets/          token/key references and redaction boundaries
+  telemetry/        metrics, traces, sanitized structured logs
+migrations/
+docs/
 ```
 
-Constraints:
+Suggested interfaces:
 
-- unique `(user_id, logical_key)` if logical keys are reused;
-- ownership checks on every read, download, update, and delete.
+```go
+type Provider interface {
+	Name() string
+	Availability(ctx context.Context, scope AvailabilityScope) error
+	Initiate(ctx context.Context, meta ObjectMetadata) (Session, error)
+	UploadChunk(ctx context.Context, session Session, chunk Chunk) (Progress, error)
+	Complete(ctx context.Context, session Session) (ProviderObject, error)
+	InspectUpload(ctx context.Context, session Session) (UploadState, error)
+	Head(ctx context.Context, object ProviderObject) (ObjectMetadata, error)
+	Open(ctx context.Context, object ProviderObject, byteRange *ByteRange) (io.ReadCloser, error)
+	Delete(ctx context.Context, object ProviderObject) error
+	Abort(ctx context.Context, session Session) error
+}
 
-### `storage_object_replicas`
-
-```text
-id                         UUID / bigint primary key
-object_id                  storage object foreign key
-role                       primary | fallback | backup
-provider                   google_drive | aws_s3 | cloudflare_r2
-connection_id              nullable user Drive connection foreign key
-backend_id                 nullable system/tenant backend foreign key
-provider_file_id           nullable Drive file ID
-provider_object_key        nullable S3/R2 bucket key
-status                     pending | uploading | ready | missing | deleting | deleted
-checksum                   verified digest
-size_bytes                 verified provider size
-last_verified_at           timestamp nullable
-created_at, updated_at     timestamps
+type Router interface {
+	Select(ctx context.Context, request UploadRequest) (Selection, error)
+}
 ```
 
-Constraints:
+The Go service owns policy, transitions, idempotency, and tenant checks. Providers own HTTP details, OAuth token use, signing, status parsing, and provider-specific error normalization. Provider adapters must never update application rows directly.
 
-- exactly one of `connection_id` and `backend_id` is set;
-- unique `(provider, provider_file_id)` for Drive replicas;
-- unique `(backend_id, provider_object_key)` for S3/R2 replicas;
-- at most one active `primary` replica per logical object;
-- ownership checks on every read, download, update, and delete.
+The initial implementation may expose Drive and S3/R2 through different upload mechanics behind the same service: backend-proxied Drive chunks and short-lived presigned/multipart S3 requests. Do not force both providers into a misleading common resumable protocol.
 
-### `storage_uploads`
+## 5. HTTP API proposal
+
+The API is provider-neutral and tenant-scoped:
 
 ```text
-id                         upload attempt ID
-object_id                  storage object foreign key
-replica_id                 storage replica foreign key
-provider                   google_drive | aws_s3 | cloudflare_r2
-idempotency_key            client/server retry key
-provider_session_uri       nullable encrypted Drive capability
-provider_multipart_id      nullable S3/R2 multipart upload ID
-expected_size              bytes
-next_known_offset          nullable bytes
-state                      initiated | active | completed | expired | aborted
-attempt_count              integer
-last_error_code            sanitized provider/application code
-expires_at                 timestamp
-created_at, updated_at     timestamps
-```
+GET    /v1/storage/status
+GET    /v1/storage/connections/google-drive
+POST   /v1/storage/connections/google-drive/start
+GET    /v1/storage/connections/google-drive/callback
+DELETE /v1/storage/connections/google-drive
 
-Do not return the session URI from ordinary object-listing endpoints. If the URI is stored, encrypt it and expire it with the upload record.
-
-## 5. Upload flow
-
-### API shape
-
-Keep the public API provider-neutral:
-
-```text
 POST   /v1/storage/uploads
-PATCH  /v1/storage/uploads/{upload_id}
+GET    /v1/storage/uploads/{upload_id}
+PATCH  /v1/storage/uploads/{upload_id}/chunks
 POST   /v1/storage/uploads/{upload_id}/complete
+POST   /v1/storage/uploads/{upload_id}/reconcile
 DELETE /v1/storage/uploads/{upload_id}
+
 GET    /v1/storage/objects/{object_id}
 GET    /v1/storage/objects/{object_id}/content
 DELETE /v1/storage/objects/{object_id}
-POST   /v1/storage/connections/google-drive
-DELETE /v1/storage/connections/google-drive
 ```
 
-The API should not expose `drive/v3/files` semantics to the rest of the product. The Google Drive adapter implements those details behind the storage interface.
+Rules:
 
-### Initiation
+- All object/upload identifiers are opaque application IDs. Never accept provider IDs, bucket keys, or a client-selected provider as authority claims.
+- `POST /uploads` requires a stable `Idempotency-Key`, immutable metadata, tenant authorization, and configured fallback consent.
+- The response identifies the selected mode (`drive_proxy`, `s3_presigned_parts`, or a safe future mode) without returning refresh tokens, S3 credentials, or Drive session URLs through list/detail endpoints.
+- A fallback selection response is a new upload attempt for the same logical object; it is not a second ready object.
+- `complete` is idempotent. Repeating it returns the existing verified object or its current pending/unknown status.
+- `reconcile` is authenticated and rate-limited. It checks only the selected provider and updates `outcome_unknown`; it does not create a second location.
+- Content download authorizes the application user first, then streams the recorded provider. Range requests must preserve safe headers and tenant checks.
 
-1. Authenticate the application session.
-2. Validate an allow-list of MIME types, maximum size, category, and applicable user/provider quota.
-3. Generate the logical object ID, logical key, and provider-safe object name/key on the server.
-4. Ask the provider router to select Drive or an S3/R2 backend based on file policy, connection state, provider health, and fallback rules.
-5. Insert the object, replica, and upload rows with `pending`/`initiated` status.
-6. Start the selected provider upload: Drive resumable upload for Drive, or multipart/presigned upload for S3/R2.
-7. Store the provider session or multipart state encrypted with an expiry timestamp.
-8. Return only the application upload ID and the minimum data the client needs to send chunks or parts.
+### Upload request
 
-The router must select one provider before data transfer begins. A Drive upload session cannot be converted to an S3/R2 multipart upload after a partial transfer. If Drive fails before or during an upload and policy permits failover, retain the same logical object ID, create a new provider-specific upload attempt, and require the client to replay the remaining bytes or restart the upload.
+```json
+{
+  "name": "report.pdf",
+  "mime_type": "application/pdf",
+  "size_bytes": 10485760,
+  "category": "report"
+}
+```
 
-### Failover and replication flow
+The server generates `object_id`, `logical_key`, and provider-safe names. It validates declared size and type before any provider mutation and applies server-side byte limits while streaming. Client MIME is metadata, not malware/content validation.
 
-For **failover**:
+## 6. Routing and upload state machine
 
-1. Retry Drive only for bounded, documented transient failures.
-2. If the failure is eligible for fallback, mark the Drive attempt `aborted` or `expired` and retain the logical object/upload ID.
-3. Create a new S3/R2 replica and return a new provider-specific upload plan.
-4. Verify the S3/R2 object with `HEAD` and checksum/size checks before marking it `ready`.
+### Preflight routing
 
-For **replication**:
+1. Authenticate the application session and resolve tenant/user from the session.
+2. Check allowed category, declared size, MIME allow-list, rate limits, fallback consent, and active provider configuration.
+3. Load the user's Drive connection and run a bounded, read-only Drive availability check. Use narrow fields and the app folder; do not list unrelated user files.
+4. Classify the result using `docs/storage-policy.md`.
+5. Select Drive on success. Select the configured S3-compatible provider only for an eligible availability failure and only before a provider mutation.
+6. Write the selected provider, provider identity, and routing evidence to the DB transaction before starting provider upload initiation.
 
-1. Mark the Drive primary `ready` only after Drive confirms the final file metadata.
-2. Enqueue a copy job using a bounded worker; do not hold the user request open.
-3. Stream the Drive object to S3/R2 or use a provider-side copy where supported.
-4. Verify size and checksum, then mark the backup replica `ready`.
-5. Mark the logical object `degraded` and alert/retry if the backup is not ready within policy.
+The preflight result is not a lease on Drive. If Drive fails after initiation starts, the attempt remains pinned to Drive until its result is reconciled. The router never performs a blind second write.
 
-Replication must be idempotent and must not create a new logical object when a copy job is retried.
+### Drive path
 
-### Drive upload mode
+1. Create or find the app folder using the stored ID and explicit recovery policy.
+2. Start a Drive resumable upload with server-generated metadata.
+3. Store the session URI encrypted, with expiry and attempt generation.
+4. Proxy chunks in the first MVP so the session URI stays server-side.
+5. On each response, use Drive's confirmed `Range`; after an ambiguous response, query session status before sending more bytes.
+6. On final success, inspect the returned file ID/size/MIME, then commit one `ready` location.
 
-There are two viable modes:
+### S3-compatible fallback path
 
-#### Mode A — backend-proxied chunks (safer default)
+1. Select the configured backend and generate a tenant-scoped key from the logical object ID and attempt generation.
+2. Create one multipart upload or signed upload plan. The browser receives only short-lived, operation-scoped capabilities.
+3. Complete the multipart upload idempotently.
+4. `HeadObject`/equivalent and compare expected size, content type, and checksum where available.
+5. Commit the same logical object as one `ready` S3 location. It stays on S3 after Drive recovers.
 
-The browser sends chunks to our API. The API validates the application session and forwards each chunk to the stored Drive resumable session URI.
+Do not enable a copy job, dual-write, provider-side replication, or automatic S3-to-Drive migration as part of this project. Provider durability/replication internal to the selected vendor is outside the application-managed copy invariant.
 
-Advantages:
-
-- the Drive session URI never leaves the backend;
-- the backend can enforce user, object, size, MIME, rate, and state checks on every chunk;
-- the client never receives a provider capability.
-
-Costs:
-
-- application bandwidth and request concurrency are consumed;
-- large uploads occupy backend connections for longer;
-- infrastructure must support streaming without buffering whole files.
-
-#### Mode B — direct browser-to-Drive session
-
-The backend starts the Drive session and returns the session URI to the authorized browser. The browser sends `PUT` requests directly to that URI.
-
-Advantages:
-
-- lower backend bandwidth and better large-upload scalability;
-- the browser can show direct progress.
-
-Costs:
-
-- the session URI becomes a sensitive upload capability;
-- application-level authorization and rate limits are enforced only at initiation unless the backend wraps the session;
-- CORS/client behavior and retry handling must be tested across browsers;
-- the provider session is not the same documented contract as an S3 presigned URL with an application-selected short expiry and policy conditions.
-
-**Recommendation:** start with Mode A for private reports and sensitive files. Add Mode B only after a threat review and load test. If Mode B is used, bind the application upload ID to the session, give the URI only to the intended authenticated client over TLS, never log it, cap the file at the application layer before initiation, and expire/abort the application upload when the client abandons it.
-
-### S3/R2 upload mode
-
-For AWS S3 or Cloudflare R2, prefer direct browser-to-storage multipart uploads using short-lived, provider-generated presigned URLs. The backend must generate the bucket key from the logical object ID and never accept a client-proposed path.
-
-The backend must:
-
-- bind every presigned operation to one logical object, upload attempt, and part number;
-- constrain content type where the provider supports signing it;
-- keep the bucket private and treat every presigned URL as a bearer capability;
-- verify the completed object with `HEAD`, expected size, content type, and checksum before `ready`;
-- use idempotency keys for initiation and completion;
-- abort abandoned multipart uploads and reconcile orphaned objects;
-- use only the common S3 API subset unless the selected backend capability explicitly supports more.
-
-Do not treat an S3/R2 event notification as the database source of truth. Events can trigger asynchronous processing, but the explicit completion path, provider `HEAD`, and periodic reconciliation determine object readiness.
-
-### Chunking and resumption
-
-Drive's documented resumable protocol is:
-
-1. `POST` the upload initiation request and save the `Location` session URI.
-2. Upload data with `PUT`.
-3. For chunked mode, use chunk sizes that are multiples of 256 KiB except for the final chunk.
-4. Send `Content-Length` and `Content-Range` for each chunk.
-5. On `308 Resume Incomplete`, inspect the returned `Range` and begin at the next byte. Do not assume all bytes in the previous request were accepted.
-6. On a network interruption or 5xx, query status with an empty `PUT` and `Content-Range: bytes */<total>`.
-7. On `404`, treat the session as expired and restart with a new session. Drive documents that resumable sessions expire after one week of inactivity.
-8. On a successful final response (`200` or `201`), verify the returned file ID and metadata before marking the object `ready`.
-
-Use a bounded retry policy with jitter. Retry transient network errors, 5xx responses, and documented rate-limit responses; do not blindly retry validation, authorization, quota, or invalid-file errors.
-
-### Idempotency
-
-The client may retry after it uploads a chunk but before receiving a response. The server must make retries safe:
-
-- use one stable upload ID per selected file;
-- use an idempotency key for initiation and completion;
-- do not create a new Drive file on every client retry;
-- persist the last known offset and query Drive when uncertain;
-- allow exactly one completion transition from `uploading` to `ready`;
-- run a cleanup job for abandoned `pending` objects and orphaned Drive files.
-
-## 6. Download flow
-
-### Private application download
-
-`GET /v1/storage/objects/{id}/content` should:
-
-1. authenticate the application user;
-2. load the object row and verify `object.user_id == session.user_id`;
-3. select a `ready` replica according to the object's provider and fallback policy;
-4. for Drive, refresh the Google access token server-side and call `files.get` with `alt=media` and the stored file ID;
-5. for S3/R2, stream `GetObject` through the backend or return a short-lived presigned GET URL according to the file's privacy policy;
-6. forward safe content headers and support HTTP range requests where the backend/client requires them;
-7. translate provider errors into stable application errors without leaking Google token/provider payloads.
-
-Drive's browser `webContentLink` and S3/R2 presigned URLs can be offered only when the user's privacy policy permits them. They are bearer capabilities, not replacements for our authorization check, and they should not be stored as canonical object URLs.
-
-### Public or externally shareable downloads
-
-Do not grant `anyone` permissions merely to imitate a public object URL. A Drive permission is an ACL change on the user's file, can be copied/shared by recipients, and may conflict with Workspace policies. For public assets, use a company-controlled object-storage/CDN path instead.
-
-## 7. Deletion, user edits, and synchronization
-
-Users can act in Drive outside the application. The application must expect:
-
-- a user renaming a file;
-- a user moving the folder or file;
-- a user sharing a file;
-- a user trashing or permanently deleting a file;
-- an administrator blocking the app;
-- the user revoking OAuth access;
-- the folder being deleted and later recreated with the same name.
-- a fallback or backup object being deleted, expired, or made unavailable by the backend provider.
-
-Store a Drive changes page token per connection. On a scheduled worker:
-
-1. call `changes.list` from the saved token;
-2. process every page in order;
-3. update local metadata for known file IDs;
-4. mark removed files `missing` rather than silently recreating them;
-5. save `newStartPageToken` only after processing the page successfully;
-6. use a periodic full reconciliation of the app folder as a backstop.
-
-For S3/R2 replicas, periodically list the configured prefix and compare it with `storage_object_replicas`. Mark missing provider objects explicitly, clean up orphaned objects only after a grace period, and never recreate a deleted Drive object solely because a same-named object exists in a bucket.
-
-Drive push notifications are hints that changes are available, not complete events: the notification body is empty and the application must call the changes feed or `files.get`. Notification channels expire and must be renewed, so do not make a webhook the only consistency mechanism.
-
-### Disconnect policy
-
-When a user disconnects Google Drive:
-
-- stop creating new provider requests immediately;
-- revoke the stored refresh token if the product's policy requires revocation;
-- mark the connection `disconnected`;
-- retain only the minimum metadata needed for support, billing, audit, or a user-requested migration;
-- tell the user whether their Drive files remain in their Drive or whether the app will delete them;
-- tell the user whether S3/R2 fallback or backup copies remain available, and under which retention policy;
-- if deletion is requested, queue deletion across all replicas and report failures rather than claiming success before each provider confirms it.
-
-If a refresh returns `invalid_grant`, transition to `reauth_required`, stop background work, and ask the user to reconnect. Do not retry an invalid refresh token forever.
-
-## 8. Error translation
-
-| Provider signal | Application behavior |
-|---|---|
-| `401` / `authError` | Refresh once; if refresh fails, mark `reauth_required`. |
-| `403 storageQuotaExceeded` | Mark upload blocked by user quota; explain that the user must free Drive space or add capacity. |
-| `403 rateLimitExceeded` / `userRateLimitExceeded` | Exponential backoff with bounded retries; queue rather than failing every client request. |
-| `403 domainPolicy` | Explain that the user's Workspace administrator blocks the app; provide reconnect/support guidance. |
-| `403 insufficientFilePermissions` | Mark the object unavailable and require user/admin permission recovery. |
-| `404 notFound` | Re-fetch metadata once; if still missing, mark `missing` and surface a recoverable state. |
-| `404` on upload session | Restart the resumable session, not the logical object. |
-| `429` | Backoff and retry within a deadline. |
-| `500–504` | Resume/query upload state or retry idempotently. |
-| S3/R2 `403` / `SignatureDoesNotMatch` | Do not retry indefinitely; refresh the signing/configuration path and mark the provider degraded if the bounded retry budget is exhausted. |
-| Provider unavailable after retry budget | If policy permits, create a new provider-specific attempt for the same logical object; never switch providers inside an existing session. |
-| invalid MIME, size, or ownership | Reject without retrying. |
-
-Log a stable internal error code, object ID, replica/backend ID, provider object ID where safe, retry count, and request correlation ID. Never log access keys, refresh tokens, session URIs, presigned URLs, authorization codes, or full provider error payloads if they could contain sensitive data.
-
-## 9. Provider abstraction
-
-Define an internal interface such as:
+### State transitions
 
 ```text
-StorageProvider.connect(context, authorization) -> connection
-StorageProvider.initiate_upload(connection, object_metadata) -> upload_session
-StorageProvider.upload_chunk(upload_session, bytes, content_range) -> progress
-StorageProvider.complete_upload(upload_session) -> provider_object
-StorageProvider.get_download_stream(connection, provider_object) -> stream
-StorageProvider.delete(connection, provider_object) -> result
-StorageProvider.reconcile(connection, cursor) -> changes + new_cursor
-StorageProvider.head(provider_object) -> verified_metadata
-StorageProvider.capabilities() -> capability_set
+pending -> selected -> initiating -> active -> verifying -> ready
+                         |             |          |
+                         |             |          +-> outcome_unknown
+                         |             +-> outcome_unknown
+                         +-> failed / blocked
+
+outcome_unknown -> active   (same provider, after reconciliation)
+outcome_unknown -> failed   (confirmed no committed object)
+failed/blocked -> selected  (new attempt only after cleanup/reconciliation)
+ready -> deleting -> deleted | missing
 ```
 
-The rest of the application should depend on logical object IDs and application policies, not on Google Drive file IDs, folder paths, bucket keys, Google MIME quirks, S3 ETags, or provider error names. This makes fallback, replication, and later provider migration adapter/data-migration work instead of an application-wide rewrite.
+`outcome_unknown` is not a provider outage classification. It means Storvia cannot yet know whether the selected provider accepted a mutation. It is never eligible for immediate cross-provider failover.
+
+## 7. Failure classification and retry budgets
+
+Provider adapters return normalized errors containing operation, provider, HTTP/status class, provider reason where safe, retryability, and `mutation_may_have_started`. They do not expose raw provider payloads to clients.
+
+| Class | Examples | Coordinator action |
+|---|---|---|
+| Validation | invalid MIME, size, tenant, object state | Reject; no provider retry |
+| Authentication/authorization | expired token, `invalid_grant`, admin block, insufficient permission | Reconnect or resolve policy; no S3 fallback |
+| User/provider quota | Drive full, `storageQuotaExceeded`, Drive rate limit | Explain/backoff; no S3 fallback under current policy |
+| Availability before mutation | bounded DNS/connect timeout, connection reset, 500/502/503/504 during read-only preflight | Eligible for S3 selection if all gates pass |
+| Availability after mutation | timeout or transport error after request may have been sent | `outcome_unknown`; same-provider reconciliation |
+| Provider transient after confirmed session | 5xx/rate-limit during Drive/S3 transfer | Bounded retry/resume on same provider |
+| Missing selected object | Drive/S3 404 after reconciliation | Mark `missing`; do not recreate or switch location automatically |
+| Configuration/security | invalid endpoint, signature mismatch, TLS verification failure, missing credentials | Disable/degrade backend, alert; no blind retry |
+
+Use context deadlines, bounded exponential backoff with jitter, and one coordinator-wide budget. The AWS SDK's retryer must not create unbounded or multiplied retries. A timeout is never treated as proof that a write failed.
+
+## 8. Downloads, deletion, and reconciliation
+
+### Download
+
+- Load object by tenant-scoped logical ID and require `ready`.
+- Open only the recorded provider location. Do not try a second provider because Drive is currently down; there is no copy.
+- For Drive, refresh OAuth server-side and use media download with range support where needed.
+- For S3/R2, proxy `GetObject` by default; use a short-lived presigned GET only where the privacy model explicitly allows it.
+- Translate provider missing/auth/quota errors into stable application states without exposing credentials or signed URLs.
+
+### Delete
+
+- Set the logical object to `deleting` in a transaction and pin deletion to its recorded provider.
+- Treat a confirmed provider `404` as already absent only after checking the provider error semantics; do not claim deletion before a confirmed result or a documented already-absent result.
+- Retry a failed delete through a job. Never delete a same-named object in another provider.
+- After deletion, retain only minimal metadata required by legal, audit, support, or idempotency policy. Do not retain bytes.
+
+### Reconciliation
+
+- Drive: store and advance a changes cursor only after each page is processed; use push notifications only as wake-up hints.
+- S3/R2: inspect only the selected key on ambiguous attempts and periodically list the Storvia-controlled prefix for orphan detection. Listing is cleanup evidence, not permission to recreate objects.
+- A reconciliation job may conclude `ready`, `failed`, `missing`, `cleanup_pending`, or `outcome_unknown`; it may not write content to a different provider.
+- Orphan cleanup needs a grace period and audit record because a delayed DB commit or lost response can make a valid object look orphaned.
+
+## 9. Observability and security
+
+Metrics:
+
+- Drive preflight success, timeout, transient failure, latency, and circuit state by tenant/provider region;
+- upload initiation, chunk/part, completion, verification, and outcome-unknown counts;
+- fallback count and reason, with no file content or credentials;
+- provider retry counts, queue age, reconciliation age, orphan cleanup, and missing-file count;
+- bytes sent/received and request duration percentiles.
+
+Every state transition gets a correlation ID, tenant ID, logical object ID, upload/attempt ID, provider, operation, normalized error class, and attempt generation. Avoid provider file IDs and names in broad telemetry unless needed and redacted.
+
+Security tests must cover OAuth state/tenant mix-up, IDOR by object ID, cross-tenant backend selection, signed URL leakage, session URI leakage, client-controlled object key, size-limit bypass, replayed completion, duplicate idempotency keys, and deletion authorization.
