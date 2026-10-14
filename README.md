@@ -186,6 +186,7 @@ complete on mocked tests alone.
 | File | Purpose |
 |---|---|
 | [AGENTS.md](AGENTS.md) | Persistent working rules, including Markdown updates |
+| [CHANGELOG.md](CHANGELOG.md) | What changed, what broke, what was verified, and what is still missing |
 | [docs/storage-policy.md](docs/storage-policy.md) | Confirmed storage contract, error classification, no-copies rules |
 | [docs/architecture.md](docs/architecture.md) | Components, single-location schema, API, and lifecycle |
 | [docs/implementation-plan.md](docs/implementation-plan.md) | Go build plan, acceptance tests, actual checks, next step |

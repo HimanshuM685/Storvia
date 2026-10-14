@@ -278,6 +278,11 @@ After each meaningful implementation change, update the relevant Markdown with:
 - remaining risk or blocked decision;
 - the exact next step for a future session.
 
+**Append an entry to `CHANGELOG.md` as part of the same change.** Updating this plan
+or the README is not a substitute: the changelog is the chronological record of what
+was done, what was verified, and what was deliberately left undone, which is what a
+future session reads first.
+
 Never write "passed" for a planned check. Keep provider incidents and raw private
 payloads out of this documentation.
 
