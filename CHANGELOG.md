@@ -17,6 +17,56 @@ Related documents:
 
 ---
 
+## 2026-10-14 — Attribution, SECURITY.md, and CONTRIBUTING.md
+
+Commit: *docs: add SECURITY.md and CONTRIBUTING.md, attribute copyright to shovan04*
+
+### Why
+
+The owner confirmed the project's creator as **shovan04** and asked for the two
+community documents a public repository is expected to have.
+
+### Changed
+
+- `LICENSE` — copyright attribution corrected from "Storvia contributors" to
+  **"Copyright 2026 shovan04"**. The earlier wording was an invention: the author's
+  identity was not known when the licence was written, and inventing a collective
+  holder for a single-author project was the wrong default.
+- `README.md` — contributing section now points at `CONTRIBUTING.md`, the
+  documentation table lists both new files, and the contributing section carries a
+  pointer to `SECURITY.md` so a reporter does not open a public issue.
+
+### Added
+
+- `SECURITY.md` — private disclosure through GitHub Security Advisories, with a
+  maintainer note that the feature must be enabled under Settings → Security or the
+  path will not work. Includes a scope table naming tenant isolation, secret handling,
+  OAuth, the single-location invariant, injection, and capability leakage as
+  high-severity in-scope areas; the TypeScript SDK is in scope too, since incorrect
+  idempotency handling there causes duplicate uploads. Also lists the known
+  limitations that are *not* vulnerabilities, so a reporter does not file the
+  no-copies trade-offs as bugs, and states that the project has not completed a
+  security review.
+- `CONTRIBUTING.md` — setup, the `make` targets, and the two project rules expected of
+  a change: the storage contract is load-bearing and the tests in
+  `internal/storage/policy` must mirror `docs/storage-policy.md` row for row, and a
+  rule should be enforced structurally where possible rather than left to reviewers.
+  Names the specific mistakes the existing tests are written to catch, so a
+  contributor learns them from the test file.
+
+### Still outstanding for a first release tag
+
+- GitHub issue and pull request templates
+- A decision on publishing the SDKs to public registries. The TypeScript package name
+  `@storvia/sdk` is unscoped and unclaimed.
+
+### Next step, in order
+
+Unchanged: apply the PostgreSQL migration to a real instance, implement the Drive
+resumable upload verbs, then run the M3 smoke test against a controlled account.
+
+---
+
 ## 2026-10-14 — Open source the project: Apache-2.0 licence and public README
 
 Commit: *docs: add Apache-2.0 licence and rewrite the README for open source*
@@ -44,7 +94,7 @@ business decision rather than a technical default, so it was not applied unilate
 ### Added
 
 - `LICENSE` — the verbatim Apache License 2.0 text, with the appendix copyright line
-  filled in as "Copyright 2026 Storvia contributors". The text was copied from a
+  filled in as "Copyright 2026 shovan04". The text was copied from a
   known-unmodified Apache-2.0 file rather than transcribed, to avoid the corruption
   that hand-copying a legal document invites.
 

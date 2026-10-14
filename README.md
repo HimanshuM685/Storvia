@@ -291,21 +291,29 @@ behaviour, that package and its table-driven tests are the place to change it.
 
 ## Contributing
 
-Issues and pull requests are welcome. Please read [`AGENTS.md`](AGENTS.md) first: it
-records the working rules this project is held to, including the requirement that
-every meaningful change appends an entry to [`CHANGELOG.md`](CHANGELOG.md) and never
-describes an unrun check as passed.
+Issues and pull requests are welcome. Start with
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for setup and the checks, and
+[`AGENTS.md`](AGENTS.md) for the working rules this project is held to.
 
-The storage contract in [`docs/storage-policy.md`](docs/storage-policy.md) is
-load-bearing. Changes to it should come with table-driven tests in
-`internal/storage/policy` that mirror the document row for row, so the code and the
-document cannot drift apart.
+Two things to know before you change the routing behaviour:
+
+- The storage contract in [`docs/storage-policy.md`](docs/storage-policy.md) is
+  load-bearing. Changes should come with table-driven tests in
+  `internal/storage/policy` that mirror the document row for row, so the code and
+  the document cannot drift apart.
+- Every meaningful change appends an entry to [`CHANGELOG.md`](CHANGELOG.md), and no
+  unrun check is ever described as passed.
+
+**Found a security problem?** Do not open a public issue. See
+[`SECURITY.md`](SECURITY.md).
 
 ## Documentation
 
 | Document | Purpose |
 |---|---|
 | [`CHANGELOG.md`](CHANGELOG.md) | What changed, what broke, what was verified, what is missing |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Setup, checks, and the two project rules to respect |
+| [`SECURITY.md`](SECURITY.md) | Reporting a vulnerability privately; known limitations |
 | [`docs/storage-policy.md`](docs/storage-policy.md) | The confirmed storage contract and error classification |
 | [`docs/architecture.md`](docs/architecture.md) | Components, schema, API, lifecycle |
 | [`docs/implementation-plan.md`](docs/implementation-plan.md) | Milestones, acceptance status, checks run |
