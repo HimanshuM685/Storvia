@@ -13,6 +13,10 @@ bin/
 dist/
 storvia-api
 
+# Private working notes for the author. Never published.
+PRIVATE-MEMORY.md
+*.private.md
+
 # Node modules for the TypeScript SDK.
 sdk/ts/node_modules/
 sdk/ts/dist/
