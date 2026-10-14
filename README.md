@@ -1,8 +1,8 @@
-# Google Drive as per-user application storage
+# Google Drive-primary storage with S3-compatible fallback
 
 **Research date:** 2026-10-14  
-**Question:** Can the company use each customer's Google Drive as the storage layer for that customer's uploaded files, reports, and backups?  
-**Recommendation:** Yes for a bounded user-owned backup/archive feature; no as a general replacement for S3-style object storage.
+**Question:** Can the company use each customer's Google Drive as the primary storage layer for that customer's uploaded files, reports, and backups, while retaining an S3-compatible fallback?
+**Recommendation:** Yes for a bounded user-owned, Drive-visible feature with policy-controlled AWS S3 or Cloudflare R2 fallback; no as a general replacement for company-controlled object storage.
 
 ## Executive decision
 
@@ -16,18 +16,22 @@ Google Drive can support the core mechanics we need:
 - file IDs and metadata stored in our database;
 - change detection through the Drive changes feed and optional webhooks.
 
+The application should also support a provider-neutral fallback path for files that cannot be stored in Drive. AWS S3 and Cloudflare R2 are the first compatible targets. The fallback must be selected before an upload starts; a Drive resumable session cannot be converted into an S3 multipart upload halfway through a transfer.
+
+Terminology: **Cloudflare R2** is the object-storage service. **Cloudflare Durable Objects** are a separate stateful compute/coordination feature and are not a replacement for blob storage.
+
 The important distinction is that this is **Drive-backed user storage**, not a normal object-storage bucket. The user's quota, Drive policies, Google OAuth grant, Google API quotas, and Google Workspace administrator rules become part of our product's availability.
 
 ### Recommended product boundary
 
-Use Drive as an **optional connected-storage destination** for:
+Use Drive as the **primary connected-storage destination** for:
 
 - user-specific backups;
 - reports the user wants to own and see in their Drive;
 - low-to-moderate volume documents and attachments;
 - export, portability, or disaster-recovery copies.
 
-Keep a provider-neutral storage interface so the company can later add S3-compatible storage. Use object storage as the default for:
+Keep a provider-neutral storage interface so the company can support S3-compatible storage without exposing provider details to the rest of the application. Use object storage as the default for:
 
 - high-volume uploads or downloads;
 - public/static assets and CDN delivery;
@@ -36,16 +40,24 @@ Keep a provider-neutral storage interface so the company can later add S3-compat
 - predictable throughput and signed URL semantics;
 - files that must remain available after a user disconnects or loses Drive capacity.
 
+For this project, "fallback" has two distinct meanings:
+
+- **Failover:** route a new upload to S3/R2 when Drive is unavailable, full, revoked, or blocked. This does not protect an existing Drive-only object if the user later deletes it.
+- **Replication:** keep a second, verified S3/R2 copy of selected Drive objects. This protects existing data but creates a company-controlled copy and must be disclosed in consent, privacy, retention, and disconnect policies.
+
+Use failover for ordinary files and replication for business-critical files. If the company needs guaranteed availability, immutable retention, or legal hold, make S3/R2 primary and treat Drive as an export destination instead.
+
 ## The proposed architecture in one page
 
 1. **Application account:** Authenticate the application user separately from Drive authorization. Google sign-in identifies the user; Drive authorization is a connected-storage capability.
 2. **Consent:** Ask for Drive access when the user enables backup/storage, using the narrowest scope that satisfies the feature. Prefer `drive.file` for files created or opened by the app. Avoid the full `drive` scope unless there is a reviewed requirement to read or manage the user's entire Drive.
 3. **Dedicated folder:** Create one visible application folder in the user's My Drive, then store files beneath it. Store the folder ID, not a path.
 4. **Backend token broker:** Exchange the authorization code on the backend, securely store the refresh token, refresh access tokens server-side, and never put refresh tokens or client secrets in browser code.
-5. **Upload coordinator:** The backend authorizes the upload, mints the Drive resumable session, stores upload state, and either proxies chunks or returns the session URL to the browser as a carefully protected upload capability.
-6. **Database catalog:** Our database remains the source of truth for application ownership, logical object IDs, status, names, MIME types, sizes, hashes, and Drive file IDs. Drive is the binary/metadata provider, not the application's relational index.
-7. **Private download endpoint:** Authorize the application user against our database, refresh the user's Google token, and stream `files.get(..., alt=media)` from Drive. Do not treat a Drive web link as an application-level authorization boundary.
-8. **Reconciliation:** Handle user-side rename, move, deletion, quota exhaustion, token revocation, and administrator policy changes. Use the Drive changes feed for synchronization and a periodic reconciliation job as a safety net.
+5. **Upload coordinator:** The backend authorizes the upload, selects Drive or an S3-compatible fallback before transfer, mints the provider-specific upload session, stores upload state, and either proxies chunks or returns a carefully protected upload capability.
+6. **Database catalog:** Our database remains the source of truth for application ownership, logical object IDs, status, names, MIME types, sizes, hashes, and provider replicas. Drive, S3, or R2 is the binary provider, not the application's relational index.
+7. **Private download endpoint:** Authorize the application user against our database, then stream from the selected ready replica. For Drive, refresh the user's Google token and use `files.get(..., alt=media)`; for S3/R2, use a backend stream or short-lived presigned URL. Do not treat a provider URL as an application-level authorization boundary.
+8. **Provider routing:** Select Drive or an S3-compatible backend before upload based on file policy, provider health, user connection state, and configured fallback rules. Never silently change the provider for an in-progress upload.
+9. **Reconciliation:** Handle user-side rename, move, deletion, quota exhaustion, token revocation, and administrator policy changes. Use the Drive changes feed plus S3/R2 object checks and a periodic reconciliation job as a safety net.
 
 ## Feasibility summary
 
@@ -61,6 +73,8 @@ Keep a provider-neutral storage interface so the company can later add S3-compat
 | S3-style presigned download | Weak fit | Use an authenticated application download proxy for private data. `webContentLink` is a Drive-generated browser link subject to Drive permissions. |
 | Stable path | Poor fit | Drive file IDs are stable for the life of a file; names and folder relationships can change. Store IDs, not paths. |
 | Public/CDN delivery | Poor fit | Sharing changes Drive ACLs and can expose user-owned data. Use object storage/CDN for this. |
+| New-upload failover | Good with explicit routing | Choose the provider before upload; a Drive session cannot be resumed as an S3 multipart upload. |
+| Verified secondary copy | Possible, but policy-sensitive | Store replica state separately; verify size/checksum before reporting the backup as ready. |
 | Background processing | Possible, but quota-sensitive | Queue work, limit concurrency, retry with bounded exponential backoff, and reconcile. |
 | Strict retention/deletion | Possible but policy-dependent | User or administrator actions can affect access; define disconnect and deletion behavior explicitly. |
 
@@ -68,7 +82,7 @@ Keep a provider-neutral storage interface so the company can later add S3-compat
 
 Build a small proof of concept before committing the company to Drive as a production storage service. The proof of concept should demonstrate OAuth verification, folder creation, a 1–10 GB resumable upload, interrupted upload recovery, private download with HTTP ranges, user-side deletion detection, token revocation recovery, and quota/error handling.
 
-If those tests pass and the product is genuinely user-owned backup/export, Drive is reasonable. If the requirement is "our application needs an object store," start with a provider-neutral interface and plan for S3-compatible storage instead of making Drive the hidden default.
+If those tests pass and the product is genuinely user-owned backup/export, Drive is reasonable. If the requirement is "our application needs an object store," use S3/R2 as the company-controlled primary and keep Drive as an explicit export or user-owned replica. Do not make a hidden S3 copy without documenting the ownership, access, retention, and deletion consequences.
 
 ## Files in this research pack
 
@@ -95,5 +109,7 @@ Before implementation, the product owner must decide:
 4. What maximum file size, daily upload volume, download volume, and retention period are supported?
 5. Must files be available when a user has no Drive space or an administrator blocks third-party Drive apps?
 6. Are any files regulated, sensitive, or subject to a legal hold that makes user-owned storage inappropriate?
+7. Does fallback mean failed new uploads only, or should critical Drive objects receive a verified S3/R2 replica?
+8. If a file is stored in S3/R2 after Drive fallback, when should it be copied back to Drive, if ever?
 
 This document is technical research, not legal or privacy counsel. Have the company review the consent language, privacy policy, data-processing terms, retention promises, and Google verification requirements before production release.

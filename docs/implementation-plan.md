@@ -1,6 +1,6 @@
 # Implementation plan and future reference
 
-This plan is intentionally provider-neutral at the application boundary and Google-Drive-specific only inside the storage adapter.
+This plan is intentionally provider-neutral at the application boundary. Google Drive is the default user-facing provider, while AWS S3 and Cloudflare R2 are controlled fallback/replication adapters.
 
 ## Phase 0 — confirm the product contract
 
@@ -14,8 +14,11 @@ Write down these answers before coding:
 - What happens when the user disconnects, deletes the folder, loses quota, or revokes access?
 - Does the company need a second copy?
 - Which users are in scope: consumer Google accounts, Workspace accounts, or both?
+- Does fallback mean failed new uploads only, or should critical Drive objects receive a verified S3/R2 replica?
+- What happens to a company-controlled S3/R2 copy when Drive is disconnected or the user requests deletion?
+- Which data regions, retention classes, encryption modes, and provider capabilities are required?
 
-**Decision gate:** If the answer is "company-owned primary records" or "strict retention," use a company-controlled object store and consider Drive only as an export destination.
+**Decision gate:** If the answer is "company-owned primary records," "strict retention," legal hold, or guaranteed availability independent of the user's Google account, use S3/R2 as the primary and consider Drive only as an export destination. If Drive remains primary, document whether fallback is failover, replication, or both.
 
 ## Phase 1 — Google Cloud and OAuth setup
 
@@ -31,7 +34,7 @@ Write down these answers before coding:
 
 > Connect Google Drive to save files created by **[Company App]** in a dedicated folder in your Google Drive. These files use your Google Drive storage quota. We do not need access to unrelated Drive files for this feature. You can disconnect Google Drive at any time from your account settings; see the privacy policy for what happens to files already saved in Drive.
 
-Do not ship this copy unchanged. It must match the actual scope, folder visibility, content processing, employee/processor access, retention, and deletion behavior.
+If S3/R2 fallback or replication is enabled, the notice must also state that some files may be stored in company-managed object storage, why that happens, where it is hosted, who can access it, how long it is retained, and what disconnect/deletion does. Do not ship this copy unchanged. It must match the actual scope, folder visibility, content processing, employee/processor access, retention, and deletion behavior.
 
 ## Phase 2 — thin vertical slice
 
@@ -46,14 +49,19 @@ Implement one complete path before adding all file categories:
 7. delete through the application endpoint;
 8. show the file in both the application and the user's Drive.
 
+The first vertical slice should keep Drive as primary but include a fake S3/R2 provider contract test. A real fallback should be added only after the logical object, replica, and provider-selection states are persisted.
+
 ### Minimum acceptance criteria
 
 - No refresh token or access token appears in browser storage, logs, URLs, or API responses.
 - The application cannot read a second user's object by changing an object ID.
 - A Drive file ID is stored and used; a path is not treated as identity.
+- Provider-specific pointers are stored on replicas, while the application uses a logical object ID.
 - A user can see which folder and file category the app created.
 - A user with a full Drive receives an actionable message.
 - A user who declines Drive consent can still use non-Drive account features.
+- A fallback upload is selected before transfer and is not silently switched mid-session.
+- A completed S3/R2 object is verified with size and checksum before it is marked ready.
 
 ## Phase 3 — resumable and large-file behavior
 
@@ -70,6 +78,21 @@ Add resumable upload support in this order:
 9. add idempotency for initiation and completion;
 10. delete or reconcile abandoned provider files.
 
+### S3/R2 fallback and replication
+
+Add this after the Drive upload path is stable:
+
+1. implement a common S3 provider contract using private buckets and server-generated keys;
+2. implement AWS S3 and Cloudflare R2 adapters against the common subset only;
+3. add short-lived presigned multipart operations for direct browser uploads;
+4. verify completed objects with `HEAD`, expected size, content type, and checksum;
+5. add provider health/circuit-breaker state and bounded failover rules;
+6. preserve the logical object ID when creating a provider-specific fallback attempt;
+7. add an asynchronous verified backup-copy job for critical Drive objects;
+8. reconcile bucket prefixes and abort orphaned multipart uploads;
+9. test provider capability flags before enabling versioning, object lock, tags, or notifications;
+10. document deletion and disconnect behavior across all ready replicas.
+
 ### Failure-injection test matrix
 
 | Test | Expected result |
@@ -83,10 +106,15 @@ Add resumable upload support in this order:
 | Wrong MIME declaration | Rejected or quarantined; not trusted as a security check. |
 | Size exceeds policy | Rejected before provider upload. |
 | Provider file deleted during download | Stable application `missing` state and user-facing recovery. |
+| Drive fails before upload data is sent | Same logical object receives a new S3/R2 upload plan; no duplicate logical object. |
+| Drive fails after partial upload | Existing session is not converted; client replays/restarts through a new provider-specific attempt. |
+| S3/R2 completion response is lost | Completion is safely retried and verified with `HEAD`; one ready replica results. |
+| Backup copy is interrupted | Job resumes or retries idempotently; object remains `backup_pending` or `degraded`, never falsely `backup_ready`. |
+| User disconnects Drive with a ready fallback copy | UI and policy show the S3/R2 copy and its retention/deletion behavior explicitly. |
 
 ## Phase 4 — reconciliation and operations
 
-Implement a worker per connected Drive account or a bounded shared queue:
+Implement a worker per connected Drive account or a bounded shared queue, plus reconciliation for company-managed S3/R2 backends:
 
 - save a Drive changes page token;
 - process changes page-by-page;
@@ -94,7 +122,10 @@ Implement a worker per connected Drive account or a bounded shared queue:
 - run a periodic full app-folder reconciliation;
 - detect DB rows with missing Drive files;
 - detect Drive files with no DB row and apply a grace-period cleanup policy;
+- list configured S3/R2 prefixes and compare them with replica rows;
+- abort stale multipart uploads and clean orphaned objects only after a grace period;
 - surface `reauth_required`, `quota_exceeded`, `admin_blocked`, and `missing` states;
+- surface `provider_degraded`, `fallback_used`, and `backup_pending` states;
 - emit metrics for upload time, retry count, Drive error reason, bytes, egress, and queue age.
 
 ### Operational dashboards
@@ -112,6 +143,9 @@ Track at minimum:
 - reconciliation lag per connection;
 - notification channel renewal failures;
 - application download authorization failures.
+- provider failover rate and fallback reason;
+- replica verification failures and backup lag;
+- S3/R2 multipart uploads, orphan count, and storage cost by provider.
 
 ### Runbooks
 
@@ -126,7 +160,9 @@ Prepare runbooks for:
 7. an upload session expires;
 8. a user deletes the app folder;
 9. cleanup of orphaned provider files;
-10. emergency revocation of all grants for a user or environment.
+10. AWS/R2 credential rotation and provider disablement;
+11. failed Drive-to-S3/R2 replication and restore;
+12. emergency revocation of all grants for a user or environment.
 
 ## API contract example
 
@@ -150,8 +186,11 @@ Content-Type: application/json
 {
   "upload_id": "app-upload-id",
   "object_id": "app-object-id",
+  "replica_id": "primary-replica-id",
+  "provider": "google_drive",
   "mode": "proxy",
   "chunk_size_bytes": 8388608,
+  "fallback_allowed": true,
   "expires_at": "2026-10-14T12:00:00Z"
 }
 ```
@@ -168,7 +207,7 @@ Content-Type: application/octet-stream
 <chunk bytes>
 ```
 
-The backend forwards the chunk to Drive and returns the provider-confirmed next offset. The client must use the returned offset instead of incrementing blindly.
+The backend forwards the chunk to the selected provider and returns the provider-confirmed next offset. The client must use the returned offset instead of incrementing blindly. If the upload is moved to a fallback provider, the API returns a new provider-specific upload plan rather than pretending that the old session is portable.
 
 ### Complete
 
@@ -178,14 +217,15 @@ Authorization: Bearer <application-session>
 Idempotency-Key: <same-or-derived-attempt-id>
 ```
 
-The backend verifies the Drive file ID, expected size, MIME type, ownership mapping, and DB transition before returning the object record.
+The backend verifies the provider pointer, expected size, MIME type, checksum where available, ownership mapping, and DB transition before returning the object record.
 
-## Migration path to object storage
+## Provider rollout, fallback, and migration path
 
 Keep these fields from day one so migration is possible:
 
 - `provider`;
 - `provider_file_id` or equivalent provider key;
+- `replica_id`, `role`, and provider capability state;
 - `logical_key`;
 - `checksum`;
 - `size_bytes`;
@@ -195,15 +235,17 @@ Keep these fields from day one so migration is possible:
 - `encryption_state`;
 - `status`.
 
-Migration sequence:
+Rollout sequence:
 
-1. add a second provider adapter;
-2. route new uploads for selected tenants/features to the new provider;
-3. copy ready Drive objects in a background job;
-4. verify size/checksum and record the new provider pointer;
-5. switch reads using a per-object provider field;
-6. retain or delete Drive copies according to the user-visible policy;
-7. remove the Drive connection only after the user has been informed.
+1. add the provider-neutral replica model and contract tests;
+2. add AWS S3 and/or Cloudflare R2 adapters;
+3. route new uploads for selected policies or tenants to the new provider;
+4. enable failover only after provider selection, retry, and orphan cleanup tests pass;
+5. copy ready Drive objects in a background job for policies that require replication;
+6. verify size/checksum and record the new ready replica;
+7. switch reads using the selected ready replica and fallback policy;
+8. retain or delete Drive copies according to the user-visible policy;
+9. remove the Drive connection only after the user has been informed.
 
 ## Definition of done for production pilot
 
@@ -215,6 +257,10 @@ Migration sequence:
 - [ ] Quota, rate-limit, 401/403/404/429/5xx translation is implemented.
 - [ ] Reauth and disconnect workflows are user-tested.
 - [ ] Changes feed and reconciliation worker are running.
+- [ ] S3/R2 provider capability checks and private-bucket configuration are reviewed.
+- [ ] Failover preserves logical object identity and never switches an in-progress provider session.
+- [ ] Critical-object replication verifies checksum/size and exposes `backup_pending`/`degraded` states.
+- [ ] Deletion and disconnect behavior is tested across every ready replica.
 - [ ] Orphan cleanup has a dry-run mode and audit trail.
 - [ ] Metrics, alerting, and runbooks exist.
 - [ ] Product has explicitly accepted Drive's user-controlled availability and quota.

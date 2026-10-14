@@ -187,6 +187,51 @@ Important findings:
 - Apps using only non-sensitive scopes do not need the same full verification path, though brand verification may still be needed to show a name/logo.
 - Restricted-scope applications may have annual re-verification and security-assessment obligations.
 
+## S3-compatible fallback references
+
+### 15. Cloudflare R2 S3 API compatibility
+
+**Source:** Cloudflare, “S3 API compatibility”
+**URL:** <https://developers.cloudflare.com/r2/api/s3/api/>
+
+Important findings:
+
+- R2 exposes an S3-compatible endpoint, but Cloudflare explicitly documents differences and unsupported S3 features.
+- The common adapter should not assume AWS-only features such as object locking, versioning, ACLs, tagging, or every bucket-management operation are available on R2.
+- R2 uses `auto` as the S3 API region value.
+
+### 16. Cloudflare R2 presigned URLs
+
+**Source:** Cloudflare, “Presigned URLs”
+**URL:** <https://developers.cloudflare.com/r2/api/s3/presigned-urls/>
+
+Important findings:
+
+- R2 supports short-lived presigned `GET`, `HEAD`, `PUT`, and `DELETE` URLs.
+- Presigned URLs are bearer tokens and must be treated as sensitive capabilities.
+- R2 presigned URLs are not currently HTML form `POST` uploads; multipart or signed `PUT` flows should be designed and tested explicitly.
+
+### 17. Cloudflare R2 event notifications
+
+**Source:** Cloudflare, “Event notifications”
+**URL:** <https://developers.cloudflare.com/r2/buckets/event-notifications/>
+
+Important findings:
+
+- R2 object-create and object-delete notifications are delivered through Cloudflare Queues.
+- Notifications can trigger asynchronous work, but the upload completion path, provider verification, and reconciliation job should remain authoritative for application state.
+
+### 18. Amazon S3 features and consistency
+
+**Source:** AWS, “What is Amazon S3?”
+**URL:** <https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html>
+
+Important findings:
+
+- S3 provides versioning, Object Lock, lifecycle management, replication, event notifications, private-by-default access, and strong read-after-write consistency for object operations.
+- These features make AWS S3 a stronger fit than R2 when immutable retention, broad compliance controls, or advanced replication are requirements.
+- The provider-neutral application boundary should use the common S3 subset and expose advanced features through capability flags.
+
 ## Community Wisdom
 
 The community evidence is useful but thin and anecdotal: the most relevant posts were implementation write-ups, not independent benchmarks or Google policy guidance. The consistent theme was that Drive's happy path is straightforward, while synchronization state, stale IDs, retries, and quota behavior require real design.
