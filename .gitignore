@@ -1,0 +1,29 @@
+# Secrets. These must never enter version control.
+.env
+.env.*
+!.env.example
+
+# Local SQLite databases.
+*.db
+*.db-shm
+*.db-wal
+
+# Build output.
+bin/
+dist/
+storvia-api
+
+# Node modules for the TypeScript SDK.
+sdk/ts/node_modules/
+sdk/ts/dist/
+sdk/ts/*.tsbuildinfo
+
+# Editor and OS noise.
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Coverage and profiling output.
+coverage.out
+*.prof

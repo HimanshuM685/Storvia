@@ -1,0 +1,129 @@
+{
+  "environment": "production",
+  "service": {
+    "name": "storvia-api",
+    "release": "set-at-build"
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "read_header_timeout": "10s",
+    "read_timeout": "60s",
+    "write_timeout": "0s",
+    "idle_timeout": "120s",
+    "upload_timeout": "30m",
+    "download_timeout": "15m",
+    "shutdown_grace": "30s",
+    "max_request_body_size": 2097152,
+    "trusted_proxies": []
+  },
+  "logging": {
+    "level": "info",
+    "format": "json"
+  },
+  "database": {
+    "driver": "postgres",
+    "dsn": "${STORVIA_DATABASE_DSN}",
+    "max_open_conns": 25,
+    "max_idle_conns": 10,
+    "conn_max_lifetime": "30m",
+    "conn_max_idle_time": "5m",
+    "auto_migrate": false,
+    "migrations_dir": "migrations"
+  },
+  "cache": {
+    "driver": "redis",
+    "redis_address": "${STORVIA_REDIS_ADDRESS}",
+    "redis_password": "${STORVIA_REDIS_PASSWORD}",
+    "redis_database": 0,
+    "janitor_interval": "1m",
+    "access_token_ttl": "30m",
+    "preflight_ttl": "5s",
+    "circuit_state_ttl": "2m",
+    "availability_scope": "default"
+  },
+  "auth": {
+    "session_cookie_name": "storvia_session",
+    "session_ttl": "12h",
+    "secure_cookie": true,
+    "trusted_proxies": []
+  },
+  "security": {
+    "encryption_key_ref": "STORVIA_ENCRYPTION_KEY",
+    "encryption_key_previous_ref": "STORVIA_ENCRYPTION_KEY_PREVIOUS",
+    "allowed_origins": [],
+    "allowed_endpoint_schemes": [
+      "https"
+    ],
+    "allowed_endpoint_hosts": [
+      "YOUR_ACCOUNT_ID.r2.cloudflarestorage.com",
+      "s3.amazonaws.com"
+    ],
+    "max_clock_skew": "2m"
+  },
+  "uploads": {
+    "max_file_size_bytes": 5368709120,
+    "allowed_mime_types": [
+      "application/pdf",
+      "application/zip",
+      "text/csv",
+      "text/plain",
+      "image/jpeg",
+      "image/png"
+    ],
+    "allowed_categories": [
+      "report",
+      "document",
+      "image"
+    ],
+    "drive_chunk_size_bytes": 8388608,
+    "s3_part_size_bytes": 8388608,
+    "min_part_size_bytes": 5242880,
+    "presigned_url_ttl": "15m",
+    "presigned_part_count": 8,
+    "category_limits": {
+      "image": 26214400
+    }
+  },
+  "drive": {
+    "client_id_ref": "STORVIA_GOOGLE_CLIENT_ID",
+    "client_secret_ref": "STORVIA_GOOGLE_CLIENT_SECRET",
+    "redirect_uri": "${STORVIA_GOOGLE_REDIRECT_URI}",
+    "scopes": [
+      "https://www.googleapis.com/auth/drive.file"
+    ],
+    "root_folder_name": "Storvia",
+    "preflight_timeout": "3s",
+    "preflight_attempts": 2,
+    "routing_budget": "8s",
+    "circuit_failures": 2,
+    "circuit_cooldown": "30s"
+  },
+  "fallback": {
+    "enabled": false,
+    "consent_required": false,
+    "backends": [
+      {
+        "id": "r2-primary",
+        "vendor": "cloudflare_r2",
+        "endpoint": "https://YOUR_ACCOUNT_ID.r2.cloudflarestorage.com",
+        "region": "auto",
+        "bucket": "storvia-fallback",
+        "prefix": "prod",
+        "access_key_id_ref": "STORVIA_R2_ACCESS_KEY_ID",
+        "secret_access_key_ref": "STORVIA_R2_SECRET_ACCESS_KEY",
+        "session_token_ref": "STORVIA_R2_SESSION_TOKEN",
+        "use_path_style": true,
+        "disabled": true,
+        "multipart_abort_ttl": "24h",
+        "orphan_grace_period": "72h"
+      }
+    ]
+  },
+  "telemetry": {
+    "metrics_enabled": true,
+    "metrics_path": "/metrics",
+    "health_path": "/healthz",
+    "readiness_timeout": "3s"
+  }
+}

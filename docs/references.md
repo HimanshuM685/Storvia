@@ -268,6 +268,41 @@ Implementation notes:
 - After an interrupted request, query the session and use the returned range; do not assume the previous request was fully accepted.
 - A session `404` means the session must restart from the beginning; it does not authorize writing the same logical object to S3 without first resolving whether any provider write committed.
 
+### 22. Go HTTP routers compared in 2026
+
+**Source:** rosgluk, "Go Web Frameworks in 2026: net/http, chi, Gin, Echo, Fiber Compared"
+**URL:** <https://dev.to/rosgluk/go-web-frameworks-in-2026-nethttp-chi-gin-echo-fiber-compared-bm3>
+
+Implementation notes:
+
+- The author benchmarked all five stacks on Go 1.27.1 and found the four `net/http`-based
+  routers within 4% of each other on a dynamic two-parameter route, with `chi` slightly
+  behind `net/http`'s `ServeMux`.
+- Per-handler-invocation cost favoured the standard library: 430 ns/op and 5 allocs for
+  `ServeMux` against 592 ns/op and 7 allocs for chi.
+- The author's own caveat is the important part: at production scale a single database
+  roundtrip of 0.5–5 ms dwarfs the router's share, so the framework choice is not where
+  a storage service spends its budget.
+
+This is why Storvia routes with the standard library `http.ServeMux` rather than chi.
+The docs originally proposed either; the measurement favours the zero-dependency option.
+
+### 23. RFC 9457 problem details in Go
+
+**Source:** onurcinar, "Returning RFC 9457 Problem Details from Go Validation Errors"
+**URL:** <https://dev.to/onurcinar/returning-rfc-9457-problem-details-from-go-validation-errors-4nb7>
+
+Implementation notes:
+
+- RFC 9457 defines a standard `application/problem+json` body with `type`, `title`,
+  `status`, and `detail`, plus room for extensions. `invalid-params` is the documented
+  extension for field-level validation failures.
+- Every API that invents its own error envelope forces each client to learn a private
+  contract. A standard shape is the difference between one client-side parser and N.
+
+Storvia therefore returns RFC 9457 for every failure, including 4xx bodies, and both
+SDKs parse exactly that one shape.
+
 ## Current project decision record
 
 The current user-confirmed rule is narrower than some earlier research recommendations: Drive is the normal primary; S3-compatible storage is only for Drive unavailability; and Storvia does not maintain duplicate application-managed file copies. This is a single-location availability strategy, not an independent backup strategy. See [storage-policy.md](storage-policy.md) for error classification and the remaining trade-off.
@@ -307,6 +342,22 @@ The community evidence is useful but thin and anecdotal: the most relevant posts
 > This object-storage comparison argues for server-minted keys, direct browser uploads, post-upload verification, idempotency, and reconciliation. Those ideas are useful for the future S3-compatible adapter, but Drive's resumable session URI is not automatically equivalent to an S3 presigned URL; the safer Drive MVP keeps the session URI server-side and proxies chunks.
 >
 > 🔗 [Read Full Discussion](https://dev.to/thomasmoore157/direct-browser-uploads-choosing-an-object-storage-api-pattern-auth-and-callbacks-58mm)
+
+### 🌐 Community Wisdom: [Go Web Frameworks in 2026: net/http, chi, Gin, Echo, Fiber Compared](https://dev.to/rosgluk/go-web-frameworks-in-2026-nethttp-chi-gin-echo-fiber-compared-bm3)
+> **Source**: [rosgluk](https://dev.to/rosgluk)
+> **Tags**: `api`, `architecture`, `dev`, `go`
+>
+> Benchmarking all five stacks on Go 1.27.1, the author found the four `net/http`-based routers within 4% of each other, with chi marginally *behind* the standard library's `ServeMux` on both throughput and allocations per call. Their own caveat is the load-bearing part: a single database roundtrip costs 0.5–5 ms, which makes the router's share irrelevant at production scale. Storvia therefore routes on the standard library rather than chi, despite chi being the common default.
+>
+> 🔗 [Read Full Discussion](https://dev.to/rosgluk/go-web-frameworks-in-2026-nethttp-chi-gin-echo-fiber-compared-bm3)
+
+### 🌐 Community Wisdom: [Returning RFC 9457 Problem Details from Go Validation Errors](https://dev.to/onurcinar/returning-rfc-9457-problem-details-from-go-validation-errors-4nb7)
+> **Source**: [onurcinar](https://dev.to/onurcinar)
+> **Tags**: `go`, `api`, `webdev`, `opensource`
+>
+> The author's framing is the useful part: most Go APIs invent a private error envelope — `{"errors": [...]}`, `{"field_errors": {...}}`, a flat `{"error": "..."}` — and every variant becomes a contract the client must learn from the docs. RFC 9457 is the IETF standard that replaces all of them with one `application/problem+json` shape, and `invalid-params` is its documented extension for field-level failures. Storvia returns that one shape for every failure, and both SDKs parse it.
+>
+> 🔗 [Read Full Discussion](https://dev.to/onurcinar/returning-rfc-9457-problem-details-from-go-validation-errors-4nb7)
 
 ## Source limitations
 

@@ -49,6 +49,15 @@ Proposed relational tables; PostgreSQL is recommended but not yet selected by th
 ### Connections and fallback configuration
 
 ```text
+tenants
+  id, name, created_at, updated_at
+```
+
+The tenant is Storvia's own identity boundary, created by the application and never
+by a provider callback. Every scoped row below hangs off it, so a missing tenant
+cannot be papered over with a bare string.
+
+```text
 drive_connections
   id, tenant_id, user_id, google_subject
   encrypted_refresh_token, key_reference, granted_scopes
@@ -121,22 +130,48 @@ Proposed module layout; keep provider details behind interfaces and keep HTTP ha
 cmd/storvia-api/main.go
 internal/
   app/              dependency wiring and lifecycle
+  apperr/           shared error vocabulary: kinds, HTTP statuses, RFC 9457 types
   auth/             application sessions, tenant/user identity
-  httpapi/          routes, request decoding, response/error mapping
+  cache/            cache interface, in-memory TTL default, Redis implementation
+  config/           JSON configuration, .env loading, validation
+  httpapi/          routes, request decoding, global error handler, middleware
+  idid/             opaque identifier generation
+  logger/           structured logging with mandatory redaction
+  persistence/      repositories, migrations, dialect handling
+  secrets/          AES-GCM keyring for refresh tokens, rotation overlap
   storage/
     model/          logical objects, uploads, attempts, provider states
     policy/         error classification, routing, retry budgets, transitions
     service/        use cases and transaction boundaries
     provider/       interfaces and capability-neutral types
-      drive/        OAuth, folders, resumable upload, media download
+      drive/        OAuth, connection registry, availability, token refresh
       s3compat/     S3 API adapter, multipart/presigned operations
-  persistence/      repositories and migrations
-  jobs/             reconciliation, cleanup, leases, bounded retries
-  secrets/          token/key references and redaction boundaries
-  telemetry/        metrics, traces, sanitized structured logs
-migrations/
+migrations/         per-dialect SQL, embedded at build time
+  sql/sqlite/
+  sql/postgres/
+sdk/go/             Go client SDK
+sdk/ts/             TypeScript client SDK
+config/             JSON configuration files
 docs/
 ```
+
+Cross-cutting packages worth naming explicitly, because each exists to make one
+class of mistake impossible rather than merely discouraged:
+
+- `apperr` gives the service one error vocabulary. Every failure reaching HTTP is an
+  `*apperr.Error`, matched by kind with `errors.Is`, and mapped to an RFC 9457 body
+  by one handler. An error that is not an `*apperr.Error` is coerced to a generic 500,
+  so a bare `fmt.Errorf` from a deep package cannot become a client-visible string.
+- `logger` applies redaction in the handler rather than asking callers to be careful.
+  Sensitive attribute names are replaced with a marker before any record is written,
+  including inside groups and through `With`.
+- `config` refuses configuration that would be unsafe or non-functional: the broad
+  Drive scope, a non-allow-listed endpoint, a retry budget that cannot fit its own
+  attempts, and enabling fallback while the disclosure is unaccepted.
+- `idid` mints unguessable opaque identifiers. No identifier encodes a tenant, a user,
+  a file name, or a sequence number.
+- `secrets` encrypts refresh tokens on the way into the database and decrypts them
+  only inside the Drive adapter, so no other layer ever holds a usable token.
 
 Suggested interfaces:
 
@@ -244,19 +279,26 @@ Do not enable a copy job, dual-write, provider-side replication, or automatic S3
 ### State transitions
 
 ```text
-pending -> selected -> initiating -> active -> verifying -> ready
-                         |             |          |
-                         |             |          +-> outcome_unknown
-                         |             +-> outcome_unknown
-                         +-> failed / blocked
+pending -> initiating -> active -> verifying -> ready
+             |            |          |
+             |            |          +-> outcome_unknown
+             |            +-> outcome_unknown
+             +-> failed / blocked
 
-outcome_unknown -> active   (same provider, after reconciliation)
-outcome_unknown -> failed   (confirmed no committed object)
-failed/blocked -> selected  (new attempt only after cleanup/reconciliation)
+outcome_unknown -> active     (same provider, after reconciliation)
+outcome_unknown -> verifying  (same provider, after reconciliation)
+outcome_unknown -> failed     (confirmed no committed object)
+failed/blocked -> initiating  (new attempt only after cleanup/reconciliation)
 ready -> deleting -> deleted | missing
 ```
 
 `outcome_unknown` is not a provider outage classification. It means Storvia cannot yet know whether the selected provider accepted a mutation. It is never eligible for immediate cross-provider failover.
+
+The table is enforced by `policy.CanTransition` and covered by tests. Two properties
+are worth restating, because they are the ones a well-meaning change would break:
+
+- **`ready` has no transition back to any pre-transfer state.** Re-adding `ready -> uploading` would let one logical object hold a second storage location.
+- **`outcome_unknown` cannot reach `ready` directly.** It must pass through a provider inspection, because the entire point of the state is that the outcome is not yet known.
 
 ## 7. Failure classification and retry budgets
 
