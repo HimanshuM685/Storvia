@@ -20,12 +20,12 @@ func newTestStore(t *testing.T) *Store {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 	store, err := Open(context.Background(), config.DatabaseConfig{
 		Driver:          config.DriverSQLite,
-		DSN:             "file:" + dbPath,
+		SQLitePath:      "file:" + dbPath,
 		MaxOpenConns:    1,
 		ConnMaxLifetime: config.Duration(time.Minute),
 		ConnMaxIdleTime: config.Duration(time.Minute),
 		AutoMigrate:     true,
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

@@ -23,7 +23,7 @@
   },
   "database": {
     "driver": "sqlite",
-    "dsn": "file:./storvia.dev.db",
+    "sqlite_path": "file:./storvia.dev.db",
     "max_open_conns": 1,
     "max_idle_conns": 1,
     "conn_max_lifetime": "30m",
@@ -34,19 +34,26 @@
   "cache": {
     "driver": "memory",
     "redis_address": "",
-    "redis_password": "",
     "redis_database": 0,
     "janitor_interval": "1m",
     "access_token_ttl": "30m",
     "preflight_ttl": "5s",
     "circuit_state_ttl": "2m",
-    "availability_scope": "default"
+    "availability_scope": "default",
+    "redis_password_ref": "STORVIA_REDIS_PASSWORD"
   },
   "auth": {
+    "session_signing_key_ref": "STORVIA_SESSION_SIGNING_KEY",
     "session_cookie_name": "storvia_session",
     "session_ttl": "12h",
     "secure_cookie": false,
     "trusted_proxies": []
+  },
+  "admin_panel": {
+    "enabled": true,
+    "tenant_id": "tenant_dev_admin",
+    "user_id": "user_dev_admin",
+    "flow_cookie": "storvia_admin_flow"
   },
   "security": {
     "encryption_key_ref": "STORVIA_ENCRYPTION_KEY",
@@ -89,6 +96,7 @@
     "client_id_ref": "STORVIA_GOOGLE_CLIENT_ID",
     "client_secret_ref": "STORVIA_GOOGLE_CLIENT_SECRET",
     "redirect_uri": "http://127.0.0.1:8080/v1/storage/connections/google-drive/callback",
+    "admin_redirect_uri": "http://127.0.0.1:8080/admin/oauth/callback",
     "scopes": [
       "https://www.googleapis.com/auth/drive.file"
     ],

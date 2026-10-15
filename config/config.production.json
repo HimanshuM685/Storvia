@@ -23,7 +23,12 @@
   },
   "database": {
     "driver": "postgres",
-    "dsn": "${STORVIA_DATABASE_DSN}",
+    "host": "postgres",
+    "port": 5432,
+    "user": "storvia",
+    "database": "storvia",
+    "sslmode": "require",
+    "password_ref": "STORVIA_DATABASE_PASSWORD",
     "max_open_conns": 25,
     "max_idle_conns": 10,
     "conn_max_lifetime": "30m",
@@ -33,20 +38,27 @@
   },
   "cache": {
     "driver": "redis",
-    "redis_address": "${STORVIA_REDIS_ADDRESS}",
-    "redis_password": "${STORVIA_REDIS_PASSWORD}",
+    "redis_address": "redis:6379",
     "redis_database": 0,
     "janitor_interval": "1m",
     "access_token_ttl": "30m",
     "preflight_ttl": "5s",
     "circuit_state_ttl": "2m",
-    "availability_scope": "default"
+    "availability_scope": "default",
+    "redis_password_ref": "STORVIA_REDIS_PASSWORD"
   },
   "auth": {
+    "session_signing_key_ref": "STORVIA_SESSION_SIGNING_KEY",
     "session_cookie_name": "storvia_session",
     "session_ttl": "12h",
     "secure_cookie": true,
     "trusted_proxies": []
+  },
+  "admin_panel": {
+    "enabled": false,
+    "tenant_id": "",
+    "user_id": "",
+    "flow_cookie": "storvia_admin_flow"
   },
   "security": {
     "encryption_key_ref": "STORVIA_ENCRYPTION_KEY",
@@ -88,7 +100,8 @@
   "drive": {
     "client_id_ref": "STORVIA_GOOGLE_CLIENT_ID",
     "client_secret_ref": "STORVIA_GOOGLE_CLIENT_SECRET",
-    "redirect_uri": "${STORVIA_GOOGLE_REDIRECT_URI}",
+    "redirect_uri": "https://api.storvia.example/v1/storage/connections/google-drive/callback",
+    "admin_redirect_uri": "",
     "scopes": [
       "https://www.googleapis.com/auth/drive.file"
     ],

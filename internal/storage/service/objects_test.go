@@ -23,11 +23,11 @@ func newServiceTestStore(t *testing.T) *persistence.Store {
 	t.Helper()
 	store, err := persistence.Open(context.Background(), config.DatabaseConfig{
 		Driver:          config.DriverSQLite,
-		DSN:             "file:" + filepath.Join(t.TempDir(), "wiring.db"),
+		SQLitePath:      "file:" + filepath.Join(t.TempDir(), "wiring.db"),
 		MaxOpenConns:    1,
 		ConnMaxLifetime: config.Duration(time.Minute),
 		ConnMaxIdleTime: config.Duration(time.Minute),
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

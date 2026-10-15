@@ -38,6 +38,9 @@ type App struct {
 	// Backends holds the constructed S3-compatible clients, keyed by backend ID.
 	// It is empty when fallback is disabled.
 	Backends map[string]*s3compat.Client
+	// secrets holds resolved secret values keyed by environment variable name.
+	// It never leaves this struct and is never logged.
+	secrets map[string]string
 	// Uploads and Objects are the use cases, exposed so tests can drive them
 	// without going through HTTP.
 	Uploads *service.UploadService
@@ -68,7 +71,17 @@ func Build(ctx context.Context, opts Options) (*App, error) {
 
 	app := &App{Config: cfg, Logger: logger, Backends: make(map[string]*s3compat.Client)}
 
-	store, err := persistence.Open(ctx, cfg.Database)
+	// Every secret is resolved once, here, and fails fast if a required one is
+	// absent. Previously each call site read the environment independently, so a
+	// missing secret surfaced much later as an authentication failure, or as a
+	// fallback backend that was silently skipped while appearing configured.
+	resolvedSecrets, err := cfg.ResolveSecrets(os.LookupEnv)
+	if err != nil {
+		return nil, err
+	}
+	app.secrets = resolvedSecrets
+
+	store, err := persistence.Open(ctx, cfg.Database, resolvedSecrets[cfg.Database.PasswordRef])
 	if err != nil {
 		return nil, err
 	}
@@ -85,18 +98,18 @@ func Build(ctx context.Context, opts Options) (*App, error) {
 		}
 	}
 
-	cacheBackend, err := buildCache(ctx, cfg.Cache)
+	cacheBackend, err := buildCache(ctx, cfg.Cache, resolvedSecrets)
 	if err != nil {
 		store.Close()
 		return nil, err
 	}
 	app.Cache = cacheBackend
 
-	backends, issues := buildBackends(ctx, cfg, logger)
+	backends, issues := buildBackends(ctx, cfg, resolvedSecrets, logger)
 	app.Backends = backends
 	app.Issues = append(app.Issues, issues...)
 
-	keyring, err := buildKeyring(cfg)
+	keyring, err := buildKeyring(cfg, resolvedSecrets)
 	if err != nil {
 		// Without a keyring no refresh token can be stored safely, so this is a
 		// hard stop rather than a degraded mode.
@@ -125,14 +138,22 @@ func Build(ctx context.Context, opts Options) (*App, error) {
 	app.Uploads = uploads
 	app.Objects = objects
 
-	issuer, sessions, err := buildAuth(cfg)
+	issuer, sessions, err := buildAuth(cfg, resolvedSecrets)
 	if err != nil {
 		cacheBackend.Close()
 		store.Close()
 		return nil, err
 	}
 
-	app.Server = buildServer(cfg, logger, store, issuer, sessions, uploads, objects, connections, driveClient, cacheBackend)
+	admin := httpapi.NewAdminHandler(httpapi.AdminPanelConfig{
+		Enabled:     cfg.AdminPanel.Enabled,
+		TenantID:    cfg.AdminPanel.TenantID,
+		UserID:      cfg.AdminPanel.UserID,
+		FlowCookie:  cfg.AdminPanel.FlowCookie,
+		RedirectURI: cfg.Drive.AdminRedirectURI,
+		Secure:      cfg.Auth.SecureCookie,
+	}, issuer, sessions, connections)
+	app.Server = buildServer(cfg, logger, store, issuer, sessions, uploads, objects, connections, admin, driveClient, cacheBackend)
 
 	logger.InfoContext(ctx, "storvia service configured",
 		"summary", cfg.RedactedSummary(),
@@ -143,13 +164,13 @@ func Build(ctx context.Context, opts Options) (*App, error) {
 }
 
 // buildCache constructs the configured cache backend.
-func buildCache(ctx context.Context, cfg config.CacheConfig) (cache.Cache, error) {
+func buildCache(ctx context.Context, cfg config.CacheConfig, resolved map[string]string) (cache.Cache, error) {
 	switch cfg.Driver {
 	case config.DriverMemory:
 		return cache.NewMemory(cache.WithJanitorInterval(cfg.JanitorInterval.Duration())), nil
 	case config.DriverRedis:
 		return cache.NewRedis(ctx, cfg.RedisAddress,
-			cache.WithPassword(cfg.RedisPassword),
+			cache.WithPassword(resolved[cfg.RedisPasswordRef]),
 			cache.WithDatabase(cfg.RedisDatabase),
 			cache.WithClientName("storvia-api"),
 		)
@@ -164,7 +185,7 @@ func buildCache(ctx context.Context, cfg config.CacheConfig) (cache.Cache, error
 // were already resolved at load time. A backend that fails to construct is
 // reported as an issue and skipped: it must not take the whole service down, and
 // it must not silently become a no-op that the routing policy thinks is healthy.
-func buildBackends(ctx context.Context, cfg *config.Config, logger *slog.Logger) (map[string]*s3compat.Client, []string) {
+func buildBackends(ctx context.Context, cfg *config.Config, resolved map[string]string, logger *slog.Logger) (map[string]*s3compat.Client, []string) {
 	var issues []string
 	built := make(map[string]*s3compat.Client)
 
@@ -184,9 +205,9 @@ func buildBackends(ctx context.Context, cfg *config.Config, logger *slog.Logger)
 			PresignTTL:    cfg.Uploads.PresignedURLTTL.Duration(),
 			RetryAttempts: 2,
 			Credentials: s3compat.Credentials{
-				AccessKeyID:     os.Getenv(backendCfg.AccessKeyIDRef),
-				SecretAccessKey: os.Getenv(backendCfg.SecretAccessKeyRef),
-				SessionToken:    os.Getenv(backendCfg.SessionTokenRef),
+				AccessKeyID:     resolved[backendCfg.AccessKeyIDRef],
+				SecretAccessKey: resolved[backendCfg.SecretAccessKeyRef],
+				SessionToken:    resolved[backendCfg.SessionTokenRef],
 			},
 		}, s3compat.Options{MultipartTTL: backendCfg.MultipartAbortTTL.Duration()})
 		if err != nil {
@@ -201,8 +222,9 @@ func buildBackends(ctx context.Context, cfg *config.Config, logger *slog.Logger)
 }
 
 // buildKeyring constructs the encryption keyring.
-func buildKeyring(cfg *config.Config) (*secrets.AESGCMKeyring, error) {
-	active := os.Getenv(cfg.Security.EncryptionKeyRef)
+func buildKeyring(cfg *config.Config, resolved map[string]string) (*secrets.AESGCMKeyring, error) {
+	// A missing key was already reported by ResolveSecrets; this is a backstop.
+	active := resolved[cfg.Security.EncryptionKeyRef]
 	if active == "" {
 		return nil, fmt.Errorf("app: the encryption key %q is not set; refresh tokens cannot be stored safely",
 			cfg.Security.EncryptionKeyRef)
@@ -211,7 +233,7 @@ func buildKeyring(cfg *config.Config) (*secrets.AESGCMKeyring, error) {
 		ActiveReference:   cfg.Security.EncryptionKeyRef,
 		ActiveKey:         active,
 		PreviousReference: cfg.Security.EncryptionKeyPrevious,
-		PreviousKey:       os.Getenv(cfg.Security.EncryptionKeyPrevious),
+		PreviousKey:       resolved[cfg.Security.EncryptionKeyPrevious],
 	})
 	if err != nil {
 		return nil, fmt.Errorf("app: encryption keyring: %w", err)
@@ -298,9 +320,9 @@ func buildServices(cfg *config.Config, store *persistence.Store, keyring secrets
 }
 
 // buildAuth constructs the session issuer and store.
-func buildAuth(cfg *config.Config) (*auth.Issuer, auth.Lookup, error) {
+func buildAuth(cfg *config.Config, resolved map[string]string) (*auth.Issuer, auth.Lookup, error) {
 	issuer, err := auth.NewIssuer(auth.IssuerOptions{
-		SigningKey: os.Getenv("STORVIA_SESSION_SIGNING_KEY"),
+		SigningKey: resolved[cfg.Auth.SessionSigningKeyRef],
 		CookieName: cfg.Auth.SessionCookieName,
 		TTL:        cfg.Auth.SessionTTL.Duration(),
 		Secure:     cfg.Auth.SecureCookie,
@@ -312,7 +334,7 @@ func buildAuth(cfg *config.Config) (*auth.Issuer, auth.Lookup, error) {
 }
 
 // buildServer assembles the HTTP server.
-func buildServer(cfg *config.Config, logger *slog.Logger, store *persistence.Store, issuer *auth.Issuer, sessions auth.Lookup, uploads *service.UploadService, objects *service.ObjectService, connections *service.ConnectionService, driveClient *drive.Client, cacheBackend cache.Cache) *http.Server {
+func buildServer(cfg *config.Config, logger *slog.Logger, store *persistence.Store, issuer *auth.Issuer, sessions auth.Lookup, uploads *service.UploadService, objects *service.ObjectService, connections *service.ConnectionService, admin *httpapi.AdminHandler, driveClient *drive.Client, cacheBackend cache.Cache) *http.Server {
 	ready := func(ctx context.Context) error {
 		// Readiness consults the database. Liveness deliberately does not: a
 		// database blip should not get the process restarted into the same blip,
@@ -327,6 +349,7 @@ func buildServer(cfg *config.Config, logger *slog.Logger, store *persistence.Sto
 		Uploads:        httpapi.NewUploadHandler(uploads, driveClient, cfg.Uploads),
 		Objects:        httpapi.NewObjectHandler(objects),
 		Connections:    httpapi.NewConnectionHandler(connections),
+		Admin:          admin,
 		Health:         httpapi.NewHealthHandler(ready, cacheBackend),
 		AllowedOrigins: cfg.Security.AllowedOrigins,
 		UploadTimeout:  cfg.Server.UploadTimeout.Duration(),

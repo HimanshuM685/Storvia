@@ -17,7 +17,10 @@ services:
     image: postgres:17-alpine
     environment:
       POSTGRES_USER: storvia
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-storvia-dev-password}
+      # No inline default. A password committed to a repository is a password in
+      # every clone of it, and a default nobody notices is worse than a missing
+      # one that stops the stack immediately.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: storvia
     ports:
       - "5432:5432"
@@ -58,14 +61,15 @@ services:
     ports:
       - "8080:8080"
     environment:
-      STORVIA_DATABASE_DSN: postgres://storvia:${POSTGRES_PASSWORD:-storvia-dev-password}@postgres:5432/storvia?sslmode=disable
-      STORVIA_REDIS_ADDRESS: redis:6379
-      STORVIA_REDIS_PASSWORD: ""
+      # Only the password is passed. Host, port, user and database name are
+      # ordinary configuration and live in config/config.production.json.
+      STORVIA_DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      # The address is non-secret and comes from the JSON config file, not here.
+      STORVIA_REDIS_PASSWORD: ${STORVIA_REDIS_PASSWORD:-}
       STORVIA_SESSION_SIGNING_KEY: ${STORVIA_SESSION_SIGNING_KEY:?set STORVIA_SESSION_SIGNING_KEY in .env}
       STORVIA_ENCRYPTION_KEY: ${STORVIA_ENCRYPTION_KEY:?set STORVIA_ENCRYPTION_KEY in .env}
       STORVIA_GOOGLE_CLIENT_ID: ${STORVIA_GOOGLE_CLIENT_ID:-}
       STORVIA_GOOGLE_CLIENT_SECRET: ${STORVIA_GOOGLE_CLIENT_SECRET:-}
-      STORVIA_GOOGLE_REDIRECT_URI: ${STORVIA_GOOGLE_REDIRECT_URI:-http://localhost:8080/v1/storage/connections/google-drive/callback}
       STORVIA_R2_ACCESS_KEY_ID: ${STORVIA_R2_ACCESS_KEY_ID:-}
       STORVIA_R2_SECRET_ACCESS_KEY: ${STORVIA_R2_SECRET_ACCESS_KEY:-}
     volumes:

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,7 +21,7 @@ func lookupMap(values map[string]string) func(string) (string, bool) {
 func minimalConfig() string {
 	return `{
       "environment": "test",
-      "database": {"driver": "sqlite", "dsn": "file::memory:"},
+      "database": {"driver": "sqlite", "sqlite_path": "file::memory:"},
       "cache": {"driver": "memory"},
       "drive": {
         "client_id_ref": "TEST_CLIENT_ID",
@@ -189,6 +190,28 @@ func TestValidateRejectsBroadDriveScope(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsEnabledAdminPanelOutsideDevelopment(t *testing.T) {
+	raw := strings.Replace(minimalConfig(), `"environment": "test"`, `"environment": "production"`, 1)
+	raw = strings.Replace(raw, `"fallback": {"enabled": false},`, `"fallback": {"enabled": false}, "admin_panel": {"enabled": true, "tenant_id": "tenant", "user_id": "user"},`, 1)
+	if _, err := Parse([]byte(raw), lookupMap(map[string]string{
+		"TEST_CLIENT_ID":     "id",
+		"TEST_CLIENT_SECRET": "secret",
+	})); err == nil || !strings.Contains(err.Error(), "admin_panel.enabled") {
+		t.Fatalf("Parse error = %v, want the development-only admin-panel error", err)
+	}
+}
+
+func TestValidateEnabledAdminPanelRequiresSeparateRedirectURI(t *testing.T) {
+	raw := strings.Replace(minimalConfig(), `"environment": "test"`, `"environment": "development"`, 1)
+	raw = strings.Replace(raw, `"fallback": {"enabled": false},`, `"fallback": {"enabled": false}, "admin_panel": {"enabled": true, "tenant_id": "tenant", "user_id": "user"},`, 1)
+	if _, err := Parse([]byte(raw), lookupMap(map[string]string{
+		"TEST_CLIENT_ID":     "id",
+		"TEST_CLIENT_SECRET": "secret",
+	})); err == nil || !strings.Contains(err.Error(), "admin_redirect_uri") {
+		t.Fatalf("Parse error = %v, want the separate callback error", err)
+	}
+}
+
 func TestValidateRejectsImpossibleRetryBudget(t *testing.T) {
 	// Three attempts of five seconds cannot fit in an eight second budget. If the
 	// budget were allowed, the coordinator would silently truncate the retry loop
@@ -292,7 +315,7 @@ func TestValidateAllowsEndpointInsideHostAllowList(t *testing.T) {
 }
 
 func TestValidateRejectsMissingPostgresDSN(t *testing.T) {
-	raw := strings.Replace(minimalConfig(), `"driver": "sqlite", "dsn": "file::memory:"`,
+	raw := strings.Replace(minimalConfig(), `"driver": "sqlite", "sqlite_path": "file::memory:"`,
 		`"driver": "postgres"`, 1)
 	if _, err := Parse([]byte(raw), lookupMap(nil)); err == nil {
 		t.Fatal("a postgres driver without a DSN must be rejected")
@@ -366,8 +389,8 @@ func TestLoadMissingFileIsAnError(t *testing.T) {
 }
 
 func TestSQLiteIsForcedToASingleConnection(t *testing.T) {
-	raw := strings.Replace(minimalConfig(), `"driver": "sqlite", "dsn": "file::memory:"`,
-		`"driver": "sqlite", "dsn": "file::memory:", "max_open_conns": 25`, 1)
+	raw := strings.Replace(minimalConfig(), `"driver": "sqlite", "sqlite_path": "file::memory:"`,
+		`"driver": "sqlite", "sqlite_path": "file::memory:", "max_open_conns": 25`, 1)
 	cfg, err := Parse([]byte(raw), lookupMap(nil))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
@@ -451,6 +474,46 @@ func TestSecretFieldsAndRedactedSummaryDoNotLeak(t *testing.T) {
 	for _, secret := range []string{"AKIAREALKEY", "veryrealsecret", "csecret"} {
 		if strings.Contains(rendered, secret) {
 			t.Errorf("summary or field list leaked the secret %q", secret)
+		}
+	}
+}
+
+func TestCheckedInJSONUsesEnvironmentReferencesForCredentials(t *testing.T) {
+	type backendRefs struct {
+		AccessKeyIDRef     string `json:"access_key_id_ref"`
+		SecretAccessKeyRef string `json:"secret_access_key_ref"`
+		SessionTokenRef    string `json:"session_token_ref"`
+	}
+	type checkedInConfig struct {
+		Drive struct {
+			ClientIDRef     string `json:"client_id_ref"`
+			ClientSecretRef string `json:"client_secret_ref"`
+		} `json:"drive"`
+		Security struct {
+			EncryptionKeyRef string `json:"encryption_key_ref"`
+		} `json:"security"`
+		Fallback struct {
+			Backends []backendRefs `json:"backends"`
+		} `json:"fallback"`
+	}
+
+	for _, path := range []string{"../../config/config.development.json", "../../config/config.production.json"} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		var checkedIn checkedInConfig
+		if err := json.Unmarshal(raw, &checkedIn); err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		refs := []string{checkedIn.Drive.ClientIDRef, checkedIn.Drive.ClientSecretRef, checkedIn.Security.EncryptionKeyRef}
+		for _, backend := range checkedIn.Fallback.Backends {
+			refs = append(refs, backend.AccessKeyIDRef, backend.SecretAccessKeyRef, backend.SessionTokenRef)
+		}
+		for _, ref := range refs {
+			if ref != "" && !strings.HasPrefix(ref, "STORVIA_") {
+				t.Errorf("%s contains a credential value or non-standard reference %q; use an STORVIA_* environment reference", path, ref)
+			}
 		}
 	}
 }

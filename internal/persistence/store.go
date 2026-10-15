@@ -57,7 +57,10 @@ func (s *Store) Close() error { return s.db.Close() }
 // configuration produces SQLITE_BUSY under concurrent uploads, and a busy error
 // after a provider write is exactly the kind of uncertainty this design refuses
 // to create.
-func Open(ctx context.Context, cfg config.DatabaseConfig) (*Store, error) {
+//
+// password carries the resolved Postgres password. It is passed in rather than read
+// here so that no layer below the application entry point touches the environment.
+func Open(ctx context.Context, cfg config.DatabaseConfig, password string) (*Store, error) {
 	var driverName, dsn string
 	var dialect Dialect
 
@@ -65,11 +68,11 @@ func Open(ctx context.Context, cfg config.DatabaseConfig) (*Store, error) {
 	case config.DriverSQLite:
 		dialect = DialectSQLite
 		driverName = "sqlite"
-		dsn = normalizeSQLiteDSN(cfg.DSN)
+		dsn = normalizeSQLiteDSN(cfg.BuildDSN(""))
 	case config.DriverPostgres:
 		dialect = DialectPostgres
 		driverName = "pgx"
-		dsn = cfg.DSN
+		dsn = cfg.BuildDSN(password)
 	default:
 		return nil, fmt.Errorf("persistence: unsupported driver %q", cfg.Driver)
 	}

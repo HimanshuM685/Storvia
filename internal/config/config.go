@@ -13,26 +13,29 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
 
 // Config is the whole service configuration.
 type Config struct {
-	Environment string          `json:"environment"`
-	Service     ServiceConfig   `json:"service"`
-	Server      ServerConfig    `json:"server"`
-	Logging     LoggingConfig   `json:"logging"`
-	Database    DatabaseConfig  `json:"database"`
-	Cache       CacheConfig     `json:"cache"`
-	Auth        AuthConfig      `json:"auth"`
-	Security    SecurityConfig  `json:"security"`
-	Uploads     UploadsConfig   `json:"uploads"`
-	Drive       DriveConfig     `json:"drive"`
-	Fallback    FallbackConfig  `json:"fallback"`
-	Telemetry   TelemetryConfig `json:"telemetry"`
+	Environment string           `json:"environment"`
+	Service     ServiceConfig    `json:"service"`
+	Server      ServerConfig     `json:"server"`
+	Logging     LoggingConfig    `json:"logging"`
+	Database    DatabaseConfig   `json:"database"`
+	Cache       CacheConfig      `json:"cache"`
+	Auth        AuthConfig       `json:"auth"`
+	AdminPanel  AdminPanelConfig `json:"admin_panel"`
+	Security    SecurityConfig   `json:"security"`
+	Uploads     UploadsConfig    `json:"uploads"`
+	Drive       DriveConfig      `json:"drive"`
+	Fallback    FallbackConfig   `json:"fallback"`
+	Telemetry   TelemetryConfig  `json:"telemetry"`
 }
 
 // ServiceConfig carries build identity stamped onto every log record.
@@ -71,16 +74,61 @@ type LoggingConfig struct {
 // DatabaseConfig selects the relational metadata store.
 //
 // SQLite is for development and single-node evaluation; PostgreSQL is the
-// production target. The DSN is always a secret reference.
+// production target.
+//
+// The connection parameters are split by secrecy, not by convenience. Host, port,
+// user, and database name are not secrets and live here as plain values, because
+// putting them behind an environment reference would push ordinary configuration
+// into a secrets file for no benefit. Only the password is a secret, and only the
+// password is referenced.
 type DatabaseConfig struct {
-	Driver          string   `json:"driver"`
-	DSN             string   `json:"dsn"`
+	Driver string `json:"driver"`
+
+	// SQLitePath is the SQLite file location. Not a secret.
+	SQLitePath string `json:"sqlite_path"`
+
+	// Postgres connection parameters. Not secrets.
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	User     string `json:"user"`
+	Database string `json:"database"`
+	// SSLMode is passed through to the driver. Not a secret.
+	SSLMode string `json:"sslmode"`
+
+	// PasswordRef names the environment variable holding the Postgres password.
+	// It is a reference, never the password itself.
+	PasswordRef string `json:"password_ref"`
+
 	MaxOpenConns    int      `json:"max_open_conns"`
 	MaxIdleConns    int      `json:"max_idle_conns"`
 	ConnMaxLifetime Duration `json:"conn_max_lifetime"`
 	ConnMaxIdleTime Duration `json:"conn_max_idle_time"`
 	AutoMigrate     bool     `json:"auto_migrate"`
 	MigrationsDir   string   `json:"migrations_dir"`
+}
+
+// BuildDSN assembles the driver connection string from the plain parameters and
+// the resolved password.
+//
+// It is built here rather than read whole from configuration because a complete
+// DSN contains a credential, and a complete DSN in a checked-in file is a
+// credential in version control.
+func (c DatabaseConfig) BuildDSN(password string) string {
+	switch c.Driver {
+	case DriverSQLite:
+		path := c.SQLitePath
+		if path == "" {
+			path = "file::memory:"
+		}
+		return path
+	default:
+		sslMode := c.SSLMode
+		if sslMode == "" {
+			sslMode = "require"
+		}
+		return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
+			c.User, url.QueryEscape(password), c.Host, c.Port, c.Database, sslMode)
+	}
 }
 
 // DriverSQLite and DriverPostgres are the accepted database drivers.
@@ -91,11 +139,16 @@ const (
 
 // CacheConfig selects the cache backend. Memory is the default; Redis is for
 // multi-instance deployments that must share token and circuit state.
+//
+// The address is not a secret and is a plain value. Only the password is a secret,
+// so only the password is a reference.
 type CacheConfig struct {
-	Driver            string   `json:"driver"`
-	RedisAddress      string   `json:"redis_address"`
-	RedisPassword     string   `json:"redis_password"`
-	RedisDatabase     int      `json:"redis_database"`
+	Driver       string `json:"driver"`
+	RedisAddress string `json:"redis_address"`
+	// RedisPasswordRef names the environment variable holding the Redis password.
+	RedisPasswordRef string `json:"redis_password_ref"`
+	RedisDatabase    int    `json:"redis_database"`
+
 	JanitorInterval   Duration `json:"janitor_interval"`
 	AccessTokenTTL    Duration `json:"access_token_ttl"`
 	PreflightTTL      Duration `json:"preflight_ttl"`
@@ -112,10 +165,25 @@ const (
 // AuthConfig controls application sign-in. Application identity is deliberately
 // separate from Google Drive authorization.
 type AuthConfig struct {
-	SessionCookieName string   `json:"session_cookie_name"`
-	SessionTTL        Duration `json:"session_ttl"`
-	SecureCookie      bool     `json:"secure_cookie"`
-	TrustedProxies    []string `json:"trusted_proxies"`
+	// SessionSigningKeyRef names the environment variable holding the HMAC key
+	// used to sign session tokens. The variable *name* is configuration and lives
+	// here; the key itself lives only in the environment.
+	SessionSigningKeyRef string   `json:"session_signing_key_ref"`
+	SessionCookieName    string   `json:"session_cookie_name"`
+	SessionTTL           Duration `json:"session_ttl"`
+	SecureCookie         bool     `json:"secure_cookie"`
+	TrustedProxies       []string `json:"trusted_proxies"`
+}
+
+// AdminPanelConfig controls the local development panel used to exercise the
+// Google Drive consent flow. It is intentionally separate from application
+// authentication: the panel mints a normal Storvia session only after Google
+// completes the Drive OAuth exchange.
+type AdminPanelConfig struct {
+	Enabled    bool   `json:"enabled"`
+	TenantID   string `json:"tenant_id"`
+	UserID     string `json:"user_id"`
+	FlowCookie string `json:"flow_cookie"`
 }
 
 // SecurityConfig holds references to key material. Values arrive from the
@@ -184,6 +252,7 @@ type DriveConfig struct {
 	ClientIDRef       string   `json:"client_id_ref"`
 	ClientSecretRef   string   `json:"client_secret_ref"`
 	RedirectURI       string   `json:"redirect_uri"`
+	AdminRedirectURI  string   `json:"admin_redirect_uri"`
 	Scopes            []string `json:"scopes"`
 	RootFolderName    string   `json:"root_folder_name"`
 	PreflightTimeout  Duration `json:"preflight_timeout"`
@@ -400,11 +469,17 @@ func (c *Config) applyDefaults() {
 	if c.Cache.CircuitStateTTL == 0 {
 		c.Cache.CircuitStateTTL = Duration(2 * time.Minute)
 	}
+	if c.Auth.SessionSigningKeyRef == "" {
+		c.Auth.SessionSigningKeyRef = "STORVIA_SESSION_SIGNING_KEY"
+	}
 	if c.Auth.SessionCookieName == "" {
 		c.Auth.SessionCookieName = "storvia_session"
 	}
 	if c.Auth.SessionTTL == 0 {
 		c.Auth.SessionTTL = Duration(12 * time.Hour)
+	}
+	if c.AdminPanel.FlowCookie == "" {
+		c.AdminPanel.FlowCookie = "storvia_admin_flow"
 	}
 	if c.Security.MaxClockSkew == 0 {
 		c.Security.MaxClockSkew = Duration(2 * time.Minute)
@@ -475,11 +550,33 @@ func (c *Config) Validate() error {
 	if err := c.validateDrive(); err != nil {
 		return err
 	}
+	if err := c.validateAdminPanel(); err != nil {
+		return err
+	}
 	if err := c.validateFallback(); err != nil {
 		return err
 	}
 	if err := c.validateUploads(); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (c *Config) validateAdminPanel() error {
+	if !c.AdminPanel.Enabled {
+		return nil
+	}
+	if c.Environment != "development" {
+		return fmt.Errorf("config: admin_panel.enabled is permitted only in the development environment")
+	}
+	if strings.TrimSpace(c.AdminPanel.TenantID) == "" || strings.TrimSpace(c.AdminPanel.UserID) == "" {
+		return fmt.Errorf("config: admin_panel.tenant_id and admin_panel.user_id are required when the panel is enabled")
+	}
+	if strings.TrimSpace(c.Drive.AdminRedirectURI) == "" {
+		return fmt.Errorf("config: drive.admin_redirect_uri is required when the admin panel is enabled")
+	}
+	if strings.TrimSpace(c.AdminPanel.FlowCookie) == "" {
+		return fmt.Errorf("config: admin_panel.flow_cookie must not be empty")
 	}
 	return nil
 }
@@ -493,17 +590,40 @@ func (c *Config) validateDatabase() error {
 		if c.Database.MaxOpenConns > 1 {
 			c.Database.MaxOpenConns = 1
 		}
+		if c.Database.SQLitePath == "" {
+			return fmt.Errorf("config: database.sqlite_path is required for the %s driver", DriverSQLite)
+		}
 	case DriverPostgres:
-		if c.Database.DSN == "" {
-			return fmt.Errorf("config: database.dsn is required for the %s driver", DriverPostgres)
+		// Every connection parameter except the password is ordinary
+		// configuration and must be present as a plain value.
+		if c.Database.Host == "" {
+			return fmt.Errorf("config: database.host is required for the %s driver", DriverPostgres)
+		}
+		if c.Database.Port == 0 {
+			return fmt.Errorf("config: database.port is required for the %s driver", DriverPostgres)
+		}
+		if c.Database.User == "" {
+			return fmt.Errorf("config: database.user is required for the %s driver", DriverPostgres)
+		}
+		if c.Database.Database == "" {
+			return fmt.Errorf("config: database.database is required for the %s driver", DriverPostgres)
+		}
+		if c.Database.PasswordRef == "" {
+			return fmt.Errorf("config: database.password_ref is required for the %s driver; "+
+				"the password itself belongs in the environment, never in this file", DriverPostgres)
+		}
+		// A Postgres deployment with TLS off is a deployment mistake worth naming,
+		// because the DSN travels credentials across the wire.
+		if c.Database.SSLMode == "" || c.Database.SSLMode == "disable" {
+			if c.Environment == "production" {
+				return fmt.Errorf("config: database.sslmode must not be %q in production; "+
+					"the DSN carries a credential", c.Database.SSLMode)
+			}
 		}
 	case "":
 		return fmt.Errorf("config: database.driver is required (use %q or %q)", DriverSQLite, DriverPostgres)
 	default:
 		return fmt.Errorf("config: unsupported database.driver %q", c.Database.Driver)
-	}
-	if c.Database.Driver == DriverSQLite && c.Database.DSN == "" {
-		return fmt.Errorf("config: database.dsn is required for the %s driver", DriverSQLite)
 	}
 	return nil
 }
@@ -649,24 +769,181 @@ func (c *Config) validateUploads() error {
 	return nil
 }
 
+// SecretRefs returns every environment reference that must resolve to a secret.
+//
+// It is the authoritative list, so startup validation, the redaction log line, and
+// the tests all agree on what "secret" means instead of each keeping its own list.
+func (c *Config) SecretRefs() []SecretRef {
+	refs := []SecretRef{
+		{Field: "security.encryption_key", EnvVar: c.Security.EncryptionKeyRef, Required: true},
+		{Field: "auth.session_signing_key", EnvVar: c.Auth.SessionSigningKeyRef, Required: true},
+		{Field: "drive.client_id", EnvVar: c.Drive.ClientIDRef, Required: false},
+		{Field: "drive.client_secret", EnvVar: c.Drive.ClientSecretRef, Required: false},
+	}
+	if c.Security.EncryptionKeyPrevious != "" {
+		refs = append(refs, SecretRef{
+			Field: "security.encryption_key_previous", EnvVar: c.Security.EncryptionKeyPrevious, Required: false,
+		})
+	}
+	if c.Cache.Driver == DriverRedis && c.Cache.RedisPasswordRef != "" {
+		refs = append(refs, SecretRef{
+			Field: "cache.redis_password", EnvVar: c.Cache.RedisPasswordRef, Required: false,
+		})
+	}
+	if c.Database.Driver == DriverPostgres {
+		refs = append(refs, SecretRef{
+			Field: "database.password", EnvVar: c.Database.PasswordRef, Required: true,
+		})
+	}
+	for _, backend := range c.Fallback.Backends {
+		if backend.Disabled {
+			continue
+		}
+		refs = append(refs,
+			SecretRef{Field: "fallback.backends[" + backend.ID + "].access_key_id",
+				EnvVar: backend.AccessKeyIDRef, Required: true},
+			SecretRef{Field: "fallback.backends[" + backend.ID + "].secret_access_key",
+				EnvVar: backend.SecretAccessKeyRef, Required: true},
+		)
+		if backend.SessionTokenRef != "" {
+			refs = append(refs, SecretRef{
+				Field:  "fallback.backends[" + backend.ID + "].session_token",
+				EnvVar: backend.SessionTokenRef, Required: false,
+			})
+		}
+	}
+	return refs
+}
+
+// SecretRef is one environment reference to a secret.
+type SecretRef struct {
+	// Field is the dotted configuration path, used in error messages.
+	Field string
+	// EnvVar is the environment variable name. It names the variable, never its
+	// value.
+	EnvVar string
+	// Required is false for a reference that is only needed when the feature it
+	// belongs to is switched on.
+	Required bool
+}
+
+// ValidateSecretRefs rejects a reference that is not an environment variable name.
+//
+// This is the guard that keeps the boundary honest. A developer who pastes an
+// actual AWS key into `access_key_id_ref` gets a startup error naming the field,
+// instead of a configuration that silently never authenticates.
+func ValidateSecretRefs(refs []SecretRef) error {
+	for _, ref := range refs {
+		if ref.EnvVar == "" {
+			if ref.Required {
+				return fmt.Errorf("config: %s has no environment reference set", ref.Field)
+			}
+			continue
+		}
+		if !validEnvVarName(ref.EnvVar) {
+			return fmt.Errorf("config: %s must name an environment variable, not a value; "+
+				"got %q. Secrets belong in the environment, never in a JSON config file",
+				ref.Field, redactIfCredential(ref.EnvVar))
+		}
+		if looksLikeCredential(ref.EnvVar) {
+			return fmt.Errorf("config: %s appears to contain a credential rather than a "+
+				"variable name. Secrets belong in the environment, never in a JSON config file",
+				ref.Field)
+		}
+	}
+	return nil
+}
+
+// validEnvVarName matches a conventional environment variable name.
+func validEnvVarName(name string) bool {
+	for i, r := range name {
+		switch {
+		case r == '_':
+		case r >= 'A' && r <= 'Z':
+		case r >= 'a' && r <= 'z':
+		case i > 0 && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return name != ""
+}
+
+// credentialPrefixes are recognizable starts of real credentials, used to catch a
+// secret pasted where a variable name belongs.
+var credentialPrefixes = []string{
+	"AKIA", "ASIA", "ya29.", "sk-", "ghp_", "gho_", "xoxb-", "-----BEGIN",
+}
+
+// looksLikeCredential reports whether a value resembles a real secret.
+//
+// It is a heuristic and deliberately narrow: it would rather miss an unusual
+// credential than reject a legitimate variable name.
+func looksLikeCredential(value string) bool {
+	for _, prefix := range credentialPrefixes {
+		if strings.HasPrefix(value, prefix) {
+			return true
+		}
+	}
+	// A long opaque string with no underscores is almost always a credential; a
+	// variable name nearly always contains one.
+	if len(value) >= 40 && !strings.Contains(value, "_") {
+		return true
+	}
+	return false
+}
+
+// redactIfCredential masks a value that looks like a credential so an error
+// message can name the field without reprinting the secret.
+func redactIfCredential(value string) string {
+	if looksLikeCredential(value) {
+		return "[REDACTED]"
+	}
+	return value
+}
+
+// ResolveSecrets resolves every reference through lookup.
+//
+// It fails when a required secret is absent. That failure matters: previously a
+// missing secret produced an empty credential, which surfaced much later as an
+// authentication error, or worse, as a silently disabled fallback backend.
+func (c *Config) ResolveSecrets(lookup func(string) (string, bool)) (map[string]string, error) {
+	if err := ValidateSecretRefs(c.SecretRefs()); err != nil {
+		return nil, err
+	}
+
+	resolved := make(map[string]string, len(c.SecretRefs()))
+	var missing []string
+	for _, ref := range c.SecretRefs() {
+		if ref.EnvVar == "" {
+			continue
+		}
+		value, ok := lookup(ref.EnvVar)
+		if !ok || value == "" {
+			if ref.Required {
+				missing = append(missing, fmt.Sprintf("%s (%s)", ref.Field, ref.EnvVar))
+			}
+			continue
+		}
+		resolved[ref.EnvVar] = value
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return nil, fmt.Errorf("config: required secret(s) not set in the environment: %s",
+			strings.Join(missing, ", "))
+	}
+	return resolved, nil
+}
+
 // SecretFields returns the dotted paths of every field holding resolved secret
 // material. Diagnostics print these paths with a redacted marker so an operator
 // can confirm a key arrived without seeing its value.
 func (c *Config) SecretFields() []string {
-	paths := []string{
-		"database.dsn",
-		"cache.redis_password",
-		"drive.client_id",
-		"drive.client_secret",
-		"security.encryption_key",
+	out := make([]string, 0, len(c.SecretRefs()))
+	for _, ref := range c.SecretRefs() {
+		out = append(out, ref.Field)
 	}
-	for _, b := range c.Fallback.Backends {
-		paths = append(paths,
-			"fallback.backends["+b.ID+"].access_key_id",
-			"fallback.backends["+b.ID+"].secret_access_key",
-		)
-	}
-	return paths
+	return out
 }
 
 // RedactedSummary renders a startup summary with no secret values, used by the
