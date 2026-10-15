@@ -45,6 +45,10 @@ type App struct {
 	// without going through HTTP.
 	Uploads *service.UploadService
 	Objects *service.ObjectService
+	// DriveFaultsEnabled reports whether deliberate Drive fault injection is armed.
+	// The admin panel shows it, because a service that believes Drive is down when
+	// it is not would otherwise be very confusing to debug.
+	DriveFaultsEnabled bool
 	// Issues lists degraded-but-started conditions an operator must resolve.
 	Issues []string
 }
@@ -118,7 +122,7 @@ func Build(ctx context.Context, opts Options) (*App, error) {
 		return nil, err
 	}
 
-	driveClient, err := buildDrive(ctx, cfg, store, logger, keyring)
+	driveClient, err := buildDrive(ctx, cfg, store, resolvedSecrets, logger, keyring)
 	if err != nil {
 		cacheBackend.Close()
 		store.Close()
@@ -154,6 +158,11 @@ func Build(ctx context.Context, opts Options) (*App, error) {
 		Secure:      cfg.Auth.SecureCookie,
 	}, issuer, sessions, connections)
 	app.Server = buildServer(cfg, logger, store, issuer, sessions, uploads, objects, connections, admin, driveClient, cacheBackend)
+
+	app.DriveFaultsEnabled = driveClient.FaultsEnabled()
+	if cfg.AdminPanel.SimulateDriveOutage && cfg.Environment == "development" {
+		logger.WarnContext(ctx, "drive outage simulation is ACTIVE; new uploads will route to the fallback provider")
+	}
 
 	logger.InfoContext(ctx, "storvia service configured",
 		"summary", cfg.RedactedSummary(),
@@ -242,13 +251,13 @@ func buildKeyring(cfg *config.Config, resolved map[string]string) (*secrets.AESG
 }
 
 // buildDrive constructs the Drive provider.
-func buildDrive(ctx context.Context, cfg *config.Config, store *persistence.Store, logger *slog.Logger, keyring secrets.Keyring) (*drive.Client, error) {
+func buildDrive(ctx context.Context, cfg *config.Config, store *persistence.Store, resolved map[string]string, logger *slog.Logger, keyring secrets.Keyring) (*drive.Client, error) {
 	connections := persistence.NewDriveConnectionRepository(store, keyring)
 
 	client, err := drive.New(ctx, drive.Config{
 		Credentials: drive.Credentials{
-			ClientID:     os.Getenv(cfg.Drive.ClientIDRef),
-			ClientSecret: os.Getenv(cfg.Drive.ClientSecretRef),
+			ClientID:     resolved[cfg.Drive.ClientIDRef],
+			ClientSecret: resolved[cfg.Drive.ClientSecretRef],
 			RedirectURI:  cfg.Drive.RedirectURI,
 		},
 		Scopes:           cfg.Drive.Scopes,
@@ -259,6 +268,11 @@ func buildDrive(ctx context.Context, cfg *config.Config, store *persistence.Stor
 		Resolver: drive.NewResolver(connections),
 		States:   drive.NewStateStore(10 * time.Minute),
 		Logger:   logger,
+		// Fault injection is gated on the environment, never on configuration. A
+		// config file can be copied from development into production by accident;
+		// an environment cannot.
+		Faults: drive.NewFaultInjection(
+			cfg.Environment == "development", cfg.AdminPanel.SimulateDriveOutage),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("app: drive client: %w", err)

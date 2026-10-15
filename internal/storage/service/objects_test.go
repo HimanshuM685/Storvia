@@ -112,6 +112,7 @@ func newS3ObjectService(t *testing.T, source ContentSource) (*ObjectService, *Up
 		errors:       []error{outage},
 	}
 	svc := newTestService(t, drive, func(deps *Dependencies) {
+		deps.FallbackUploader = newStubFallback()
 		deps.Fallback = config.FallbackConfig{
 			Enabled: true,
 			Backends: []config.S3BackendConfig{{

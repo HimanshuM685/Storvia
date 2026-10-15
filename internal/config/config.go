@@ -175,6 +175,15 @@ type AdminPanelConfig struct {
 	TenantID   string `json:"tenant_id"`
 	UserID     string `json:"user_id"`
 	FlowCookie string `json:"flow_cookie"`
+
+	// SimulateDriveOutage forces the read-only Drive availability preflight to
+	// report a transport failure, so the outage-routing path can be exercised on
+	// demand instead of waiting for a real Google incident.
+	//
+	// It is refused outside development. A provider that can be told to lie about
+	// its own health is a way to disable the service's safety checks, so this is a
+	// stop-the-line error rather than a warning.
+	SimulateDriveOutage bool `json:"simulate_drive_outage,omitempty"`
 }
 
 // SecurityConfig holds references to key material. Values arrive from the
@@ -508,6 +517,14 @@ func (c *Config) Validate() error {
 }
 
 func (c *Config) validateAdminPanel() error {
+	// Fault injection is checked before the enabled flag, so it is refused even
+	// when the panel itself is off. Otherwise a configuration could enable a fault
+	// and leave the panel disabled, which looks harmless and is not.
+	if c.AdminPanel.SimulateDriveOutage && c.Environment != "development" {
+		return fmt.Errorf("config: admin_panel.simulate_drive_outage is permitted only in the " +
+			"development environment. Fault injection that can ship is a way to disable the " +
+			"service's own safety checks")
+	}
 	if !c.AdminPanel.Enabled {
 		return nil
 	}

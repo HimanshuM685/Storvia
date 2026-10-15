@@ -313,6 +313,7 @@ func TestCreateUploadSelectsFallbackOnlyOnAnEligibleOutage(t *testing.T) {
 			}
 
 			svc := newTestService(t, drive, func(deps *Dependencies) {
+				deps.FallbackUploader = newStubFallback()
 				deps.Fallback = config.FallbackConfig{
 					Enabled: tc.backend,
 					Backends: []config.S3BackendConfig{{

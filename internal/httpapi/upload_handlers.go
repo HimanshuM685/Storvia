@@ -151,14 +151,38 @@ func (h *UploadHandler) Chunks(w http.ResponseWriter, r *http.Request) {
 }
 
 // Complete handles POST /v1/storage/uploads/{upload_id}/complete.
+//
+// It is idempotent: a repeat returns the object that is already ready rather than
+// writing again. Verification compares the provider's confirmed size against the
+// declared size, so a truncated or substituted upload never becomes a ready
+// location.
 func (h *UploadHandler) Complete(w http.ResponseWriter, r *http.Request) {
-	if _, err := scopeFrom(r); err != nil {
+	scope, err := scopeFrom(r)
+	if err != nil {
 		WriteProblem(w, r, err)
 		return
 	}
-	WriteProblem(w, r, apperr.New(apperr.KindProviderNotConfigured,
-		"Provider transfer not implemented",
-		"upload completion is not implemented in this release"))
+	uploadID := r.PathValue("upload_id")
+	if uploadID == "" {
+		WriteProblem(w, r, apperr.Validation("upload_id is required"))
+		return
+	}
+
+	result, err := h.svc.CompleteUpload(r.Context(), scope, uploadID)
+	if err != nil {
+		WriteProblem(w, r, err)
+		return
+	}
+
+	// A repeat is not a new creation, so it answers 200 rather than 201.
+	status := http.StatusCreated
+	if result.AlreadyComplete {
+		status = http.StatusOK
+	}
+	WriteJSON(w, status, map[string]any{
+		"object":           newObjectResponse(result.Object),
+		"already_complete": result.AlreadyComplete,
+	})
 }
 
 // Reconcile handles POST /v1/storage/uploads/{upload_id}/reconcile.

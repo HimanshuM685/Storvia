@@ -88,6 +88,8 @@ type Client struct {
 	// endpoint can report a missing deployment configuration without duplicating
 	// the credential check.
 	configured bool
+	// faults gates deliberate failure injection for testing. See faults.go.
+	faults FaultInjection
 
 	// tokens caches short-lived access tokens per connection. It is an
 	// interface, so a multi-instance deployment can put the shared cache behind
@@ -204,6 +206,7 @@ func New(ctx context.Context, cfg Config, deps ClientDeps) (*Client, error) {
 		tokens:     deps.Tokens,
 		states:     deps.States,
 		conns:      deps.Resolver,
+		faults:     deps.Faults,
 	}, nil
 }
 
@@ -213,6 +216,9 @@ type ClientDeps struct {
 	Resolver ConnectionResolver
 	States   *StateStore
 	Logger   *slog.Logger
+	// Faults gates deliberate failure injection. It is only ever set by
+	// development wiring.
+	Faults FaultInjection
 }
 
 // Configured reports whether Google credentials are present.
@@ -237,6 +243,12 @@ func (c *Client) Name() string { return string(model.ProviderGoogleDrive) }
 // not see them anyway and a broader query would be a scope violation in spirit
 // even when the token allows it.
 func (c *Client) Availability(ctx context.Context, scope model.AvailabilityScope) error {
+	return c.faults.simulateUnavailable(ctx, scope, c.availability)
+}
+
+// availability is the real read-only check. Availability wraps it so fault
+// injection can short-circuit it without duplicating the logic.
+func (c *Client) availability(ctx context.Context, scope model.AvailabilityScope) error {
 	if !c.Configured() {
 		return &policy.ProviderError{
 			Provider:  c.Name(),

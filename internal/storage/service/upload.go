@@ -56,9 +56,13 @@ type Dependencies struct {
 	UploadLimits config.UploadsConfig
 	DriveCfg     config.DriveConfig
 	Fallback     config.FallbackConfig
-	IDs          *idid.Generator
-	Logger       *slog.Logger
-	Now          Clock
+	// FallbackUploader plans and verifies uploads on the S3-compatible provider.
+	// It is nil when the fallback is disabled, which is what makes completion
+	// report honestly rather than pretending to work.
+	FallbackUploader FallbackUploader
+	IDs              *idid.Generator
+	Logger           *slog.Logger
+	Now              Clock
 	// Jitter supplies the backoff seed. Tests pass a fixed value.
 	Jitter func() float64
 	// Sleep is the backoff wait, injected so tests do not sleep.
@@ -405,6 +409,16 @@ func (s *UploadService) routeAndSelect(ctx context.Context, scope persistence.Sc
 	result.Mode = model.ModeS3PresignedParts
 	result.ChunkSize = s.deps.UploadLimits.S3PartSizeBytes
 	result.ExpiresAt = s.deps.Now().Add(s.deps.UploadLimits.PresignedURLTTL.Duration())
+
+	// The capabilities are planned only now: the policy has already selected the
+	// fallback and the attempt row is durable, so a client cannot reach this path
+	// for a Drive upload.
+	parts, err := presignedPartsFor(s.deps.FallbackUploader, *backendID, plannedIdentity,
+		object.ExpectedSize, s.deps.UploadLimits.PresignedURLTTL.Duration())
+	if err != nil {
+		return CreateUploadResult{}, err
+	}
+	result.Parts = parts
 	return result, nil
 }
 
