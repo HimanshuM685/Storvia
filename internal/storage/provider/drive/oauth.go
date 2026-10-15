@@ -21,11 +21,22 @@ import (
 // stolen authorization code could be redeemed by another session, which is the
 // classic OAuth CSRF/account-mix-up attack.
 func (c *Client) AuthorizeURL(state, browserBinding string) (string, error) {
+	return c.AuthorizeURLWithRedirect(state, browserBinding, c.cfg.Credentials.RedirectURI)
+}
+
+// AuthorizeURLWithRedirect builds the consent URL for a registered redirect
+// URI. The development admin panel uses its own callback while the normal API
+// keeps its existing callback, so both flows can be registered in one Google
+// OAuth client without changing the application's default flow.
+func (c *Client) AuthorizeURLWithRedirect(state, browserBinding, redirectURI string) (string, error) {
 	if !c.Configured() {
 		return "", ErrNotConfigured
 	}
 	if state == "" {
 		return "", errors.New("drive: oauth state is required")
+	}
+	if redirectURI == "" {
+		return "", errors.New("drive: oauth redirect URI is required")
 	}
 
 	query := url.Values{}
@@ -38,9 +49,11 @@ func (c *Client) AuthorizeURL(state, browserBinding string) (string, error) {
 	query.Set("include_granted_scopes", "true")
 	query.Set("response_type", "code")
 	query.Set("scope", scopesParam(c.cfg.Scopes))
-	query.Set("redirect_uri", c.cfg.Credentials.RedirectURI)
-	// The state is a random value whose digest is bound to the browser binding.
-	query.Set("state", state+":"+browserBinding)
+	query.Set("redirect_uri", redirectURI)
+	// The state is the random value stored server-side. The browser binding is
+	// checked separately by StateStore. Combining the two values here would make
+	// the callback return a state key that cannot be consumed from that store.
+	query.Set("state", state)
 
 	return authorizeURL + "?" + query.Encode(), nil
 }
@@ -59,8 +72,18 @@ type ExchangeResult struct {
 // invalid_grant, network) without including the code, the token, or the raw
 // provider body.
 func (c *Client) Exchange(ctx context.Context, scope Scope, code, state, browserBinding string) (ExchangeResult, error) {
+	return c.ExchangeWithRedirect(ctx, scope, code, state, browserBinding, c.cfg.Credentials.RedirectURI)
+}
+
+// ExchangeWithRedirect completes a consent flow using a specific registered
+// redirect URI. It shares the same state, token, and persistence safeguards as
+// the normal API callback.
+func (c *Client) ExchangeWithRedirect(ctx context.Context, scope Scope, code, state, browserBinding, redirectURI string) (ExchangeResult, error) {
 	if !c.Configured() {
 		return ExchangeResult{}, ErrNotConfigured
+	}
+	if redirectURI == "" {
+		return ExchangeResult{}, errors.New("drive: oauth redirect URI is required")
 	}
 	if !c.states.Consume(state, browserBinding) {
 		// A wrong or replayed state is rejected outright. Guessing is not
@@ -74,7 +97,7 @@ func (c *Client) Exchange(ctx context.Context, scope Scope, code, state, browser
 	form.Set("client_secret", c.cfg.Credentials.ClientSecret)
 	// The redirect URI must match the authorization request byte for byte,
 	// including a trailing slash.
-	form.Set("redirect_uri", c.cfg.Credentials.RedirectURI)
+	form.Set("redirect_uri", redirectURI)
 	form.Set("grant_type", "authorization_code")
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint,

@@ -22,6 +22,7 @@ type Config struct {
 	Uploads     *UploadHandler
 	Objects     *ObjectHandler
 	Connections *ConnectionHandler
+	Admin       *AdminHandler
 	Health      *HealthHandler
 
 	// AllowedOrigins is the CORS allow-list. An empty list disables CORS headers
@@ -115,6 +116,13 @@ func Router(cfg Config) http.Handler {
 	// The OAuth callback is public: Google redirects the browser here without any
 	// Storvia credential. The OAuth state value is what authenticates it.
 	root.Handle("GET /v1/storage/connections/google-drive/callback", http.HandlerFunc(cfg.Connections.Callback))
+	if cfg.Admin != nil {
+		root.Handle("GET /admin", http.HandlerFunc(cfg.Admin.Show))
+		root.Handle("GET /admin/connect", http.HandlerFunc(cfg.Admin.Connect))
+		root.Handle("GET /admin/oauth/callback", http.HandlerFunc(cfg.Admin.Callback))
+		root.Handle("POST /admin/disconnect", http.HandlerFunc(cfg.Admin.Disconnect))
+		root.Handle("POST /admin/logout", http.HandlerFunc(cfg.Admin.Logout))
+	}
 	root.Handle("/v1/", guarded)
 
 	// Anything else gets a 404 in the same error format as everything else, so a

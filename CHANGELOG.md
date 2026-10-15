@@ -17,6 +17,194 @@ Related documents:
 
 ---
 
+## 2026-10-15 — Remove dead configuration and guard the config files with tests
+
+Commit: *chore: remove dead configuration, add shipped-config guard tests*
+
+### Why
+
+The owner asked for the configuration surface to be cleaned up and the whole codebase
+brought under test. An audit found configuration that was declared, defaulted, and
+validated, but never read by any runtime code.
+
+### Dead configuration removed
+
+Every one of these was referenced only by its own default block and its own
+validation. An operator could tune the value, see no effect, and reasonably conclude
+the setting was subtly broken. That is worse than not offering the setting.
+
+| Removed | Why it was dead |
+|---|---|
+| `server.download_timeout` | Never applied. `WriteTimeout` is `0` so a streamed download is not cut off |
+| `server.max_request_body_size` | The body limit is a constant in `internal/httpapi`, not configuration |
+| `server.trusted_proxies`, `auth.trusted_proxies` | Never read. `clientIP` deliberately ignores proxy headers, because a client-supplied `X-Forwarded-For` would otherwise poison the access log |
+| `database.migrations_dir` | Migrations are compiled into the binary with `embed.FS`, so a path is meaningless |
+| `cache.access_token_ttl`, `preflight_ttl`, `circuit_state_ttl` | Cache TTLs are not wired. `MemoryTokens` and `Memory` take their own TTLs |
+| `cache.availability_scope` | Never read. The availability scope is built by the coordinator from the connection, not from configuration |
+| `security.max_clock_skew` | Never used |
+| `uploads.presigned_part_count` | Part planning is part of the unimplemented presigned path |
+| `fallback.backends[].orphan_grace_period` | Orphan cleanup is not implemented |
+| the entire `telemetry` block | `health_path`, `metrics_path`, `metrics_enabled`, and `readiness_timeout`. The three routes are registered at fixed paths in `internal/httpapi/router.go` |
+
+Configuration fields declared: 105 to 90.
+
+Deliberately **kept** despite appearing unused by a naive scan, because each is used
+inside the config package or has a documented contract:
+
+- `security.allowed_endpoint_schemes`, `allowed_endpoint_hosts` — enforced by `endpointAllowed`
+- `uploads.max_file_size_bytes`, `category_limits` — used by `EffectiveMaxSize`
+- `uploads.min_part_size_bytes` — the S3 five mebibyte minimum, enforced by validation
+- `drive.circuit_failures`, `circuit_cooldown` — defined in `docs/storage-policy.md` section 4 and covered by tests in `internal/storage/policy`
+- `fallback.backends[].disabled` — used by `ActiveBackends`
+
+### `.env.example` cleaned
+
+Removed three orphan variables that no config file referenced: `STORVIA_S3_ACCESS_KEY_ID`,
+`STORVIA_S3_SECRET_ACCESS_KEY`, and `STORVIA_S3_SESSION_TOKEN`. They documented an AWS
+alternative to the configured R2 backend, but with no `*_ref` pointing at them they
+were a secret an operator would populate for no reason. AWS S3 remains supported by the
+adapter; adding it back means adding the backend block and its references.
+
+### Added
+
+`internal/config/shipped_config_test.go` — nine tests that run against the real,
+committed configuration files rather than fixtures built inside the test:
+
+1. Both shipped files parse with an explicit environment.
+2. Neither contains a credential-shaped value.
+3. No secret-bearing field holds a value instead of a reference.
+4. Neither file uses `${VAR}` substitution, which is the property that keeps ordinary
+   settings out of `.env`.
+5. Every `*_ref` in a config file is documented in `.env.example`.
+6. Every variable in `.env.example` is referenced by a config file, so no orphan
+   secret is documented.
+7. The one compose-only exemption is genuinely used by `docker-compose.yml`.
+8. Neither file contains a key the loader does not recognise, which catches a field
+   removed from the struct but left behind in the JSON.
+
+### Two bugs in the new tests, found by running them
+
+- The environment-variable pattern matched only active assignments, so a variable
+  documented as a commented placeholder counted as undocumented. Optional variables
+  are documented precisely by being commented out, so the pattern now accepts that.
+- `looksLikeCredential` flagged OAuth scope URIs and redirect URLs, because they are
+  long strings without underscores. It now excludes anything containing `://` or `/`,
+  since a real credential carries neither. Without this the check was useless, and the
+  obvious fix was to delete it, which would have removed the guard entirely.
+
+### Verified
+
+```text
+make check                                            -> pass
+go test -race ./...                                   -> pass
+internal/config shipped-config tests                   -> 9 pass
+storvia-api -config config.development.json -check    -> valid
+```
+
+A repository-wide scan now reports no configuration field that is never read outside
+the config package's own defaults and validation.
+
+### Next step, in order
+
+Unchanged: run the PostgreSQL migration against a real instance, implement the Drive
+resumable upload verbs, then run the M3 smoke test against a controlled account.
+
+---
+
+## 2026-10-15 — Fix the configuration boundary: secrets only in the environment
+
+Commit: *fix: enforce the configuration boundary between JSON and the environment*
+
+### Why
+
+The owner corrected a standing rule: actual credentials belong only in an ignored
+`.env` or runtime secret injection, and ordinary settings such as timeouts, TTLs, and
+booleans belong only in the JSON config file. Auditing the codebase against that rule
+found six violations. All are fixed here.
+
+### Violations found and fixed
+
+| # | Violation | Fix |
+|---|---|---|
+| 1 | `database.dsn` took a whole connection string from `${STORVIA_DATABASE_DSN}`. Because a DSN contains a password, that pushed four **non-secret** values (host, port, user, database name) into `.env` | Split into plain `host`, `port`, `user`, `database`, `sslmode` in JSON plus `password_ref`. `BuildDSN(password)` assembles it at runtime, percent-encoding the password |
+| 2 | `cache.redis_address` used `${STORVIA_REDIS_ADDRESS}`. A hostname is not a secret | Plain value in JSON. Removed from `.env.example` |
+| 3 | `drive.redirect_uri` used `${STORVIA_GOOGLE_REDIRECT_URI}`. A URL is not a secret | Plain value in JSON. Removed from `.env.example` |
+| 4 | `STORVIA_SESSION_SIGNING_KEY` was hardcoded in Go. The variable **name** is configuration and belongs in JSON | New `auth.session_signing_key_ref` field, defaulting to `STORVIA_SESSION_SIGNING_KEY` |
+| 5 | `docker-compose.yml` carried an inline default password, `storvia-dev-password` | Removed. `POSTGRES_PASSWORD` is now required, so a missing value stops the stack instead of silently using a committed credential |
+| 6 | `.env.example` documented `STORVIA_R2_ACCOUNT_ID`, a non-secret, and `STORVIA_DATABASE_DSN` and `STORVIA_REDIS_ADDRESS`, also non-secrets | Rewritten so every remaining variable is genuinely a secret |
+
+### A seventh problem, found while fixing the sixth
+
+**A missing secret was silently tolerated.** `validateFallback` checked only that a
+reference *name* was non-empty, never that it resolved. An unset
+`STORVIA_R2_SECRET_ACCESS_KEY` therefore produced an empty credential, the backend
+failed to construct, and `buildBackends` logged an issue and skipped it. The
+deployment then looked like the fallback was configured while no fallback existed,
+and the outage path silently stopped working.
+
+Now `Config.ResolveSecrets` resolves every reference once at startup and fails when a
+required one is absent, naming the field and the variable. Optional references are
+only required when the feature they belong to is enabled, so a deployment without
+Google credentials still starts and reports that gap through `GET /v1/storage/status`.
+
+### Added
+
+- `Config.SecretRefs()` is the single authoritative list of what counts as a secret.
+  Startup validation, the redaction log line, and the tests all read from it, so they
+  cannot drift apart.
+- `Config.ResolveSecrets(lookup)` resolves every reference and fails fast.
+- `ValidateSecretRefs` rejects a reference that is not a variable name. It checks the
+  character set and, more usefully, looks for recognizable credential prefixes
+  (`AKIA`, `ASIA`, `ya29.`, `sk-`, `ghp_`, `xoxb-`, `-----BEGIN`) and for a long opaque
+  string with no underscores. The rejection message names the field but never
+  reprints the value.
+- `DatabaseConfig.BuildDSN(password)`, replacing the `dsn` field.
+- `internal/config/boundary_test.go` — 14 tests covering the boundary, including that
+  a credential in a reference is rejected, that the rejection does not echo the
+  credential, that an absent required secret fails startup, and that an optional
+  secret does not fail a deployment that does not use its feature.
+
+### Changed
+
+- `internal/app/app.go` — secrets are resolved once in `Build` and passed down as a
+  map. No call site reads the environment any more, so there is one place where a
+  missing secret is detected. The map is held on `App.secrets`, never logged.
+- `persistence.Open` takes the resolved password as a parameter, so no layer below
+  the entry point touches the environment.
+- `docker-compose.yml` passes only `STORVIA_DATABASE_PASSWORD`, not a full DSN.
+- `.env.example` documents only genuine secrets, and explains why the rest are absent.
+- `README.md` rewrites the configuration section around the secrecy split, including
+  the DSN mistake so the reasoning is visible.
+
+### New validation
+
+- `sslmode: disable` is rejected when `environment` is `production`, because the DSN
+  carries a credential.
+- Every ordinary Postgres parameter is required, so splitting the DSN did not make
+  anything silently optional.
+
+### Verified
+
+```text
+make check                                                  -> pass
+go test ./internal/config/...                                -> pass, 14 new tests
+storvia-api -config config.development.json -check           -> valid
+storvia-api with STORVIA_ENCRYPTION_KEY unset                -> fails, naming the field
+storvia-api with AKIA... pasted into access_key_id_ref       -> fails, value not reprinted
+```
+
+A boundary audit over the repository now reports zero violations: no `${}` references
+remain in the JSON, no credential-shaped key appears outside a `*_ref` field, no
+environment variable name is hardcoded in Go, and no inline credential default remains
+in the compose file.
+
+### Next step, in order
+
+Unchanged: run the PostgreSQL migration against a real instance, implement the Drive
+resumable upload verbs, then run the M3 smoke test against a controlled account.
+
+---
+
 ## 2026-10-14 — Containerization: Dockerfile, .dockerignore, compose stack
 
 Commit: *build: add multi-stage Dockerfile, .dockerignore, and a compose stack*
@@ -488,3 +676,107 @@ tests alone.
 - Privacy and legal acceptance that an outage upload may be stored outside the user's
   Drive. `fallback.consent_required` is hard-coded to `true` in the loader as the
   code-level stand-in until this is signed off.
+
+---
+
+## 2026-10-15 — Development admin panel for Google Drive OAuth testing
+
+Commit: *not committed; changes are left in the working tree for the owner*
+
+### Why
+
+The owner asked for a local admin panel that can complete Google OAuth and show the
+connected test user's Drive authorization. The existing application already had the
+OAuth state/token/connection foundation, but no browser page could start the flow and
+issue an application session for a controlled development identity.
+
+### Decisions settled
+
+- The panel is development-only and is rejected by configuration validation outside
+  the `development` environment.
+- It uses configured fixed development tenant/user IDs; the browser cannot select
+  either identity.
+- It uses the existing narrow `drive.file` scope and the existing encrypted refresh
+  token path.
+- The panel has a separate registered callback URI so the existing authenticated API
+  callback remains unchanged:
+  `/admin/oauth/callback` for development versus
+  `/v1/storage/connections/google-drive/callback` for the normal API.
+- The panel issues a normal Storvia session only after Google code exchange succeeds.
+- The page shows connection status, Google subject, granted scope, folder presence,
+  logout, and disconnect. It does not implement file transfer.
+
+### Added/changed
+
+- `internal/httpapi/admin_handlers.go` — server-rendered development admin page,
+  browser-bound flow cookie, OAuth start/callback, session issuance, status view,
+  logout, and disconnect.
+- `internal/httpapi/admin_handlers_test.go` — tests for the disabled gate, callback
+  session issuance, metadata rendering, unauthorized disconnect, and configured
+  connection use.
+- `internal/config/config.go` — `admin_panel` configuration and the separate
+  `drive.admin_redirect_uri`; enabled panels require development mode, fixed IDs,
+  and a callback URI.
+- `config/config.development.json` — enables the local panel with non-secret test
+  tenant/user IDs and `http://127.0.0.1:8080/admin/oauth/callback`.
+- `config/config.production.json` — explicitly disables the panel.
+- `internal/app/app.go` and `internal/httpapi/router.go` — wire the panel without
+  changing `/v1` authentication.
+- `internal/storage/provider/drive/client.go`, `oauth.go`, and
+  `internal/storage/service/connections.go` — support an operator-configured second
+  callback URI while keeping the normal flow unchanged.
+- `internal/storage/provider/drive/client_test.go` — verifies the OAuth `state`
+  query parameter is the exact server-stored state value.
+- `.env.example` — documents both the normal API callback and the development admin
+  callback as exact Google OAuth redirect URIs.
+- `internal/config/config_test.go` — verifies checked-in development/production JSON
+  uses environment references for credential-bearing fields instead of literal secret
+  values.
+- `README.md`, `docs/architecture.md`, `docs/implementation-plan.md`, and
+  `docs/risk-register.md` — record the panel, setup, and remaining live-provider gap.
+
+### Bug found and fixed
+
+The existing OAuth URL appended the browser binding to the `state` query parameter,
+while the callback attempted to consume the unmodified server-stored state. A real
+Google callback would therefore fail state lookup. The binding is already stored and
+checked separately by `StateStore`, so the URL now carries only the stored state.
+
+### Checks actually run
+
+```text
+go test ./internal/httpapi ./internal/config ./internal/storage/provider/drive ./internal/storage/service ./internal/app -> success
+go test ./...                                                                                                       -> all packages ok
+go vet ./...                                                                                                         -> clean
+gofmt -l ./cmd ./internal ./sdk/go ./migrations                                                               -> no output
+go run ./cmd/storvia-api -config config/config.development.json -env .env.development -check                    -> success; reports missing Google credentials as a startup issue
+curl http://127.0.0.1:8080/admin                                                                           -> 200; rendered the panel
+curl http://127.0.0.1:8080/admin/connect                                                                       -> 502 because local Google credentials are empty
+make check                                                                                                  -> go vet and go test success
+make check-config                                                                                           -> success; reports missing Google credentials as a startup issue
+```
+
+The first server smoke command was re-run with a corrected shell variable after
+zsh rejected the read-only variable name `status`; no code issue was involved.
+
+The configuration boundary was also corrected: the earlier R2 instructions could be
+read as putting account identity settings and secrets together in `.env`. Account
+endpoint/bucket/region/prefix remain JSON configuration; only R2 access/session keys
+remain in `.env`.
+
+### Not done
+
+- No live Google account, consent round trip, or real Drive API call was performed;
+  `.env.development` has no Google client credentials.
+- Drive folder creation, resumable upload, media download, and delete remain
+  unimplemented.
+- No PostgreSQL or S3/R2 provider verification was performed.
+- No commit was created; the owner will inspect and commit the changes.
+
+### Next step, in order
+
+1. Add the local Google OAuth client ID/secret to the ignored `.env.development` and
+   register both exact callback URIs in Google Cloud.
+2. Start the API and complete `/admin` against a controlled Google test account.
+3. Record the observed callback, connection status, and any provider errors.
+4. Implement the Drive `Storvia/` folder creation and resumable transfer verbs.

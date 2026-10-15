@@ -71,6 +71,7 @@ Early. The foundations are built and tested; the file transfer paths are not fin
 | Error handling, logging, caching, configuration | Complete, tested |
 | Metadata store with enforced single-location invariant | Complete, tested on SQLite |
 | Google OAuth (consent, token refresh, revocation) | Complete, tested against stubs |
+| Development admin panel | Complete locally; live Google callback not yet verified |
 | S3-compatible adapter | Complete, **never run against a real bucket** |
 | HTTP API surface | Complete; transfer endpoints return `provider_not_configured` |
 | Go and TypeScript SDKs | Complete, tested |
@@ -118,11 +119,7 @@ container that cannot start cannot explain why it is unready.
 ```sh
 docker build --target runtime --build-arg VERSION=1.0.0 -t storvia-api .
 
-docker run --rm -p 8080:8080 \
-  -e STORVIA_SESSION_SIGNING_KEY="$(openssl rand -base64 48)" \
-  -e STORVIA_ENCRYPTION_KEY="$(openssl rand -hex 32)" \
-  -e STORVIA_DATABASE_DSN="postgres://storvia:pass@host:5432/storvia?sslmode=require" \
-  storvia-api
+docker run --rm --env-file .env.production -p 8080:8080 storvia-api
 ```
 
 The image is three stages: build, test, runtime. Only the runtime stage ships, and it
@@ -152,15 +149,44 @@ the real thing.
 
 ### Configuration
 
-Configuration is split deliberately:
+Configuration is split by secrecy, not by convenience:
 
-- **JSON** (`config/*.json`) holds structure and non-secret values. Safe to review
-  and commit.
-- **`.env`** holds every API key, password, and signing material. Never committed.
+- **JSON** (`config/*.json`) holds every ordinary setting: timeouts, TTLs, booleans,
+  size limits, hostnames, ports, bucket names, endpoints, regions, prefixes, and
+  redirect URIs. A field ending in `_ref` holds the **name** of an environment
+  variable, never its value.
+- **`.env`** holds every actual credential: API keys, OAuth client credentials,
+  access keys, secret keys, passwords, the refresh-token encryption key, and the
+  session-signing key. `.env` files are never committed.
 
-A JSON string of `${VAR}` or `${VAR:-fallback}` resolves from the environment at
-load time. A reference with no value and no default is a startup error, so a missing
-key fails loudly instead of becoming an empty credential.
+The split is by secrecy, which means ordinary settings never get pushed into a
+secrets file as a side effect. For example:
+
+```json
+{
+  "database": {
+    "host": "postgres",
+    "port": 5432,
+    "user": "storvia",
+    "database": "storvia",
+    "sslmode": "require",
+    "password_ref": "STORVIA_DATABASE_PASSWORD"
+  }
+}
+```
+
+Host, port, user, and database name are not secrets, so they are plain values. Only
+the password is a reference. An earlier version of this project read a whole
+connection string from the environment, which quietly moved four ordinary settings
+into `.env` because the string happened to contain a password.
+
+Two rules are enforced at startup rather than left to code review:
+
+- **A missing required secret stops the service.** It does not become an empty
+  credential. The error names the field and the variable.
+- **A credential pasted where a reference belongs is rejected.** If
+  `access_key_id_ref` holds something shaped like an AWS key rather than a variable
+  name, startup fails and says so, without reprinting the value.
 
 ```json
 {
@@ -179,14 +205,38 @@ enabling fallback while the outage disclosure is unaccepted.
 
 1. Create a Google Cloud project and enable the Drive API.
 2. Create an OAuth client of type **Web application**.
-3. Add your exact redirect URI:
+3. Add both exact redirect URIs:
    `https://your-host/v1/storage/connections/google-drive/callback`
+   and, for local development, `http://127.0.0.1:8080/admin/oauth/callback`
    It must match character for character, including any trailing slash.
 4. Set `STORVIA_GOOGLE_CLIENT_ID` and `STORVIA_GOOGLE_CLIENT_SECRET`.
 
 Storvia requests only `https://www.googleapis.com/auth/drive.file`, a non-sensitive
 per-file scope covering files the app creates. That scope is enforced at
 construction; a config naming a broader scope fails to load.
+
+### Development admin panel
+
+The development configuration enables a local admin panel at
+`http://127.0.0.1:8080/admin`. It is disabled by configuration validation outside the
+`development` environment. The panel uses a browser-bound OAuth state, exchanges the
+Google authorization code server-side, and then issues a normal Storvia session for
+the configured development tenant/user. It displays only connection metadata and
+never displays access tokens, refresh tokens, authorization codes, or Drive session
+URLs.
+
+To use it:
+
+```sh
+# Put these two values in the ignored .env.development file.
+STORVIA_GOOGLE_CLIENT_ID=...
+STORVIA_GOOGLE_CLIENT_SECRET=...
+make run
+open http://127.0.0.1:8080/admin
+```
+
+The panel currently tests Google Drive authorization and connection state only.
+Drive folder creation, file uploads, downloads, and deletes remain unfinished.
 
 ## Using the SDKs
 

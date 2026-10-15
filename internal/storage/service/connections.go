@@ -31,6 +31,13 @@ type Connector interface {
 	Disconnect(ctx context.Context, scope persistence.Scope) error
 }
 
+// RedirectConnector is the optional extension used by the development admin
+// panel. The normal API flow keeps using Connector's configured callback.
+type RedirectConnector interface {
+	BeginConnectAt(ctx context.Context, scope persistence.Scope, browserBinding, redirectURI string) (authorizeURL string, err error)
+	CompleteConnectAt(ctx context.Context, scope persistence.Scope, code, state, browserBinding, redirectURI string) error
+}
+
 // ConnectionStatus is the client-visible connection state.
 type ConnectionStatus struct {
 	Connected     bool
@@ -81,9 +88,35 @@ func (s *ConnectionService) BeginConnect(ctx context.Context, scope persistence.
 	return url, nil
 }
 
+// BeginConnectAt starts a flow at an explicitly configured callback. It is used
+// only by the development panel, never with a browser-supplied redirect URI.
+func (s *ConnectionService) BeginConnectAt(ctx context.Context, scope persistence.Scope, browserBinding, redirectURI string) (string, error) {
+	if browserBinding == "" || redirectURI == "" {
+		return "", apperr.Authentication("a bound browser session and redirect URI are required")
+	}
+	connector, ok := s.connector.(RedirectConnector)
+	if !ok {
+		return "", apperr.ProviderNotConfigured("the configured drive connector does not support the admin callback")
+	}
+	url, err := connector.BeginConnectAt(ctx, scope, browserBinding, redirectURI)
+	if err != nil {
+		return "", apperr.Wrap(err, apperr.KindInternal, "Internal error", "the google authorization could not be started")
+	}
+	return url, nil
+}
+
 // CompleteConnect finishes the consent flow.
 func (s *ConnectionService) CompleteConnect(ctx context.Context, scope persistence.Scope, code, state, browserBinding string) error {
 	return s.connector.CompleteConnect(ctx, scope, code, state, browserBinding)
+}
+
+// CompleteConnectAt finishes a flow at an explicitly configured callback.
+func (s *ConnectionService) CompleteConnectAt(ctx context.Context, scope persistence.Scope, code, state, browserBinding, redirectURI string) error {
+	connector, ok := s.connector.(RedirectConnector)
+	if !ok {
+		return apperr.ProviderNotConfigured("the configured drive connector does not support the admin callback")
+	}
+	return connector.CompleteConnectAt(ctx, scope, code, state, browserBinding, redirectURI)
 }
 
 // DriveConnector implements Connector over the Drive client.
@@ -98,17 +131,31 @@ func NewDriveConnector(client *drive.Client) *DriveConnector {
 
 // BeginConnect starts the consent flow.
 func (d *DriveConnector) BeginConnect(ctx context.Context, scope persistence.Scope, browserBinding string) (string, error) {
+	return d.BeginConnectAt(ctx, scope, browserBinding, d.client.RedirectURI())
+}
+
+// BeginConnectAt starts a flow with a registered redirect URI.
+func (d *DriveConnector) BeginConnectAt(ctx context.Context, scope persistence.Scope, browserBinding, redirectURI string) (string, error) {
 	state, err := d.client.NewState()
 	if err != nil {
 		return "", apperr.Wrap(err, apperr.KindInternal, "Internal error", "could not start the authorization")
 	}
 	d.client.RememberState(state, browserBinding)
-	return d.client.AuthorizeURL(state, browserBinding)
+	return d.client.AuthorizeURLWithRedirect(state, browserBinding, redirectURI)
 }
 
 // CompleteConnect finishes the consent flow.
 func (d *DriveConnector) CompleteConnect(ctx context.Context, scope persistence.Scope, code, state, browserBinding string) error {
-	_, err := d.client.Exchange(ctx, drive.Scope{TenantID: scope.TenantID, UserID: scope.UserID}, code, state, browserBinding)
+	return d.completeConnectAt(ctx, scope, code, state, browserBinding, d.client.RedirectURI())
+}
+
+// CompleteConnectAt finishes a flow with a registered redirect URI.
+func (d *DriveConnector) CompleteConnectAt(ctx context.Context, scope persistence.Scope, code, state, browserBinding, redirectURI string) error {
+	return d.completeConnectAt(ctx, scope, code, state, browserBinding, redirectURI)
+}
+
+func (d *DriveConnector) completeConnectAt(ctx context.Context, scope persistence.Scope, code, state, browserBinding, redirectURI string) error {
+	_, err := d.client.ExchangeWithRedirect(ctx, drive.Scope{TenantID: scope.TenantID, UserID: scope.UserID}, code, state, browserBinding, redirectURI)
 	if err == nil {
 		return nil
 	}

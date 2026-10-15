@@ -218,6 +218,11 @@ type ClientDeps struct {
 // Configured reports whether Google credentials are present.
 func (c *Client) Configured() bool { return c.configured }
 
+// RedirectURI returns the configured normal API callback. It is exposed for
+// the connection service's default flow; callers cannot replace it through a
+// request parameter.
+func (c *Client) RedirectURI() string { return c.cfg.Credentials.RedirectURI }
+
 // IsConfigured exposes the credential check to callers outside this package, so
 // the service layer can report a deployment gap without inspecting credentials.
 func (c *Client) IsConfigured() bool { return c.configured }

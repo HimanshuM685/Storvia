@@ -9,3 +9,4 @@
 - Follow the failure classification and single-location rules in `docs/storage-policy.md`. A timeout is not proof that a write failed.
 - Implementation language: Go. The repository now contains a working application alongside its planning documents. Do not describe planned Go checks as having passed, and do not describe a mocked or unit-tested path as verified against a live provider.
 - Preserve narrow Drive OAuth scope, tenant isolation, secret redaction, and existing user changes. Never store credentials, tokens, signed URLs, or raw private inputs in these documents.
+- Configuration boundary: actual credentials/secrets belong only in ignored `.env` or runtime secret injection. Checked-in JSON may contain non-secret settings and environment-variable references such as `client_secret_ref`, never credential values.

@@ -40,7 +40,26 @@ Go API + workers -> metadata DB
 - Company-managed S3 credentials are secret references, separate from per-user OAuth connections. Never send raw credentials to clients.
 - Redact tokens, codes, session URIs, signed URLs, user file names where sensitive, and raw error bodies in logs/traces.
 
+### Configuration boundary
+
+Checked-in JSON contains only non-secret deployment settings and references to secret
+environment variables. Environment files contain the actual values for Google OAuth
+client credentials, S3/R2 access keys, database credentials/DSNs, Redis passwords,
+encryption keys, and session-signing keys. A field ending in `_ref` names an
+environment variable; it is not the credential itself. Never replace a reference with
+a literal secret in JSON, examples, tests, or documentation.
+
 For the proposed visible folder, create `Storvia/` in the user's My Drive at connection setup. Save the folder ID; names are not unique. If the user deletes the folder, request explicit recovery rather than silently creating a replacement or falling back to S3. Folder creation needs its own idempotency/reconciliation handling.
+
+### Development admin panel
+
+The development-only `/admin` panel is a testing surface, not a second identity
+system. It starts a Drive OAuth flow with a separate registered development callback
+URI, binds the state to a short-lived HttpOnly browser cookie, and after a successful
+code exchange issues a normal Storvia session for configured development tenant/user
+IDs. The panel calls the existing connection service and displays only status,
+subject, scope, and folder-presence metadata. Production configuration rejects an
+enabled panel. The panel does not implement file transfer.
 
 ## 3. Single-location database model
 

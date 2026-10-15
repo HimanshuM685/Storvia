@@ -142,6 +142,13 @@ Deliverables:
 - [x] Token refresh with per-connection serialization and rotated-token persistence.
 - [x] `invalid_grant` classified as a consent failure, never as availability.
 - [x] Read-only Drive availability preflight with minimal field selection.
+- [x] Development-only `/admin` panel with Google Drive connect, callback, session,
+      status, logout, and disconnect controls.
+- [x] Separate registered development callback URI for the admin panel; the normal
+      API callback remains unchanged.
+- [x] Configuration boundary documented and tested: credential values stay in ignored
+      `.env`/runtime injection; checked-in JSON contains only non-secret settings or
+      `STORVIA_*` environment-variable references.
 - [ ] Create/find the visible `Storvia/` folder and persist the folder ID.
 - [ ] Drive resumable session initiation.
 - [ ] Backend-proxied chunk upload.
@@ -155,6 +162,7 @@ Tests and manual checks:
 - [x] Declined consent and revoked-grant classification.
 - [x] Tenant isolation and application authorization on object operations.
 - [ ] Successful small upload/download/delete against a controlled Drive test account.
+- [ ] Successful admin-panel OAuth round trip against a controlled Google account.
 - [ ] Interrupted chunk after body-before-response.
 - [ ] Drive quota, admin policy, missing folder, missing file, 401, 403, 404, 429, 5xx
       end to end.
@@ -253,6 +261,20 @@ sdk/ts: node --test --experimental-strip-types test/  -> 19 tests, 19 pass, 0 fa
 
 `make check` runs `fmt-check`, `vet`, and `test`. `make check-all` adds the race
 detector.
+
+Additional checks run on 2026-10-15 for the development admin panel:
+
+```text
+go test ./internal/httpapi ./internal/config ./internal/storage/provider/drive ./internal/storage/service ./internal/app -> success
+go test ./...                                                                                                       -> all packages ok
+go vet ./...                                                                                                         -> clean
+gofmt -l ./cmd ./internal ./sdk/go ./migrations                                                               -> no output
+go run ./cmd/storvia-api -config config/config.development.json -env .env.development -check                    -> success; Google credentials reported absent as a startup issue
+```
+
+Manual local smoke checks returned `200` for `/admin` and rendered the panel. The
+`/admin/connect` request returned `502` because `.env.development` has no Google
+client credentials; no live OAuth or Drive call was attempted.
 
 Not run, and required before the pilot:
 

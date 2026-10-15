@@ -2,6 +2,7 @@ package drive
 
 import (
 	"context"
+	urlpkg "net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -279,6 +280,13 @@ func TestAuthorizeURLCarriesTheRequiredParameters(t *testing.T) {
 	}
 	if !strings.Contains(url, "state=state-123") {
 		t.Error("the state must be present")
+	}
+	parsed, err := urlpkg.Parse(url)
+	if err != nil {
+		t.Fatalf("parse authorize URL: %v", err)
+	}
+	if got := parsed.Query().Get("state"); got != "state-123" {
+		t.Fatalf("oauth state = %q, want the server-stored state without browser binding", got)
 	}
 }
 
