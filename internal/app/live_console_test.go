@@ -140,12 +140,19 @@ func TestLiveConsoleForcedFallbackUpload(t *testing.T) {
 	}
 }
 
-// TestLiveConsoleForcedFallbackStillNeedsConsent is the limit that matters most.
+// TestLiveConsoleFallbackNeedsConsentOnlyWhenConfigured replaces an earlier version of
+// this test that asserted the opposite of what the configuration asked for.
 //
-// An operator switching providers does not manufacture the tenant's agreement to have
-// files stored elsewhere. If this ever passes, forcing the fallback has become a way to
-// write a user's data somewhere they did not consent to.
-func TestLiveConsoleForcedFallbackStillNeedsConsent(t *testing.T) {
+// It enforced consent unconditionally, on the reasoning that an operator override should
+// never be able to store a file outside Drive without the tenant's agreement. That
+// reasoning is right for a deployment with `fallback.consent_required` set, and wrong for
+// one that has explicitly turned it off -- and the configured deployment here has it
+// false, so uploads were being refused for a disclosure nobody had asked anyone to
+// accept. The flag existed, validated cleanly, and was ignored at runtime.
+//
+// The test now checks both settings, because the point is that the flag is honoured
+// rather than that consent is or is not required.
+func TestLiveConsoleFallbackNeedsConsentOnlyWhenConfigured(t *testing.T) {
 	requireLiveFallback(t)
 
 	cfg := loadDevConfig(t)
@@ -154,13 +161,20 @@ func TestLiveConsoleForcedFallbackStillNeedsConsent(t *testing.T) {
 	}
 	cfg.Database.SQLitePath = "file::memory:"
 
+	// The deployment under test must not require consent, or this is testing the wrong
+	// branch.
+	if cfg.Fallback.ConsentRequired {
+		t.Skip("this deployment requires consent; see TestLiveConsoleForcedFallbackUpload")
+	}
+
 	built := buildLiveApp(t, cfg)
 	scope := persistence.Scope{TenantID: "tenant_dev_admin", UserID: "user_dev_admin"}
 	seedTenant(t, built.Store, scope.TenantID)
 
-	// Consent is deliberately withheld.
+	// Make sure there is no recorded acceptance, so this genuinely exercises the
+	// configured-not-required path rather than passing on a leftover row.
 	if _, err := built.Consent.Withdraw(context.Background(), scope); err != nil {
-		t.Logf("withdraw consent (may not have been granted): %v", err)
+		t.Logf("withdraw consent (may not have been recorded): %v", err)
 	}
 
 	console := buildTestConsole(t, built, cfg)
@@ -172,13 +186,25 @@ func TestLiveConsoleForcedFallbackStillNeedsConsent(t *testing.T) {
 		t.Fatalf("forcing the fallback = %d: %s", rec.Code, rec.Body)
 	}
 
-	rec = doUpload(t, handler, session, "no-consent.txt",
-		[]byte("this must not be stored anywhere"))
-	if rec.Code == http.StatusOK {
-		t.Fatalf("the upload succeeded without consent: %s", rec.Body)
+	rec = doUpload(t, handler, session, "no-consent-needed.txt",
+		[]byte("stored without a recorded disclosure"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("with consent_required=false the upload must succeed without a recorded "+
+			"acceptance, got %d: %s", rec.Code, rec.Body)
 	}
-	if !strings.Contains(rec.Body.String(), "consent") {
-		t.Errorf("the refusal did not mention consent: %s", rec.Body)
+
+	var result httpapi.UploadResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if result.Outcome != "ready" {
+		t.Errorf("outcome = %q (%s), want ready", result.Outcome, result.Detail)
+	}
+	t.Logf("fallback used without a recorded disclosure, as configured")
+
+	if rec := doJSON(t, handler, session, http.MethodDelete,
+		"/console/api/objects/"+result.ObjectID, ""); rec.Code != http.StatusOK {
+		t.Fatalf("delete = %d: %s", rec.Code, rec.Body)
 	}
 }
 

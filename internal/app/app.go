@@ -209,6 +209,14 @@ func Build(ctx context.Context, opts Options) (*App, error) {
 		Secure:          cfg.Auth.SecureCookie,
 		SessionTTL:      cfg.Auth.SessionTTL.Duration(),
 		AdminSessionTTL: cfg.Auth.AdminSessionTTL.Duration(),
+		ConsoleURL:      cfg.AdminPanel.ConsoleURL,
+	}
+	// A process override, so the development launcher can point Go at a frontend on a
+	// different port without editing checked-in configuration. Read straight from the
+	// environment rather than through ResolveSecrets: that resolves credentials, and this
+	// is a location, not a secret.
+	if override, ok := os.LookupEnv(config.EnvConsoleURL); ok && override != "" {
+		adminCfg.ConsoleURL = override
 	}
 	// The development tenant named by configuration must exist before anything can be
 	// written for it. Consent, Drive connections, and objects all reference the

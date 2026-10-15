@@ -2285,3 +2285,653 @@ party holds a permanent reference to — an OAuth redirect, a bookmark, a webhoo
 link — keeps pointing there after you move, and breaking it fails silently until someone
 uses the feature. Leave the old path answering until the external registration has
 actually changed.
+
+---
+
+## 2026-10-15 — Console rewritten in Next.js; consent flag fixed; README stabilised
+
+Three corrections, two of them to things I got wrong.
+
+### The fallback disclosure was gating when it had been told not to
+
+The operator controls showed:
+
+> The fallback is forced but the disclosure has not been accepted. Uploads will be refused.
+
+with `fallback.consent_required` set to `false` in configuration.
+
+`ConsentGate` ignored its `required` argument entirely and always demanded a recorded
+acceptance. The flag existed, validated cleanly, and did nothing at runtime — so an upload
+during a Drive outage was refused for a disclosure nobody had asked anyone to accept.
+
+`ConsentGate(store, required)` now honours the flag. A deployment that sets it to `true`
+still gets the gate. `TestConsentGateHonoursTheConfiguredRequirement` pins both branches.
+
+This was the sixth declared-and-never-wired dependency, after `FallbackConsent`,
+`FallbackUploader`, `Metrics`, and two others.
+
+### The console is a real Next.js app
+
+The single-document, vanilla-JS panel is gone. It was my decision to avoid a build step,
+made unilaterally, and it was the wrong call: it meant every piece of UI logic was inline
+strings, and the one bug worth reporting about it (a `<select>` whose `.value` was assigned
+before its option values were rewritten, so the control showed "Force fallback provider"
+while the server had `forced=false`) was a symptom of hand-managing state in a framework
+that already solves it.
+
+```
+console/                     Next.js 15, App Router, TypeScript, React 19
+  app/layout.tsx  app/page.tsx  app/globals.css
+  components/     Console, ConsoleGate, SignInGate, UploadPanel,
+                 DrivePanel, OperatorControls, ObjectTable, ui
+  lib/            api.ts (typed fetch wrapper), types.ts
+```
+
+- **Static export embedded in the Go binary**, so a release is one artifact and the
+  console cannot be stale or missing in the deployments where somebody needs it.
+- **The API and OAuth callback stay in Go** — one process, one port, no CORS, and the
+  redirect URI registered with Google does not change when the frontend is rebuilt.
+- **Go builds do not need Node.** The export sits behind the `consoleassets` build tag, so
+  `go build`, `go vet` and `go test` work with no frontend build present. The build tag
+  variant embeds `internal/httpapi/consoleout/assets`; without it, the binary reads
+  `console/out` from disk for `go run`.
+- `make console`, `make console-dev` (Next dev server on :3001), `make build-console`.
+- Generated output is gitignored; only a placeholder is tracked.
+- Caching is split deliberately: hashed bundles are `immutable`, documents are `no-store`.
+  A cached console shows stale control state to whoever loads it next.
+- Go tests mount a stand-in export, so the suite never requires a Node build. A test that
+  can only pass after a frontend build is a test that gets skipped.
+
+### The README stopped being a work log
+
+The status table was rewritten on almost every change, which made it a session-by-session
+log rather than an introduction. On an open-source project that is the wrong artefact:
+the two things a reader needs — what this is and how to run it — were being buried under
+churn, and every consumer's first impression changed for no reason they could see.
+
+The per-area table moved to **`docs/implementation-status.md`**, which says at the top
+that it changes often. The README keeps a four-line Status section that links there, and
+gains nothing else per-change. From here the README changes when the software's interface
+changes, not when a component finishes.
+
+Also corrected while there: the "Outage fallback consent" section described a
+tenant-disclosure model that was not what the configured deployment did, and the
+"Development admin panel" section still pointed at `/admin` and said file uploads were
+unfinished.
+
+### Verified
+
+```
+make check, make check-all          — pass
+make sdk-ts-test                   — 22 pass, 0 fail
+console: tsc --noEmit               — clean
+npm run build                      — 4.38 kB route, 110 kB first load
+make test-live                     — 2 pass
+make test-live-drive               — 2 pass, 1 fail, 1 skip (see below)
+```
+
+`/console/` 200 serving the React app with all bundles 200; `/console/api/state` 401
+signed out; `/admin/oauth/callback` 302; `/admin` 301; `/healthz` 200.
+
+### Not done
+
+- **`TestLiveDefaultUploadGoesToDrive` currently fails** because the development
+  database's Drive connection is `disconnected` — the Disconnect button in the console
+  was pressed at 22:25. The refresh token is still encrypted and intact; reconnecting is
+  one click and needs no re-setup. The test fails rather than skipping, deliberately.
+- The console has been served and its bundles fetched, but **nobody has signed in through
+  it in a browser**. Type-checking and a production build are not the same as the page
+  rendering correctly.
+- The old inline-HTML tests were replaced rather than ported one-for-one.
+- PostgreSQL migrations and the Redis session store remain unproven.
+- No commit was created.
+
+### Next step, in order
+
+1. Open `http://127.0.0.1:8080/console/`, sign in, and confirm the page renders and signs
+   in. Then upload a file larger than 8 MB so the chunked resumable path runs.
+
+---
+
+## 2026-10-15 — Remove the old admin panel's routes and its callback URI
+
+Follow-up to the console rewrite: the `/admin` surface was still registered, `dev.sh`
+still called the console "the admin panel", and `drive.admin_redirect_uri` still pointed
+at the deleted callback.
+
+### `dev.sh`
+
+- `ADMIN_URL` → `CONSOLE_URL`, pointing at `http://127.0.0.1:8080/console/`.
+- **The trailing slash is deliberate.** The Next.js export is built with one, so
+  `/console` only 301s to `/console/`; opening the bare path spends a redirect on what
+  should be a single page load.
+- "admin panel" in the usage text, the `open_panel` message, and the `status` output is
+  now "console".
+
+### The `/admin` routes are gone
+
+`GET /admin`, `GET /admin/`, `GET /admin/oauth/callback`, and `GET /admin/connect` all
+return 404. The previous session kept them alive as aliases, on the reasonable argument
+that the callback URI is registered in Google Cloud and outside this repository. That was
+right *during* a migration and wrong once it finished: it is how a deleted feature kept
+serving, and it left two ways to sign in with only one documented.
+
+### The callback URI moved on the backend too
+
+`drive.admin_redirect_uri` is now `http://127.0.0.1:8080/console/oauth/callback` in
+`config.development.json`. The URI actually sent to Google was verified against the
+running server.
+
+> **This requires an action outside the repository.** The Google Cloud OAuth client must
+> have `http://127.0.0.1:8080/console/oauth/callback` registered and
+> `http://127.0.0.1:8080/admin/oauth/callback` removed. Google refuses a `redirect_uri`
+> that is not registered, and a registered URI the server no longer answers ends a
+> consent screen on a 404. Both halves have to move together.
+
+`config.production.json` was left without `admin_redirect_uri`, as it was: the console is
+disabled there, and inventing a `127.0.0.1` callback for a production deployment would be
+wrong. (An earlier edit in this session added one; reverted.)
+
+### Tests
+
+`TestTheOldAdminPanelIsGone` replaces `TestOAuthCallbackSurvivesThePanelMove` and asserts
+the opposite of what that test asserted. `TestTheConsoleCallbackIsServed` covers the
+replacement so removing the old path cannot leave sign-in with nowhere to land. Both run
+against the production route table.
+
+Verified against the running server:
+
+```
+/admin                      404      /console              301 -> /console/
+/admin/                     404      /console/             200
+/admin/oauth/callback       404      /console/sign-in      302
+/admin/connect              404      /console/oauth/callback  302
+
+redirect_uri sent to Google: http://127.0.0.1:8080/console/oauth/callback
+scope:                       https://www.googleapis.com/auth/drive.file
+```
+
+`make check` pass (16 packages), `scripts/dev.sh status` reports the console URL.
+
+### Not done
+
+- The Google Cloud client has **not** been updated here; that needs the owner's console.
+- The development database's Drive connection is still `disconnected`, so sign-in has not
+  been exercised end to end through the new callback path.
+- No commit was created.
+
+---
+
+## 2026-10-15 — Correction: the `/admin` callback must stay
+
+The previous entry removed `/admin/oauth/callback` and repointed
+`drive.admin_redirect_uri` at `/console/oauth/callback`. **That was wrong and it broke
+sign-in.** Reverted, with the reasoning checked against Google rather than asserted.
+
+### What I verified
+
+Google rejects an unregistered `redirect_uri` with `redirect_uri_mismatch`, before the
+user is ever shown a consent screen. Asked directly:
+
+```
+redirect_uri=http://127.0.0.1:8080/console/oauth/callback
+  -> accounts.google.com/signin/oauth/error?authError=redirect_uri_mismatch
+
+redirect_uri=http://127.0.0.1:8080/admin/oauth/callback
+  -> accounts.google.com/v3/signin/identifier  (reaches the sign-in screen)
+```
+
+So repointing the config produced a sign-in that could not work, and the only fix was a
+manual edit in the Google Cloud console — which is exactly the manual step I had just
+declared "required".
+
+### The state now
+
+- `drive.admin_redirect_uri` is back at `http://127.0.0.1:8080/admin/oauth/callback`, the
+  registered value. Confirmed accepted by Google.
+- `GET /admin/oauth/callback` answers with the **console's** callback handler: it verifies
+  the state, exchanges the code, issues the session, sets the cookie, and hands the browser
+  back to `/console/`.
+- `GET /admin` and `GET /admin/` **301 to `/console/`** and serve no markup at all.
+
+### The distinction I had collapsed
+
+Removing the old admin panel and moving its OAuth callback are two different operations,
+and I treated them as one:
+
+- The **interface** is gone. No document, no form, no server-rendered HTML anywhere under
+  `/admin`.
+- The **registered callback** has to stay, because an identity provider holds a permanent
+  reference to that exact URI and cannot be edited from this repository.
+
+A callback path is not part of the panel. It is where Google's redirect *arrives*. Keeping
+it answering is not keeping the old site; it is the console finishing the trip at the door
+the provider was told to use.
+
+### Tests
+
+- `TestTheRegisteredCallbackPathStillWorks` — both paths reach the handler and hand the
+  browser back to `/console`.
+- `TestTheOldPanelServesNoInterface` — `/admin` redirects and serves no interface markup.
+  It replaced `TestTheOldAdminPanelIsGone`, which asserted the opposite of what is correct.
+
+Both run against the production route table.
+
+### Verified
+
+```
+/console/sign-in -> redirect_uri=http://127.0.0.1:8080/admin/oauth/callback
+                    and Google accepts it (reaches the sign-in screen, not an error)
+
+/admin                301 -> /console/     'Sign in with Google' matches: 0
+/admin/               301 -> /console/
+/admin/oauth/callback 302
+/console/             200
+/console/oauth/callback 302
+```
+
+`make check` pass.
+
+### Not done
+
+- Sign-in has still not been completed in a browser, so the full round trip — consent,
+  code exchange, session cookie, landing on the console — remains unexercised. The pieces
+  up to Google's redirect are verified.
+- The development database's Drive connection is still `disconnected`.
+- No commit was created.
+
+---
+
+## 2026-10-15 — The console dev server, started by `dev.sh`
+
+The console was built as a static export embedded in the Go binary, and `dev.sh` opened
+the binary's copy on `:8080`. That works, but it was my architectural choice rather than
+anyone's request, and it meant no hot reload — the normal reason to run a Next.js dev
+server. The owner asked, correctly: *"why u not starting the nextjs server and opens
+that?"*
+
+### What `dev.sh start` does now
+
+```
+localhost:8080    the Go API
+localhost:3001    the Next.js dev server (hot reload) — this is what gets opened
+```
+
+- `start_console` launches `next dev` after the API is ready, because it proxies to the
+  API and a proxy against a cold backend looks like a broken frontend.
+- `wait_console` blocks until it answers, and explains a failure by tailing
+  `logs/console.log` rather than leaving a half-started pair.
+- **A console failure is not fatal.** The API serves its embedded console regardless, so
+  a missing npm or a broken frontend degrades to no hot reload instead of taking the whole
+  developer loop down. `--no-console` skips the second process deliberately.
+- `stop` kills the console too, including the child process `npm run dev` spawns — a
+  surviving child would keep `:3001` held.
+- `status` and the start summary report which mode is live.
+
+### The proxy, and a bug it caused
+
+`next.config.mjs` has two modes. Development has no `basePath` and rewrites the API and
+the OAuth routes to `:8080`, so the browser sees one origin and the consent round trip is
+ordinary navigation. Export mode keeps the `/console` prefix and embeds.
+
+`trailingSlash: true` in development was actively wrong. Next answered every proxied path
+with a 308 to the slashed form, and the rewrite is matched *before* that redirect — so
+`/console/api/state` bounced between the two servers forever, and sign-in looped back to
+itself. Removing it from the development branch fixed both; it stays on for the export,
+where Next's own routing depends on it.
+
+Verified through `:3001`:
+
+```
+/                                  200   Next.js console
+/console/api/state  (signed out)   401   proxied to Go, so a session check and not a 404
+/console/sign-in                   ->    accounts.google.com/… with
+                                         redirect_uri=http://127.0.0.1:8080/admin/oauth/callback
+/console/oauth/callback            302   -> /console?error=…
+
+:8080/console/                     200   the embedded console, still intact
+```
+
+`scripts/dev.sh stop` leaves 0 listeners on both ports; `start` brings both back.
+`make check`, `make check-all`, `make console` and the console typecheck all pass.
+
+### Not done
+
+- The console still has not been signed into in a browser. Everything up to Google's
+  redirect is verified; the round trip after it is not.
+- The development database's Drive connection is still `disconnected`.
+- No commit was created.
+
+---
+
+## 2026-10-15 — OAuth is backend logic; the console is only a client
+
+Follow-up correction. `dev.sh` had started proxying the console's API and OAuth routes
+from `:3001` to `:8080`. That inverts the correct design: an authorization code would
+pass *through* the frontend, and the frontend would need its own copy of the verification.
+
+The right shape, which is what is in place now:
+
+```
+1.  browser at :3001  (Next.js console)
+2.  → Go :8080/console/sign-in          Go starts the consent flow, 302s to Google
+3.  Google → Go :8080/admin/oauth/callback   Go verifies the state, exchanges the code,
+                                              issues the session, sets the cookie
+4.  Go → browser :3001/                 Go hands the browser back to the console
+5.  console → Go :8080/console/api/*    ordinary cross-origin calls, cookies attached
+```
+
+**The console never receives an authorization code and never verifies anything.** It has
+no OAuth route at all — `:3001/console/sign-in` is a 404, deliberately.
+
+### Why it works without a proxy
+
+Cookies are port-agnostic. `127.0.0.1:3001` and `127.0.0.1:8080` are the same host for
+cookie purposes, so the session Go sets is sent by the browser on every request to `:8080`,
+including the ones the console makes. All that is required is for the frontend to call Go
+directly with `credentials: 'include'` and for Go to answer with CORS — which it already
+did.
+
+- `console/next.config.mjs` has **no rewrites at all** in development. It only sets
+  `NEXT_PUBLIC_API_ORIGIN` and `NEXT_PUBLIC_CONSOLE_URL`.
+- `lib/api.ts` calls `${API_ORIGIN}/console/api`, and `apiUrl()` builds absolute Go URLs
+  for the two things that must be *navigations* rather than fetches: sign-in and sign-out.
+  Sign-out is a form post to Go because a cookie set on another origin cannot be cleared
+  from here.
+- `security.allowed_origins` in development is now `http://127.0.0.1:3001` and
+  `http://localhost:3001`.
+- **`admin_panel.console_url`**, overridable by `STORVIA_CONSOLE_URL`, is where Go sends
+  the browser once the session exists. Empty means this binary serves the console and the
+  redirect stays local — which is the embedded case. It is read straight from the process
+  environment rather than through `ResolveSecrets`, because that resolves credentials and
+  this is a location.
+
+### A bug the two modes caused
+
+Running `make console` while `next dev` was up made every page 500 with
+`Cannot find module './403.js'`. The export and the dev server shared `.next`, so the
+export overwrote modules the dev server had compiled. The export now builds into
+`.next-export`; `next dev` keeps `.next`. Both gitignored.
+
+The export output also lands in `.next-export/` rather than `out/` in Next 15, which the
+Makefile assumed otherwise. Fixed.
+
+Verified: `make console` while `next dev` is running leaves `:3001` at 200 and refreshes
+the embedded copy.
+
+### Verified
+
+```
+:3001/                        200   Next.js console
+:3001/console/sign-in         404   the console does not do OAuth
+:8080/console/sign-in         302   Go starts the consent flow
+:8080/admin/oauth/callback    302   Go verifies, issues the session, hands the browser back
+                                 -> http://127.0.0.1:3001/?error=…
+:8080/console/api/state
+  Origin: http://127.0.0.1:3001
+                                 401   Access-Control-Allow-Origin echoed,
+                                       Access-Control-Allow-Credentials: true
+:8080/console/                200   the embedded console, same origin, no CORS
+```
+
+Four tests cover the division of responsibility: `TestOAuthIsEntirelyBackendLogic` (both
+the start and the verified handback go through Go), `TestConsoleHandbackFallsBackToTheLocalConsole`,
+`TestSignOutRedirectsToTheConsole`, and `TestSignOutClearsTheCookieOnTheBackend`.
+
+`make check`, `make check-all`, `make console`, `make sdk-ts-test` (22/22),
+`make test-live` (2/2), and the console typecheck all pass.
+
+### Not done
+
+- **The round trip has still not been completed in a browser.** Every hop up to Google's
+  redirect is verified; completing consent and landing back on `:3001` with a working
+  session is not.
+- The development database's Drive connection is still `disconnected`.
+- No commit was created.
+
+---
+
+## 2026-10-15 — `dev.sh`: stale-process trap on the console port
+
+Asked whether the start script had been updated. It had been — `start_console`,
+`wait_console`, `stop_console` and `--no-console` were all in place — but it only checked
+port 8080 for a stale process, and that left the console port unguarded.
+
+### The bug
+
+Reproduced it deliberately: started a console dev server by hand, then ran
+`scripts/dev.sh start`.
+
+```
+warn port 3001 is already in use by next-server(v15.1.6)
+  ok pid 62658, logging to logs/console.log
+  ok ready
+  mode  next dev (hot reload)          ← a lie
+```
+
+`next dev` could not bind, exited with `EADDRINUSE`, and **the stale server answered every
+readiness check**. The run reported a healthy console while serving somebody else's build
+— the exact stale-process trap documented for port 8080, one port over, and it produced
+two false "ready" results before it was noticed.
+
+### The fix
+
+- **`claim_port`** guards both ports. It warns, offers to stop the holder, kills the child
+  processes first, and then **re-checks that the port is actually free** rather than
+  assuming the kill worked.
+- **Staleness is prevented before launch, not detected after.** `claim_port` proves the
+  port is empty before `start_console` runs, which is what makes the readiness check
+  trustworthy — there is no window in which somebody else's server could answer it.
+- **The recorded pid is now the process that owns the port**, not `$!`. `npm run dev` nests
+  `npm → sh → next dev → next-server`, so the listener is a grandchild and is in neither
+  `$!` nor `pgrep -P`. My first attempt at the ownership check compared pids and failed,
+  because the recorded pid was the npm wrapper and the port owner was two levels down.
+- `stop_console` kills the recorded listener, then clears anything still holding the port —
+  safe, because `claim_port` guaranteed it was free before start.
+
+An earlier version of `wait_console` compared pids and produced a *different* false
+negative, reporting "held by another process" on a perfectly good start.
+
+### Verified
+
+```
+stop  -> :8080 0 listeners, :3001 0 listeners
+stale console on :3001 (pid 63376)
+start -> warns, stops it, launches pid 63480, reports "ready"
+        stale pid 63376 is gone; 1 listener on :3001
+
+two full stop/start cycles:
+  :8080 200, :3001 200, recorded console pid == port owner: yes (both times)
+```
+
+Two more defects found while testing the flags:
+
+- **`--no-console` was documented but not implemented.** It appeared in the usage text and
+  the parser had no case for it, so `dev.sh start --no-console` failed with
+  `unknown option`. A documented flag that does not exist is worse than an absent one: the
+  help text is what someone trusts.
+- **`--no-console` then reported the wrong mode.** `wait_console` returns success
+  immediately when the console is disabled, so the summary said
+  `next dev (hot reload)` for a console that was never started.
+
+All four flags now parse and behave: `--fresh`, `--no-open`, `--no-console`, `--faults-off`.
+`status` reports the mode from what is actually running rather than from what the last
+start attempted.
+
+`make check`, `make check-all`, `make sdk-ts-test`, `make test-live`, and the console
+typecheck all pass.
+
+### Not done
+
+- The OAuth round trip has still not been completed in a browser.
+- The development database's Drive connection is still `disconnected`.
+- No commit was created.
+
+---
+
+## 2026-10-15 — Two more `dev.sh` bugs found by running the script, not reading it
+
+The three fixes above were re-verified by reproducing each one against the running
+script, which turned up two further defects in the same area.
+
+### `status` claimed hot reload for a console that was dead
+
+```
+kill -9 <next-server>
+:3001 -> 000
+$ dev.sh status
+  mode  next dev (hot reload)      ← false
+```
+
+The mode was derived from whether the pid file **existed**. A pid file outlives the
+process it names, so a crashed console was reported as running with hot reload. The URL
+was correct (it checked the port) while the mode next to it contradicted it.
+
+The mode is now derived from the port, like the URL. `status` also reports the API URL,
+which it had stopped printing, and warns when the pid file is stale:
+
+```
+mode    embedded in the API
+warn    the console dev server is not running (stale pid file: logs/console.pid)
+```
+
+### `stop` left the pid file of a crashed console behind
+
+`stop_console` returned early when the recorded process was gone, which is exactly the
+crashed case — so the stale file survived, and every subsequent `status` reported a
+console that did not exist. It now removes the file when the process is already dead.
+
+### Also
+
+`status` now notices the inverse: a console dev server running with no API behind it,
+which is what `kill` on the wrong process looks like.
+
+### Verified
+
+A twelve-case matrix, each run against the running script rather than inferred:
+
+```
+✓ default: api up                              ✓ default: console up
+✓ default: recorded pid owns port              ✓ stop: :8080 listeners -> 0
+✓ stop: :3001 listeners -> 0                   ✓ --no-console: api up
+✓ --no-console: :3001 not started              ✓ --no-console: embedded console
+✓ --no-console: mode honest                    ✓ stale console replaced, not adopted
+✓ crash: status does not lie                   ✓ crash: status warns
+✓ crash: stop cleans the stale pid file
+```
+
+Plus all three earlier fixes, reproduced individually: the stale console is replaced
+rather than adopted, the recorded pid owns the port, and `--no-console` parses and reports
+correctly.
+
+`make check`, `make check-all`, `make sdk-ts-test` (22/22), `make test-live` (2/2) and the
+console typecheck pass.
+
+### The point
+
+Every bug in this file was found by **running** the script, and none by reading it.
+Including the ones where the fix itself was wrong — the pid-tree check that failed on a
+good start, and a `--no-console` flag documented but absent from the parser.
+
+> **A script is not finished when it is written. It is finished when every flag has been
+> passed at least once, and the failure paths have been walked.**
+
+---
+
+## 2026-10-15 — Drive is connected; sign-in is now diagnosable
+
+Closing the two items left open. One is closed completely; the other is closed as far as
+automation genuinely allows, and the boundary is stated rather than papered over.
+
+### Drive: closed
+
+The development database's connection is live again and verified with a real round trip:
+
+```
+TestLiveDefaultUploadGoesToDrive              PASS
+  stored in Drive as file 1aNDi1kxbBms-42rxgTSGXoQNohUNx2Eq
+  deleted from Drive and marked deleted locally
+
+TestLiveUnavailableDriveFallsBackToTheProvider PASS
+  drive unavailable -> routed to s3_compatible
+```
+
+Both directions confirmed against real providers: an upload lands in the real `Storvia/`
+folder, reads back byte-identical and deletes; with Drive made unavailable the same upload
+goes to R2 instead.
+
+### Sign-in: every hop except Google's consent screen
+
+**Google requires an interactive sign-in.** Followed the authorize URL with `curl` and it
+returns `accounts.google.com/v3/signin/identifier` — the account chooser. There is no
+authorization code to be had without a human clicking through it, so that single step
+cannot be automated from here and no amount of further testing will change that.
+
+Everything on this side of it is now covered. `console_signin_test.go` drives the whole
+chain with only Google's answer stubbed:
+
+- `TestCallbackIssuesASessionAndHandsBackToTheConsole` — sign-in start mints a state and
+  sets the flow cookie; the callback presents the right browser binding; a session cookie
+  is issued with a **positive `MaxAge`**, so closing the browser does not sign you out;
+  that cookie then **resolves a real session**; and the browser is handed back to
+  `:3001`.
+- `TestCallbackWithoutTheFlowCookieIssuesNothing` — no cookie, no session, and the
+  specific reason.
+- `TestCallbackFailureIsExplainedToTheOperator` — four causes mapped to distinct,
+  actionable messages, each asserted not to leak a code, token or secret.
+- `TestCallbackDeclinedIsNotAnError` — declining is a normal outcome.
+
+The flow's security property is now proven rather than assumed: the callback presents the
+browser binding the flow started with, and a callback without that cookie gets nothing.
+
+### Sign-in failures now say what to do
+
+The callback returned one message — "The Google sign-in could not be completed." — for
+every possible cause, including a replayed state and an unregistered redirect URI. When
+the only remaining action is to fix something, that message is useless.
+
+`classifySignInError` maps the cause to something actionable, bounded, and safe for a
+browser:
+
+```
+Google did not grant access: access_denied
+The sign-in could not be verified: the browser that started it is not the one that
+  returned. Try signing in again from the same browser.
+Google rejected the redirect URI. It must be registered, character for character, in the
+  OAuth client.
+Google's authorization code was refused, usually because it had already been used or had
+  expired. Sign in again.
+```
+
+The full cause still goes to the log; only the classified reason reaches the browser.
+
+### A bug in my own test, not the code
+
+The first version of `beginFlow` failed because the shared test helper never set a
+redirect URI — and `BeginConnectAt` correctly refuses to start a flow without one. The
+production behaviour was right; my fixture was wrong. Four other tests then failed on a nil
+connector for the same reason.
+
+Worth noting because it is the pattern again: the test told me my fixture was wrong, and
+the fix belonged in the test. A second assertion of mine also treated any message starting
+with "The" as generic, which flagged the *correct* specific message.
+
+### Verified
+
+```
+make check, make check-all          — pass
+make sdk-ts-test                   — 22 pass, 0 fail
+console typecheck                  — clean
+console :3001  200
+sign-in     302 -> accounts.google.com (well-formed, correct redirect_uri)
+declined    -> "Google did not grant access: access_denied"
+stale       -> "the browser that started it is not the one that returned"
+```
+
+### Not done
+
+- **One human click.** Open `http://127.0.0.1:3001/`, press *Sign in with Google*, and
+  approve. Nothing short of that can complete the round trip, and the failure messages
+  above are there to make it a one-attempt operation if it fails.
+- PostgreSQL migrations and the Redis session store remain unproven.
+- No commit was created.

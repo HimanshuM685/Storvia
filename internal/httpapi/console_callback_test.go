@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 )
 
@@ -14,27 +15,39 @@ import (
 // paths would pass even after the real router had lost them, which is exactly the
 // failure these tests exist to catch.
 func consoleRouter(console *Console) http.Handler {
-	return Router(Config{Console: console, RateLimit: 1000, RateInterval: time.Minute})
+	router := Router(Config{Console: console, RateLimit: 1000, RateInterval: time.Minute})
+	return router
 }
 
-// TestOAuthCallbackSurvivesThePanelMove is the regression test for a real outage.
+// testConsoleAssets is a stand-in for the built Next.js export.
 //
-// The console replaced a panel served at /admin, and the OAuth callback path moved to
-// /console/oauth/callback. That broke sign-in for anyone whose Google Cloud project
-// still had the old URI registered: Google redirected the browser to a path the server
-// no longer served, and the person saw a 404 instead of a session.
+// The Go tests must not require Node to have been run: a test suite that only passes
+// after a frontend build is a test suite that gets skipped.
+func testConsoleAssets() fstest.MapFS {
+	return fstest.MapFS{
+		"index.html":          {Data: []byte("<!doctype html><title>Storvia console</title><div id=\"root\"></div>")},
+		"_next/static/app.js": {Data: []byte("console.log(1)")},
+	}
+}
+
+// TestTheRegisteredCallbackPathStillWorks is the test that matters most here, and it
+// exists because I got this wrong once.
 //
-// It is an easy mistake to repeat because the failure is invisible until someone tries
-// to log in, and the callback URI lives in Google Cloud rather than in this repository.
-func TestOAuthCallbackSurvivesThePanelMove(t *testing.T) {
-	console := newTestConsole(t, nil, &stubRouting{})
+// I removed the /admin routes and repointed drive.admin_redirect_uri at
+// /console/oauth/callback, on the reasoning that the old panel was gone and the
+// configuration should say so. That broke sign-in completely: Google rejects an
+// unregistered redirect_uri with `redirect_uri_mismatch` before the user is ever shown a
+// consent screen, and the URI registered in Google Cloud could not be changed from here.
+//
+// The callback therefore has to stay where it is registered. This asserts the handler
+// still answers there, against the production route table.
+func TestTheRegisteredCallbackPathStillWorks(t *testing.T) {
+	router := consoleRouter(newTestConsole(t, nil, &stubRouting{}))
 
-	router := consoleRouter(console)
-
+	// The registered path first, then the console's own. Both must reach the handler.
 	for _, path := range []string{
-		"/console/oauth/callback?code=x&state=y",
-		// The old, registered path. This one must keep working.
 		"/admin/oauth/callback?code=x&state=y",
+		"/console/oauth/callback?code=x&state=y",
 	} {
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
@@ -43,20 +56,22 @@ func TestOAuthCallbackSurvivesThePanelMove(t *testing.T) {
 			t.Errorf("%s = 404; google redirects here after consent, so a 404 means "+
 				"nobody can sign in", path)
 		}
-		// A fake code is rejected, which is correct. What matters is that the request
-		// reached the callback handler and was handled rather than 404'd.
 		if rec.Code != http.StatusFound {
 			t.Errorf("%s = %d, want a redirect to the console", path, rec.Code)
 		}
 		if got := rec.Header().Get("Location"); !strings.HasPrefix(got, "/console") {
-			t.Errorf("%s redirected to %q, want the console", path, got)
+			t.Errorf("%s redirected to %q, want the console: the handler verifies, issues "+
+				"the session, and hands the browser back", path, got)
 		}
 	}
 }
 
-// TestOldPanelRootRedirectsToTheConsole. A stale bookmark or an old link should land
-// on the console rather than a 404. It is a pointer, not a second panel.
-func TestOldPanelRootRedirectsToTheConsole(t *testing.T) {
+// TestTheOldPanelServesNoInterface is the half that actually removes the old panel.
+//
+// Keeping the callback is not the same as keeping the panel. Nothing renders at /admin:
+// it redirects, and there is no document, no form, and no server-rendered HTML anywhere
+// under it. Only the OAuth return trip is still answered there.
+func TestTheOldPanelServesNoInterface(t *testing.T) {
 	router := consoleRouter(newTestConsole(t, nil, &stubRouting{}))
 
 	for _, path := range []string{"/admin", "/admin/"} {
@@ -66,8 +81,12 @@ func TestOldPanelRootRedirectsToTheConsole(t *testing.T) {
 		if rec.Code != http.StatusMovedPermanently {
 			t.Errorf("%s = %d, want 301", path, rec.Code)
 		}
-		if got := rec.Header().Get("Location"); got != "/console" {
-			t.Errorf("%s redirected to %q, want /console", path, got)
+		if got := rec.Header().Get("Location"); got != "/console/" {
+			t.Errorf("%s redirected to %q, want /console/", path, got)
+		}
+		if body := rec.Body.String(); strings.Contains(body, "<html") ||
+			strings.Contains(body, "Sign in with Google") {
+			t.Errorf("%s served interface markup; the old panel must be gone", path)
 		}
 	}
 }

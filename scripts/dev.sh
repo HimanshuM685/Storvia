@@ -9,7 +9,7 @@
 # stop it.
 #
 # Usage:
-#   scripts/dev.sh start     build, start, wait for readiness, open the admin panel
+#   scripts/dev.sh start     build, start, wait for readiness, open the console
 #   scripts/dev.sh stop      stop everything this script started
 #   scripts/dev.sh restart   stop then start
 #   scripts/dev.sh status    is it up, and where are the logs
@@ -18,6 +18,7 @@
 # Options:
 #   --fresh        delete the local SQLite database before starting
 #   --no-open      do not open a browser
+#   --no-console   do not start the Next.js dev server; the API serves the built console instead
 #   --faults-off   turn off Drive outage simulation, so uploads use the real Drive path
 #
 # Secrets are read from the gitignored .env.development. They are never echoed.
@@ -34,12 +35,24 @@ readonly ENV_FILE="${STORVIA_ENV:-.env.development}"
 readonly LOG_DIR="${STORVIA_LOG_DIR:-logs}"
 readonly LOG_FILE="$LOG_DIR/storvia-api.log"
 readonly PID_FILE="$LOG_DIR/storvia-api.pid"
-readonly ADMIN_URL="http://127.0.0.1:8080/console"
+# The Next.js dev server runs as a second process so the console has hot reload. It is a
+# development convenience only: a release binary embeds the built export and serves the
+# console itself, with no Node anywhere.
+readonly CONSOLE_PORT=3001
+readonly CONSOLE_URL_DEV="http://127.0.0.1:$CONSOLE_PORT/"
+readonly CONSOLE_PID_FILE="$LOG_DIR/console.pid"
+readonly CONSOLE_LOG_FILE="$LOG_DIR/console.log"
+# The trailing slash is deliberate. The Next.js export is built with one, and
+# /console without it only 301s to /console/, so opening the bare path spends
+# a redirect on what should be a single page load.
+readonly CONSOLE_URL="http://127.0.0.1:8080/console/"
 readonly READY_URL="http://127.0.0.1:8080/readyz"
 readonly PORT=8080
 
 FRESH=0
 OPEN_BROWSER=1
+# The console dev server is on by default: the console is where the work happens.
+WITH_CONSOLE=1
 FAULT_OVERRIDE=""
 
 # --- output ------------------------------------------------------------------
@@ -91,7 +104,10 @@ require_file() {
 build() {
   command -v go >/dev/null 2>&1 || die "go is not on PATH"
   info "Building the API"
-  if ! go build -o "$LOG_DIR/storvia-api" ./cmd/storvia-api 2>&1 | sed 's/^/     /'; then
+  # The consoleassets tag embeds the built Next.js export, so the dev server serves the
+  # same artifact a release binary would. If the export has not been built yet the build
+  # still succeeds: consoleAssetsFor falls back to reading console/out from disk.
+  if ! go build -tags consoleassets -o "$LOG_DIR/storvia-api" ./cmd/storvia-api 2>&1 | sed 's/^/     /'; then
     die "build failed"
   fi
   ok "built $LOG_DIR/storvia-api"
@@ -181,6 +197,37 @@ stop_api() {
   ok "stopped"
 }
 
+# stop_console ends the console dev server.
+stop_console() {
+  [[ -f "$CONSOLE_PID_FILE" ]] || return 0
+  local pid
+  pid="$(cat "$CONSOLE_PID_FILE" 2>/dev/null || true)"
+
+  if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+    # Already dead -- most likely it crashed. The file still has to go, or every later
+    # status and start reports a console that does not exist.
+    rm -f "$CONSOLE_PID_FILE"
+  fi
+
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    # The recorded pid is the next-server that holds the port. Killing just it leaves the
+    # npm wrapper alive to respawn, so the children go first.
+    pkill -P "$pid" 2>/dev/null || true
+    kill "$pid" 2>/dev/null || true
+    sleep 0.3
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  # Anything still holding the console port is ours by construction -- claim_port
+  # guaranteed it was free before start -- so it is safe to clear.
+  local leftover
+  leftover="$(port_owner "$CONSOLE_PORT")"
+  if [[ -n "$leftover" ]]; then
+    pkill -P "$leftover" 2>/dev/null || true
+    kill -9 "$leftover" 2>/dev/null || true
+  fi
+  rm -f "$CONSOLE_PID_FILE"
+}
+
 # restore_config puts back a config changed by --faults-off.
 restore_config() {
   local backup="$LOG_DIR/config.development.json.bak"
@@ -190,13 +237,116 @@ restore_config() {
   fi
 }
 
+# claim_port refuses to start when something already holds a port this script needs.
+#
+# It is the same check for both the API and the console, because the failure mode is the
+# same: the newcomer cannot bind, and whatever is already there keeps answering.
+claim_port() {
+  local port="$1"
+  local holder
+  holder="$(port_owner "$port")"
+  [[ -z "$holder" ]] && return 0
+
+  warn "port $port is already in use by $(describe_process "$holder")"
+  hint "this is the stale-process trap: an old process makes the new one look broken"
+  read -r -p "     stop it and continue? [y/N] " reply
+  if [[ "${reply:-}" =~ ^[Yy]$ ]]; then
+    # Kill the process group where possible: `npm run dev` spawns a child, and killing
+    # only the parent would leave the child holding the port.
+    pkill -P "$holder" 2>/dev/null || true
+    kill "$holder" 2>/dev/null || true
+    sleep 1
+    kill -9 "$holder" 2>/dev/null || true
+    sleep 0.5
+    if [[ -n "$(port_owner "$port")" ]]; then
+      fail "port $port is still held after stopping $(describe_process "$holder")"
+      return 1
+    fi
+    ok "port $port is free"
+  else
+    return 1
+  fi
+  return 0
+}
+
 # start_api launches the server in the background with its output captured.
 start_api() {
   info "Starting the API"
   : >"$LOG_FILE"
-  "$LOG_DIR/storvia-api" -config "$CONFIG_FILE" -env "$ENV_FILE" >>"$LOG_FILE" 2>&1 &
+  # Where Go hands the browser once it has verified the OAuth callback. The console is
+  # not proxied through Go, so this is the only thing that returns the browser to it.
+  STORVIA_CONSOLE_URL="$CONSOLE_URL_DEV" \
+    "$LOG_DIR/storvia-api" -config "$CONFIG_FILE" -env "$ENV_FILE" >>"$LOG_FILE" 2>&1 &
   echo $! >"$PID_FILE"
   ok "pid $(cat "$PID_FILE"), logging to $LOG_FILE"
+}
+
+# start_console launches the Next.js dev server in the background.
+#
+# It is started after the API, because its rewrites proxy to the API origin and a failing
+# proxy would look like a broken frontend.
+start_console() {
+  [[ "$WITH_CONSOLE" -eq 0 ]] && return 0
+  if ! command -v npm >/dev/null 2>&1; then
+    warn "npm is not on PATH; skipping the console dev server."
+    warn "the API still serves the built console at $CONSOLE_URL"
+    return 0
+  fi
+  if [[ ! -d "$REPO_ROOT/console/node_modules" ]]; then
+    info "Installing console dependencies"
+    (cd "$REPO_ROOT/console" && npm install --silent) || {
+      warn "npm install failed; skipping the console dev server."
+      return 0
+    }
+  fi
+
+  info "Starting the Next.js console on port $CONSOLE_PORT"
+  : >"$CONSOLE_LOG_FILE"
+  (cd "$REPO_ROOT/console" && npm run dev -- --port "$CONSOLE_PORT") \
+    >>"$CONSOLE_LOG_FILE" 2>&1 &
+  local npm_pid=$!
+  # `npm run dev` nests npm -> sh -> next dev -> next-server, so the process holding the
+  # port is a grandchild and is not in $! or its direct children. The port owner is what
+  # has to be recorded: it is both the thing that proves the console came up and the
+  # thing that has to be stopped.
+  for _ in $(seq 1 40); do
+    local owner
+    owner="$(port_owner "$CONSOLE_PORT")"
+    if [[ -n "$owner" ]]; then
+      echo "$owner" >"$CONSOLE_PID_FILE"
+      ok "pid $owner (launched via npm $npm_pid), logging to $CONSOLE_LOG_FILE"
+      return 0
+    fi
+    kill -0 "$npm_pid" 2>/dev/null || break
+    sleep 0.25
+  done
+  echo "$npm_pid" >"$CONSOLE_PID_FILE"
+  return 1
+}
+
+# wait_console blocks until the console dev server answers.
+wait_console() {
+  [[ "$WITH_CONSOLE" -eq 0 ]] && return 0
+  [[ -f "$CONSOLE_PID_FILE" ]] || return 0
+  info "Waiting for the console"
+  for _ in $(seq 1 120); do
+    # claim_port proved the port was free before the console was launched, so anything
+    # answering now is ours. That ordering is what makes this check trustworthy --
+    # there is no window in which somebody else's server could be mistaken for it.
+    if curl -fsS --max-time 2 "$CONSOLE_URL_DEV" >/dev/null 2>&1; then
+      ok "ready"
+      return 0
+    fi
+    if ! kill -0 "$(cat "$CONSOLE_PID_FILE")" 2>/dev/null; then
+      fail "the console dev server exited. Last lines of $CONSOLE_LOG_FILE:"
+      tail -n 20 "$CONSOLE_LOG_FILE" | sed 's/^/     /' >&2
+      return 1
+    fi
+    sleep 0.25
+  done
+  fail "the console did not start. Last lines of $CONSOLE_LOG_FILE:"
+  tail -n 20 "$CONSOLE_LOG_FILE" | sed 's/^/     /' >&2
+  return 1
 }
 
 # wait_ready blocks until the server answers, and explains a failure.
@@ -220,16 +370,27 @@ wait_ready() {
   return 1
 }
 
-# open_panel opens the admin page, tolerating a headless machine.
+# console_url reports where the console is actually being served.
+console_url() {
+  if [[ "$WITH_CONSOLE" -eq 1 ]] && curl -fsS --max-time 1 "$CONSOLE_URL_DEV" >/dev/null 2>&1; then
+    printf '%s' "$CONSOLE_URL_DEV"
+  else
+    printf '%s' "$CONSOLE_URL"
+  fi
+}
+
+# open_panel opens the console, tolerating a headless machine.
 open_panel() {
   [[ "$OPEN_BROWSER" -eq 0 ]] && return 0
-  info "Opening the admin panel"
+  local url
+  url="$(console_url)"
+  info "Opening the console"
   if command -v open >/dev/null 2>&1; then
-    open "$ADMIN_URL" && ok "$ADMIN_URL"
+    open "$url" && ok "$url"
   elif command -v xdg-open >/dev/null 2>&1; then
-    xdg-open "$ADMIN_URL" && ok "$ADMIN_URL"
+    xdg-open "$url" && ok "$url"
   else
-    hint "no opener found; visit $ADMIN_URL yourself"
+    hint "no opener found; visit $url yourself"
   fi
 }
 
@@ -237,9 +398,13 @@ open_panel() {
 summarise() {
   echo
   info "Ready"
-  printf '     panel   %s\n' "$ADMIN_URL"
+  printf '     console %s\n' "$(console_url)"
   printf '     api     http://127.0.0.1:%s\n' "$PORT"
+  printf '     mode    %s\n' "${CONSOLE_MODE:-embedded in the API}"
   printf '     logs    %s\n' "$LOG_FILE"
+  if [[ -f "$CONSOLE_PID_FILE" ]]; then
+    printf '     console logs %s\n' "$CONSOLE_LOG_FILE"
+  fi
   printf '     stop    scripts/dev.sh stop\n'
   echo
   local fault
@@ -271,31 +436,43 @@ cmd_start() {
     ok "fresh database"
   fi
 
-  local holder
-  holder="$(port_owner "$PORT")"
-  if [[ -n "$holder" ]]; then
-    warn "port $PORT is already in use by $(describe_process "$holder")"
-    hint "this is the stale-process trap: an old binary makes the new one look broken"
-    read -r -p "     stop it and continue? [y/N] " reply
-    if [[ "${reply:-}" =~ ^[Yy]$ ]]; then
-      kill "$holder" 2>/dev/null || true
-      sleep 1
-    else
-      die "not starting"
-    fi
-  fi
+  # Both ports are checked. A stale console dev server on $CONSOLE_PORT is the same trap
+  # as a stale API on $PORT, and it is worse: `next dev` fails to bind, dies quietly, and
+  # the stale server answers the readiness check — so the run reports success while
+  # serving somebody else's build.
+  claim_port "$PORT"   || die "not starting"
+  claim_port "$CONSOLE_PORT" || die "not starting"
 
   build
   apply_flag_override
   validate
   start_api
   wait_ready || { stop_api || true; exit 1; }
+
+  # The console comes up after the API, because it proxies to it. A failure here is not
+  # fatal: the API serves the built console itself, so the developer still gets a working
+  # console with no hot reload.
+  start_console
+  if [[ "$WITH_CONSOLE" -eq 0 ]]; then
+    # --no-console. wait_console returns success immediately in this mode, so the mode
+    # has to be set here or the summary would claim hot reload for a console that was
+    # never started.
+    CONSOLE_MODE="embedded in the API (--no-console)"
+  elif wait_console; then
+    CONSOLE_MODE="next dev (hot reload)"
+  else
+    warn "falling back to the console embedded in the API at $CONSOLE_URL"
+    stop_console
+    CONSOLE_MODE="embedded in the API"
+  fi
+
   open_panel
   summarise
 }
 
 cmd_stop() {
   mkdir -p "$LOG_DIR"
+  stop_console
   stop_api
   restore_config
 }
@@ -305,10 +482,33 @@ cmd_status() {
   holder="$(port_owner "$PORT")"
   if [[ -n "$holder" ]]; then
     ok "running: $(describe_process "$holder")"
-    printf '     panel %s\n' "$ADMIN_URL"
-    printf '     logs  %s\n' "$LOG_FILE"
+
+    # The mode is derived from the port, not from the pid file. A pid file survives a
+    # crash, so keying off its existence reported "next dev (hot reload)" for a console
+    # that had been killed and was not coming back.
+    local console_holder
+    console_holder="$(port_owner "$CONSOLE_PORT")"
+    if [[ -n "$console_holder" ]]; then
+      printf '     console %s\n' "$CONSOLE_URL_DEV"
+      printf '     mode    next dev (hot reload)\n'
+      printf '     console logs %s\n' "$CONSOLE_LOG_FILE"
+    else
+      printf '     console %s\n' "$CONSOLE_URL"
+      printf '     mode    embedded in the API\n'
+      if [[ -f "$CONSOLE_PID_FILE" ]]; then
+        warn "the console dev server is not running (stale pid file: $CONSOLE_PID_FILE)"
+        hint "run scripts/dev.sh start to bring it back, or --no-console to skip it"
+      fi
+    fi
+    printf '     api     http://127.0.0.1:%s\n' "$PORT"
+    printf '     logs    %s\n' "$LOG_FILE"
   else
     info "not running"
+    # A dead API does not mean a dead console; someone may have killed the wrong thing.
+    if [[ -n "$(port_owner "$CONSOLE_PORT")" ]]; then
+      warn "the console dev server is still running on $CONSOLE_PORT with no API behind it"
+      hint "run scripts/dev.sh stop"
+    fi
   fi
   [[ -f "$LOG_DIR/config.development.json.bak" ]] && \
     warn "a --faults-off override is still in place; run 'dev.sh stop' to restore it"
@@ -336,6 +536,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --fresh)      FRESH=1 ;;
     --no-open)    OPEN_BROWSER=0 ;;
+    --no-console) WITH_CONSOLE=0 ;;
     --faults-off) FAULT_OVERRIDE="off" ;;
     -h|--help)    usage; exit 0 ;;
     *)            die "unknown option: $1 (try --help)" ;;

@@ -14,7 +14,14 @@ type AdminPanelConfig struct {
 	UserID      string
 	FlowCookie  string
 	RedirectURI string
-	Secure      bool
+	// ConsoleURL is where the browser is sent once Go has verified the OAuth callback
+	// and issued the session.
+	//
+	// Empty means "this binary serves the console", and the redirect stays local. It is
+	// absolute when the console is a separate frontend: the frontend is not proxied
+	// through this server, so this is the only place that can return the browser to it.
+	ConsoleURL string
+	Secure     bool
 	// SessionTTL is the fallback lifetime when AdminSessionTTL is unset.
 	SessionTTL time.Duration
 	// AdminSessionTTL is the panel's sign-in lifetime. It is longer than the API's

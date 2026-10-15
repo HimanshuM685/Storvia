@@ -63,82 +63,91 @@ recovery guarantee after the loss of the only file.
 
 ## Status
 
-Early. The foundations are built and tested; the file transfer paths are not finished.
+The foundations are built and tested, and the Drive transfer path has been verified
+against a real Google account. PostgreSQL migrations and the Redis session store have
+never been run.
 
-| Area | State |
-|---|---|
-| Routing policy engine | Complete, table-driven tests |
-| Error handling, logging, caching, configuration | Complete, tested |
-| Metadata store with enforced single-location invariant | Complete, tested on SQLite |
-| Google OAuth (consent, token refresh, revocation) | Complete; **verified against a live Google account** |
-| Development admin panel | Complete; live OAuth round trip verified |
-| S3-compatible adapter | Complete, **verified against a live Cloudflare R2 bucket** |
-| HTTP API surface | Complete |
-| Go and TypeScript SDKs | Complete, tested |
-| Drive resumable upload / download / delete | Complete, **verified against a real Drive account** |
-| Reconciliation | Implemented; Drive's outcome is honestly `unknown` by design |
-| Job workers, leases, orphan sweep | Implemented; a worker was observed claiming and completing a real job |
-| Metrics (`/metrics`, Prometheus) | Implemented; 12 families served by the running binary |
-| Drive change-log poller | Implemented; cursor advancing against a live account |
-| Testing console at `/console` | Implemented; backend verified against real R2, **the page has not been clicked in a browser** |
-| Forced-fallback operator switch | Implemented; verified with a real R2 upload while Drive was healthy |
-| Redis-backed session store | Implemented, **never run against a real Redis** |
-
-### What has actually been verified
-
-This distinction matters more than the feature list, so it is stated plainly:
-
-- **Verified live against a real provider:** the R2 fallback round trip (upload planned,
-  bytes transferred, verified with `HeadObject`, read back, deleted), Google OAuth
-  consent and token refresh, Drive folder creation, the Drive change-log cursor, and the
-  background worker's claim-and-complete cycle.
-- **Verified against a real Drive account:** an upload lands in the `Storvia/` folder, the
-  bytes read back identical, and the delete works — and with Drive forced unavailable the
-  same upload routes to R2 instead. Both directions are covered by `make test-live-drive`.
-- **Verified against real R2 through the console:** forcing the fallback uploads to R2
-  even while Drive is healthy, the bytes come back identical, and the routing decision is
-  visible in the reported state.
-- **Never run at all:** the PostgreSQL migrations (all testing is SQLite), and the Redis
-  session store (only a failing stub).
-
-See [`CHANGELOG.md`](CHANGELOG.md) for exactly what is missing and
-[`docs/implementation-plan.md`](docs/implementation-plan.md) for milestone status.
+For the per-area breakdown and what is still unverified, see
+[`docs/implementation-status.md`](docs/implementation-status.md). It changes often; this
+README does not.
 
 ---
 
 ## The testing console
 
-`/console` is the operator surface. It replaces an earlier `/admin` panel that could show
-a connection status and nothing else — it could not perform an upload, so it could not
-answer the question it existed to answer.
+`/console` is the operator surface: a Next.js app served by the API binary itself.
 
 ```bash
-./scripts/dev.sh start          # starts the API and opens http://127.0.0.1:8080/console
+make console        # build the frontend
+./scripts/dev.sh start
 ```
 
-Sign in with the Google account whose Drive you want to use. You stay signed in until you
-press **Sign out**; the console's session lasts 30 days and is not tied to the browser
-process.
+It replaces an earlier `/admin` panel that could show a connection status and nothing
+else — it could not perform an upload, so it could not answer the question it existed to
+answer.
+
+Sign in with the Google account whose Drive you want to use. You stay signed in until
+you press **Sign out**.
 
 What it does:
 
-- **Upload a file** and see where it actually landed — the provider, the provider-side
-  reference, the bytes transferred, and the elapsed time. This runs the whole client
-  sequence (create, transfer, verify, commit), including the resumable `PUT` to Google
-  that an SDK performs. With Drive connected, files go to Drive.
+- **Upload a file** and see where it actually landed: the provider, the provider-side
+  reference, the bytes transferred, and the elapsed time.
 - **Download and delete** any stored object, so an upload can be verified rather than
   assumed.
 - **See the Drive connection**, create the `Storvia/` folder, or disconnect.
-- **Force the fallback provider** — three states: force it, prefer Drive, or follow
-  `fallback.force` from `config.json`.
+- **Force the fallback provider** — or go back to Google Drive, or follow the configured
+  default.
 - **Simulate a Drive outage.** Off by default, so uploads use the real Drive path.
 
-Google Drive is the upload default. Uploads only go elsewhere when Drive is unavailable
-*and* you have accepted the outage-fallback disclosure — an operator switch cannot write
-a file outside Drive without that consent, and cannot move bytes that may already have
-reached Drive.
+### How it is built
 
-The console has no build step and no external assets.
+```
+console/            Next.js app (App Router, TypeScript)
+  app/              routes, layout, styles
+  components/       Console, ConsoleGate, SignInGate, UploadPanel,
+                    DrivePanel, OperatorControls, ObjectTable, ui
+  lib/api.ts        typed fetch wrapper over the console API
+```
+
+```bash
+make console        # build it into the Go binary as a static export
+make console-dev    # just the Next.js dev server
+```
+
+**In development** `scripts/dev.sh start` runs both processes: the API on `:8080` and
+the Next.js dev server on `:3001` with hot reload, and opens the console at
+<http://127.0.0.1:3001/>.
+
+OAuth is backend logic. The console is a client and has no OAuth route at all:
+
+```
+browser at :3001                        the Next.js console
+  → :8080/console/sign-in               Go starts the Google consent flow
+  Google → :8080/admin/oauth/callback   Go verifies the state, exchanges the code,
+                                        issues the session, sets the cookie
+  ← :3001/                              Go hands the browser back to the console
+  → :8080/console/api/*                 ordinary calls, session cookie attached
+```
+
+The frontend never receives an authorization code and never verifies anything. It reaches
+the API directly at `STORVIA_API_ORIGIN`; Go answers cross-origin, because cookies are
+port-agnostic and the session Go sets is sent on every request. `STORVIA_CONSOLE_URL`
+(config key `admin_panel.console_url`) is where Go returns the browser once the session
+exists. `security.allowed_origins` must list the console's origin.
+
+**For a release** `make console` builds a static export that is embedded into the Go
+binary, so a release is one artifact with no Node anywhere. `make build-console` builds
+that binary. Go builds work without Node: the export lives behind the `consoleassets` build
+tag, so `go build`, `go vet` and `go test` never require a frontend build. The API serves
+the console at `/console/` in that mode, same origin, no CORS.
+
+### Routing
+
+Uploads go to the user's Google Drive. If Drive cannot be used — not connected, or the
+availability check fails — the upload goes to the configured fallback provider instead.
+That is automatic; no switch is involved. The fallback only records a disclosure when the
+deployment sets `fallback.consent_required` to true.
 
 ---
 
@@ -295,30 +304,29 @@ The loader also refuses configuration that would be unsafe: the broad `drive` sc
 non-allow-listed endpoint, a retry budget that cannot fit its own attempts, and
 enabling fallback while the outage disclosure is unaccepted.
 
-### Outage fallback consent
+### Outage fallback
 
-When Drive is unavailable, a new upload may be routed to the fallback provider instead.
-That means a file can be stored outside the user's own Drive, so it only happens when the
-**tenant has accepted the outage-fallback disclosure**. It is a per-tenant record, not a
-deployment switch: consent is not transferable between tenants and a deployment cannot
-imply it on someone's behalf.
+When Drive is unavailable, a new upload is routed to the fallback provider automatically.
+That means a file can be stored outside the user's own Drive.
+
+Whether the tenant must accept a disclosure first is a deployment setting,
+`fallback.consent_required`:
+
+- `false` (the default here) — uploads route to the fallback without a recorded
+  acceptance.
+- `true` — routing is refused until the tenant accepts the current disclosure, and
+  withdrawing it closes the gate immediately.
+
+The record is per tenant, not per deployment: consent is not transferable between
+tenants, and a deployment cannot imply it on someone's behalf. A tenant who accepted
+version 1 of the disclosure has *not* accepted version 2, so the gate stays shut when the
+text changes.
 
 ```sh
 GET    /v1/storage/fallback/consent   # current state
 POST   /v1/storage/fallback/consent   # accept the current disclosure
-DELETE /v1/storage/fallback/consent   # withdraw; closes the gate immediately
+DELETE /v1/storage/fallback/consent   # withdraw
 ```
-
-A tenant that has never been asked and a tenant that declined both read as *not granted*,
-because both mean the same thing to the router. The record carries the disclosure version
-the tenant agreed to, so when the wording changes they are asked again rather than being
-held to terms they never saw.
-
-Withdrawal is the direction that has to work instantly — it is what stops a tenant's files
-being routed somewhere new.
-
-Enabling `fallback.enabled` in the configuration does **not** grant consent. It only says
-where files would go if the tenant agreed.
 
 ### Google OAuth setup
 
@@ -327,39 +335,42 @@ where files would go if the tenant agreed.
 3. Add both exact redirect URIs:
    `https://your-host/v1/storage/connections/google-drive/callback`
    and, for local development, `http://127.0.0.1:8080/admin/oauth/callback`
-   (`http://127.0.0.1:8080/console/oauth/callback` also works and is the current path;
-   both are accepted so the console can be moved without breaking sign-in for a project
-   that still has the older URI registered — Google refuses a `redirect_uri` that is not
-   registered, so the registered one must keep working)
    It must match character for character, including any trailing slash.
+
+   `drive.admin_redirect_uri` in `config.json` names the second one, and it must match
+   the registered value: Google rejects an unregistered `redirect_uri` with
+   `redirect_uri_mismatch` before the user ever sees a consent screen.
+
+   The console lives at `/console/`, but its OAuth callback is answered at the `/admin`
+   path too, because that is the URI registered here. The trip returns to `/admin/oauth/callback`,
+   the server verifies it and issues the session, and the browser is handed back to
+   `/console/`. Nothing of the old admin panel is served — `/admin` only redirects.
 4. Set `STORVIA_GOOGLE_CLIENT_ID` and `STORVIA_GOOGLE_CLIENT_SECRET`.
 
 Storvia requests only `https://www.googleapis.com/auth/drive.file`, a non-sensitive
 per-file scope covering files the app creates. That scope is enforced at
 construction; a config naming a broader scope fails to load.
 
-### Development admin panel
+### Development console
 
-The development configuration enables a local admin panel at
-`http://127.0.0.1:8080/admin`. It is disabled by configuration validation outside the
-`development` environment. The panel uses a browser-bound OAuth state, exchanges the
-Google authorization code server-side, and then issues a normal Storvia session for
-the configured development tenant/user. It displays only connection metadata and
-never displays access tokens, refresh tokens, authorization codes, or Drive session
-URLs.
-
-To use it:
+The development configuration enables the console at `http://127.0.0.1:8080/console/`. It
+is disabled by configuration validation outside the `development` environment.
 
 ```sh
 # Put these two values in the ignored .env.development file.
 STORVIA_GOOGLE_CLIENT_ID=...
 STORVIA_GOOGLE_CLIENT_SECRET=...
-make run
-open http://127.0.0.1:8080/admin
+
+make console        # build the frontend
+./scripts/dev.sh start
 ```
 
-The panel currently tests Google Drive authorization and connection state only.
-Drive folder creation, file uploads, downloads, and deletes remain unfinished.
+The console signs in through a browser-bound OAuth state, exchanges the Google
+authorization code server-side, and issues a Storvia session for the configured
+development tenant and user. It never displays access tokens, refresh tokens,
+authorization codes, or Drive session URLs.
+
+---
 
 ## Using the SDKs
 
@@ -564,7 +575,8 @@ Two things to know before you change the routing behaviour:
 | [`SECURITY.md`](SECURITY.md) | Reporting a vulnerability privately; known limitations |
 | [`docs/storage-policy.md`](docs/storage-policy.md) | The confirmed storage contract and error classification |
 | [`docs/architecture.md`](docs/architecture.md) | Components, schema, API, lifecycle |
-| [`docs/implementation-plan.md`](docs/implementation-plan.md) | Milestones, acceptance status, checks run |
+| [`docs/implementation-status.md`](docs/implementation-status.md) | Per-area state and what is still unverified |
+| [`docs/implementation-plan.md`](docs/implementation-plan.md) | Milestones and acceptance criteria |
 | [`docs/risk-register.md`](docs/risk-register.md) | Failure modes, security controls, go/no-go |
 | [`docs/references.md`](docs/references.md) | Google and Cloudflare API references, bounded community evidence |
 

@@ -85,7 +85,6 @@
   },
   "drive": {
     "redirect_uri": "https://api.storvia.example/v1/storage/connections/google-drive/callback",
-    "admin_redirect_uri": "",
     "scopes": [
       "https://www.googleapis.com/auth/drive.file"
     ],

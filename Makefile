@@ -96,6 +96,23 @@ test-live-drive: ## Run tests that read AND WRITE a real Google Drive account (n
 	@echo "These create, read, and delete files in the real Drive account."
 	STORVIA_LIVE_DRIVE_TEST=1 STORVIA_LIVE_FALLBACK_TEST=1 $(GO) test ./internal/app/ -run Live -v
 
+.PHONY: console
+console: ## Build the Next.js console into the Go binary's asset directory
+	@command -v npm >/dev/null || { echo "npm is not on PATH"; exit 1; }
+	cd console && npm install --silent && STORVIA_CONSOLE_EXPORT=1 npm run build
+	rm -rf internal/httpapi/consoleout/assets
+	mkdir -p internal/httpapi/consoleout/assets
+	cp -R console/.next-export/. internal/httpapi/consoleout/assets/
+	@echo "console built into internal/httpapi/consoleout/assets"
+
+.PHONY: console-dev
+console-dev: ## Run the Next.js dev server against the Go API on :3001
+	cd console && npm run dev
+
+.PHONY: build-console
+build-console: console ## Build the API with the console embedded
+	$(GO) build -tags consoleassets ./cmd/storvia-api
+
 .PHONY: test-live-drive
 
 .PHONY: cover

@@ -121,43 +121,47 @@ func Router(cfg Config) http.Handler {
 	// The testing console. It replaces the earlier admin panel, which had grown a
 	// set of form posts that could not show what an upload actually did.
 	if cfg.Console != nil {
-		root.Handle("GET /console", http.HandlerFunc(cfg.Console.Index))
-		root.Handle("GET /console/", http.HandlerFunc(cfg.Console.Index))
+		// The static export first: it answers for documents and assets under /console,
+		// and the more specific API and OAuth patterns below take precedence over it.
+		mountConsole(root, consoleAssets)
+
+		// The export is built with a trailing slash, so /console redirects rather than
+		// serving the document at the slashless path where its relative asset URLs
+		// would resolve one level too high.
+		root.Handle("GET /console", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/console/", http.StatusMovedPermanently)
+		}))
 
 		// The OAuth callback is public: Google redirects here without any Storvia
 		// credential, and the state value is what authenticates it.
 		root.Handle("GET /console/oauth/callback", http.HandlerFunc(cfg.Console.Callback))
 		root.Handle("GET /console/sign-in", http.HandlerFunc(cfg.Console.SignIn))
 
-		// The OAuth callback is ALSO served at the old /admin path, and deliberately so.
+		// The OAuth callback is ALSO answered at the old /admin path, and this is not a
+		// leftover of the old panel -- it is the only way sign-in can work.
 		//
 		// The callback URI is registered in Google Cloud, outside this repository, and
-		// Google refuses a redirect_uri that is not registered. Deleting the console's
-		// former path therefore broke the sign-in for anyone whose project still had it
-		// registered: Google redirected to a path this server no longer served, and the
-		// browser landed on a 404 instead of a session.
+		// Google refuses a redirect_uri that is not registered. Verified directly against
+		// accounts.google.com: an unregistered console URI comes back as
+		// redirect_uri_mismatch before the user is ever shown a consent screen.
 		//
-		// Accepting both paths means the flow works before and after the project is
-		// re-registered, so the panel can be moved without an outage that only shows
-		// up when somebody tries to sign in. The old path is an alias, not a second
-		// panel: there is nothing to see at it.
+		// So the registered URI has to stay the one Storvia sends, and the server has to
+		// keep answering at it. Google redirects the browser here, this handler verifies
+		// the state, exchanges the code, issues the session, sets the cookie, and then
+		// hands the browser back to /console. The old path is where the trip *returns*,
+		// not where the console lives.
+		//
+		// Nothing of the old panel is served here. /admin itself only redirects.
 		root.Handle("GET /admin/oauth/callback", http.HandlerFunc(cfg.Console.Callback))
-		root.Handle("GET /admin/connect", http.HandlerFunc(cfg.Console.SignIn))
 
-		// A stale bookmark or a link from an older changelog should land on the console
-		// rather than a 404. A redirect is not the old site: there is nothing served
-		// here, only a pointer.
+		// A stale bookmark or a link from an older changelog lands on the console rather
+		// than a 404. A redirect is not the old site: there is nothing served here but a
+		// pointer.
 		root.Handle("GET /admin", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "/console", http.StatusMovedPermanently)
+			http.Redirect(w, r, "/console/", http.StatusMovedPermanently)
 		}))
 		root.Handle("GET /admin/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "/console", http.StatusMovedPermanently)
-		}))
-		root.Handle("POST /console/sign-out", http.HandlerFunc(cfg.Console.SignOut))
-		// A server-side reload, so the redirect lands on a clean URL rather than on a
-		// copy of one with a query string.
-		root.Handle("GET /console/refresh", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "/console", http.StatusFound)
+			http.Redirect(w, r, "/console/", http.StatusMovedPermanently)
 		}))
 
 		console := func(h http.HandlerFunc) http.Handler {

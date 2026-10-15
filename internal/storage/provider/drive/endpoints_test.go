@@ -55,7 +55,7 @@ func TestAuthorizeEndpointIsNotUnderTheOAuthAPIBase(t *testing.T) {
 func TestAuthorizeURLGoesToGoogle(t *testing.T) {
 	client := newTestClient(t, true)
 
-	raw, err := client.AuthorizeURLWithRedirect("state-token", "binding", "http://127.0.0.1:8080/admin/oauth/callback")
+	raw, err := client.AuthorizeURLWithRedirect("state-token", "binding", "http://127.0.0.1:8080/console/oauth/callback")
 	if err != nil {
 		t.Fatalf("AuthorizeURLWithRedirect: %v", err)
 	}

@@ -184,7 +184,21 @@ type AdminPanelConfig struct {
 	// its own health is a way to disable the service's safety checks, so this is a
 	// stop-the-line error rather than a warning.
 	SimulateDriveOutage bool `json:"simulate_drive_outage,omitempty"`
+
+	// ConsoleURL is where the browser is sent after Go has verified the OAuth callback
+	// and issued the session.
+	//
+	// It is empty when this binary serves the console itself. It is absolute when the
+	// console is a separate frontend process, because that frontend is not proxied
+	// through this server and Go is the only thing that can return the browser to it.
+	//
+	// STORVIA_CONSOLE_URL overrides it, so the development launcher can point at
+	// whichever port the frontend happens to be on without editing this file.
+	ConsoleURL string `json:"console_url,omitempty"`
 }
+
+// EnvConsoleURL overrides admin_panel.console_url.
+const EnvConsoleURL = "STORVIA_CONSOLE_URL"
 
 // SecurityConfig holds references to key material. Values arrive from the
 // environment and are never written back to a config file or a log.

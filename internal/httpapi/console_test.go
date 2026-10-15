@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/shovan04/storvia/internal/auth"
@@ -52,6 +53,7 @@ func newTestConsole(t *testing.T, sessions auth.Lookup, routing RoutingControl) 
 		TenantID:        "tenant-dev",
 		UserID:          "user-1",
 		FlowCookie:      "storvia_admin_flow",
+		RedirectURI:     "http://127.0.0.1:8080/admin/oauth/callback",
 		AdminSessionTTL: time.Hour,
 	}, ConsoleOptions{
 		Issuer:   issuer,
@@ -82,28 +84,47 @@ func TestConsoleRejectsEverythingWithoutASession(t *testing.T) {
 	}
 }
 
-// TestConsoleHTMLIsServedWithoutASession. A signed-out visitor has to be able to see
-// the sign-in button, so the document itself is not gated. It must also carry no
-// data, which is why every value on the page comes from a session-gated call.
-func TestConsoleHTMLIsServedWithoutASession(t *testing.T) {
-	console := newTestConsole(t, auth.NewMemorySessions(10), &stubRouting{})
+// TestConsoleServesTheDocumentSignedOut is a property of the frontend rather than an
+// inline template.
+//
+// The Next.js export is served signed-out so there is a sign-in button to click, and the
+// document carries no data of its own: every value on the page comes from a session-gated
+// API call, and those routes reject an unauthenticated request independently.
+func TestConsoleServesTheDocumentSignedOut(t *testing.T) {
+	// Swap in a stand-in export so this test does not depend on a frontend build.
+	withConsoleAssets(testConsoleAssets(), func(router http.Handler) {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/console/", nil))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /console/ = %d, want 200", rec.Code)
+		}
+		if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+			t.Errorf("Cache-Control = %q, want no-store; a cached console shows stale control state", got)
+		}
+	})
+
+}
+
+// TestConsoleAssetsAreImmutable pins the other half of the caching rule: hashed bundles
+// never change, so re-fetching them on every load is waste.
+func TestConsoleAssetsAreImmutable(t *testing.T) {
+	root := http.NewServeMux()
+	mountConsole(root, fstest.MapFS{
+		"index.html":          {Data: []byte("<!doctype html><title>console</title>")},
+		"_next/static/app.js": {Data: []byte("console.log(1)")},
+	})
 
 	rec := httptest.NewRecorder()
-	console.Index(rec, httptest.NewRequest(http.MethodGet, "/console", nil))
+	root.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/console/_next/static/app.js", nil))
+	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "immutable") {
+		t.Errorf("asset Cache-Control = %q, want immutable", got)
+	}
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	body := rec.Body.String()
-	for _, want := range []string{"Sign in with Google", "Upload a file", "/console/api/state"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("the panel is missing %q", want)
-		}
-	}
-	// The document must not be cacheable: it is an operator surface, and a stale copy
-	// in a shared browser would show the wrong connection state to the next person.
-	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
-		t.Errorf("Cache-Control = %q, want no-store", got)
+	rec = httptest.NewRecorder()
+	root.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/console/index.html", nil))
+	if got := rec.Header().Get("Cache-Control"); strings.Contains(got, "immutable") {
+		t.Errorf("document Cache-Control = %q, must not be immutable", got)
 	}
 }
 

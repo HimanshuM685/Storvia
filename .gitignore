@@ -22,6 +22,10 @@ PRIVATE-MEMORY.md
 sdk/ts/node_modules/
 sdk/ts/dist/
 sdk/ts/*.tsbuildinfo
+console/node_modules/
+console/.next/
+console/.next-export/
+console/build/
 
 # Editor and OS noise.
 .DS_Store
@@ -35,3 +39,9 @@ coverage.out
 
 # Development launcher output: binaries, logs, and pids.
 logs/
+# Next.js console
+console/node_modules/
+console/.next/
+console/.next-export/
+console/out/
+console/next-env.d.ts
