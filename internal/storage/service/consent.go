@@ -126,8 +126,15 @@ func (s *ConsentService) Withdraw(ctx context.Context, scope persistence.Scope) 
 // must never open the gate is stated once. A database problem closing the fallback
 // shut is the safe direction: uploads keep going to Drive or fail, and no file is
 // moved somewhere the tenant did not agree to.
-func ConsentGate(store ConsentStore) func(context.Context, persistence.Scope) (bool, error) {
+func ConsentGate(store ConsentStore, required bool) func(context.Context, persistence.Scope) (bool, error) {
 	return func(ctx context.Context, scope persistence.Scope) (bool, error) {
+		// A deployment that does not require consent gets it by configuration. Reading
+		// the store anyway and reporting "not granted" would refuse the upload for a
+		// disclosure nobody asked for -- which is what happened: the flag existed,
+		// validated fine, and was ignored at runtime.
+		if !required {
+			return true, nil
+		}
 		granted, err := store.Granted(ctx, scope.TenantID)
 		if err != nil {
 			return false, err

@@ -204,10 +204,12 @@ func TestLiveUnavailableDriveFallsBackToTheProvider(t *testing.T) {
 		t.Skip("no google drive connection in the development database; sign in first")
 	}
 
-	// Consent, because the fallback may not be used without it. This is the whole
-	// point of the gate and the test should not route around it.
-	if _, err := built.Consent.Accept(context.Background(), scope); err != nil {
-		t.Fatalf("grant fallback consent: %v", err)
+	// No consent step. The configured deployment sets fallback.consent_required=false,
+	// so a Drive outage must route to the fallback on its own. Granting consent here
+	// would hide the very bug that was reported: the flag existed, validated, and was
+	// ignored at runtime, so uploads were refused for a disclosure nobody asked for.
+	if _, err := built.Consent.Show(context.Background(), scope); err == nil {
+		t.Log("a consent record exists; the fallback still does not depend on it here")
 	}
 
 	// Make Drive unavailable the way an outage would, not by switching routing: this

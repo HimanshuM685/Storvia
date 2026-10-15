@@ -2207,3 +2207,81 @@ make test-live-drive                 — 6 pass, 0 fail (real Drive + real R2)
 1. Upload a file larger than 8 MB through `/console`, so the chunked resumable path runs.
 2. Open `/console` in a browser and confirm the page renders and signs in.
 3. Run the PostgreSQL migrations against a real instance.
+
+---
+
+## 2026-10-15 — Fix: sign-in 404s on `/admin/oauth/callback`
+
+Reported immediately after the console replaced the admin panel:
+
+```
+404 no route matches this request   instance=/admin/oauth/callback
+```
+
+**The console move broke Google sign-in.** The panel served its OAuth callback at
+`/admin/oauth/callback`; the console serves it at `/console/oauth/callback`. Deleting the
+old panel deleted the callback, and Google redirects the browser there after consent —
+so anybody whose Google Cloud project still had the old URI registered landed on a 404
+instead of a session.
+
+### Why just changing the config would not have worked
+
+The obvious fix — repoint `drive.admin_redirect_uri` at the console path — trades this
+bug for the mirror image. **Google rejects a `redirect_uri` that is not registered**, so
+until the project in Google Cloud is edited, changing the config produces a consent
+screen that bounces back with `redirect_uri_mismatch`. The callback URI is registered
+outside this repository, which makes it the one setting here that cannot be changed
+locally.
+
+### The fix: accept the callback at both paths
+
+- `GET /console/oauth/callback` and `GET /admin/oauth/callback` both reach the console's
+  callback handler.
+- `GET /console/sign-in` and `GET /admin/connect` both start the flow.
+- `GET /admin` and `GET /admin/` now **301 to `/console`**, so a stale bookmark lands on
+  the console instead of a 404.
+
+`drive.admin_redirect_uri` is left at the registered `/admin/oauth/callback` value, which
+is what Google Cloud has, so sign-in works before anyone re-registers anything. The old
+path is an alias, not a second panel — nothing is served there except the callback and the
+redirect.
+
+Verified against the running server:
+
+```
+/admin/oauth/callback?code=…&state=…   302 -> /console?error=…
+/console/oauth/callback?code=…&state=…  302 -> /console?error=…
+/admin                                301 -> /console
+/admin/oauth/callback?error=access_denied
+                                       302 -> /console?error=Google did not grant access: access_denied
+/admin/connect  -> https://accounts.google.com/…&redirect_uri=http%3A%2F%2F127.0.0.1%3A8080%2Fadmin%2Foauth%2Fcallback
+flow cookie: storvia_admin_flow=…; Path=/; Max-Age=600; HttpOnly; SameSite=Lax
+```
+
+The redirect URI sent to Google is unchanged, so a project with the old registration keeps
+working. The flow cookie is `Path=/`, so it survives the round trip.
+
+### Tests
+
+Four tests against the **production route table** — `Router(Config{...})`, not a
+hand-built mux. A test that re-declared the paths would have passed after the real router
+lost them, which is precisely the failure being guarded.
+
+- `TestOAuthCallbackSurvivesThePanelMove` — both callback paths reach the handler.
+- `TestOldPanelRootRedirectsToTheConsole` — 301 to `/console`.
+- `TestDeclinedConsentIsNotAnError` — declining is reported as a normal outcome.
+- `TestCallbackWithNoCodeDoesNot404`.
+
+Confirmed the first test fails when the alias is deleted, so it is not decorative.
+
+### The lesson
+
+I deleted a route without asking what depended on it. The dependency was in Google
+Cloud, invisible from here, and it only manifests when a human tries to sign in — which
+is the one thing nobody does during a test run.
+
+The general form: **a path is not owned by the process that serves it.** Anything a third
+party holds a permanent reference to — an OAuth redirect, a bookmark, a webhook, a docs
+link — keeps pointing there after you move, and breaking it fails silently until someone
+uses the feature. Leave the old path answering until the external registration has
+actually changed.

@@ -327,6 +327,10 @@ where files would go if the tenant agreed.
 3. Add both exact redirect URIs:
    `https://your-host/v1/storage/connections/google-drive/callback`
    and, for local development, `http://127.0.0.1:8080/admin/oauth/callback`
+   (`http://127.0.0.1:8080/console/oauth/callback` also works and is the current path;
+   both are accepted so the console can be moved without breaking sign-in for a project
+   that still has the older URI registered — Google refuses a `redirect_uri` that is not
+   registered, so the registered one must keep working)
    It must match character for character, including any trailing slash.
 4. Set `STORVIA_GOOGLE_CLIENT_ID` and `STORVIA_GOOGLE_CLIENT_SECRET`.
 

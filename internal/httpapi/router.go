@@ -128,6 +128,31 @@ func Router(cfg Config) http.Handler {
 		// credential, and the state value is what authenticates it.
 		root.Handle("GET /console/oauth/callback", http.HandlerFunc(cfg.Console.Callback))
 		root.Handle("GET /console/sign-in", http.HandlerFunc(cfg.Console.SignIn))
+
+		// The OAuth callback is ALSO served at the old /admin path, and deliberately so.
+		//
+		// The callback URI is registered in Google Cloud, outside this repository, and
+		// Google refuses a redirect_uri that is not registered. Deleting the console's
+		// former path therefore broke the sign-in for anyone whose project still had it
+		// registered: Google redirected to a path this server no longer served, and the
+		// browser landed on a 404 instead of a session.
+		//
+		// Accepting both paths means the flow works before and after the project is
+		// re-registered, so the panel can be moved without an outage that only shows
+		// up when somebody tries to sign in. The old path is an alias, not a second
+		// panel: there is nothing to see at it.
+		root.Handle("GET /admin/oauth/callback", http.HandlerFunc(cfg.Console.Callback))
+		root.Handle("GET /admin/connect", http.HandlerFunc(cfg.Console.SignIn))
+
+		// A stale bookmark or a link from an older changelog should land on the console
+		// rather than a 404. A redirect is not the old site: there is nothing served
+		// here, only a pointer.
+		root.Handle("GET /admin", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/console", http.StatusMovedPermanently)
+		}))
+		root.Handle("GET /admin/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/console", http.StatusMovedPermanently)
+		}))
 		root.Handle("POST /console/sign-out", http.HandlerFunc(cfg.Console.SignOut))
 		// A server-side reload, so the redirect lands on a clean URL rather than on a
 		// copy of one with a query string.

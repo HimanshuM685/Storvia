@@ -456,7 +456,7 @@ func buildServices(cfg *config.Config, store *persistence.Store, keyring secrets
 		Fallback:         cfg.Fallback,
 		IDs:              idid.NewGenerator("upl"),
 		Logger:           logger,
-		FallbackConsent:  service.ConsentGate(consentRepo),
+		FallbackConsent:  service.ConsentGate(consentRepo, cfg.Fallback.ConsentRequired),
 		// Metrics was left unwired for a while, so every upload counter was recording
 		// into a nil pointer and the families stayed permanently empty. The nil-safety
 		// is still correct -- a deployment without metrics should not fail requests --
