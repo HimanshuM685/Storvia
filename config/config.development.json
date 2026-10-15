@@ -12,10 +12,7 @@
     "write_timeout": "0s",
     "idle_timeout": "120s",
     "upload_timeout": "30m",
-    "download_timeout": "15m",
-    "shutdown_grace": "30s",
-    "max_request_body_size": 2097152,
-    "trusted_proxies": []
+    "shutdown_grace": "30s"
   },
   "logging": {
     "level": "debug",
@@ -28,26 +25,20 @@
     "max_idle_conns": 1,
     "conn_max_lifetime": "30m",
     "conn_max_idle_time": "5m",
-    "auto_migrate": true,
-    "migrations_dir": "migrations"
+    "auto_migrate": true
   },
   "cache": {
     "driver": "memory",
     "redis_address": "",
     "redis_database": 0,
     "janitor_interval": "1m",
-    "access_token_ttl": "30m",
-    "preflight_ttl": "5s",
-    "circuit_state_ttl": "2m",
-    "availability_scope": "default",
     "redis_password_ref": "STORVIA_REDIS_PASSWORD"
   },
   "auth": {
     "session_signing_key_ref": "STORVIA_SESSION_SIGNING_KEY",
     "session_cookie_name": "storvia_session",
     "session_ttl": "12h",
-    "secure_cookie": false,
-    "trusted_proxies": []
+    "secure_cookie": false
   },
   "admin_panel": {
     "enabled": true,
@@ -65,8 +56,7 @@
     "allowed_endpoint_schemes": [
       "https"
     ],
-    "allowed_endpoint_hosts": [],
-    "max_clock_skew": "2m"
+    "allowed_endpoint_hosts": []
   },
   "uploads": {
     "max_file_size_bytes": 5368709120,
@@ -87,7 +77,6 @@
     "s3_part_size_bytes": 8388608,
     "min_part_size_bytes": 5242880,
     "presigned_url_ttl": "15m",
-    "presigned_part_count": 8,
     "category_limits": {
       "image": 26214400
     }
@@ -123,15 +112,8 @@
         "session_token_ref": "STORVIA_R2_SESSION_TOKEN",
         "use_path_style": true,
         "disabled": true,
-        "multipart_abort_ttl": "24h",
-        "orphan_grace_period": "72h"
+        "multipart_abort_ttl": "24h"
       }
     ]
-  },
-  "telemetry": {
-    "metrics_enabled": true,
-    "metrics_path": "/metrics",
-    "health_path": "/healthz",
-    "readiness_timeout": "3s"
   }
 }

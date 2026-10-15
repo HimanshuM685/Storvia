@@ -61,7 +61,6 @@ func TestParseMinimalConfigAppliesDefaults(t *testing.T) {
 		{"drive.redirect_uri kept", cfg.Drive.RedirectURI, "http://127.0.0.1:8080/callback"},
 		{"logging.level", cfg.Logging.Level, "info"},
 		{"logging.format", cfg.Logging.Format, "json"},
-		{"telemetry.health_path", cfg.Telemetry.HealthPath, "/healthz"},
 	}
 	for _, c := range checks {
 		if c.got != c.want {

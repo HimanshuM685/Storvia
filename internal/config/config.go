@@ -35,7 +35,6 @@ type Config struct {
 	Uploads     UploadsConfig    `json:"uploads"`
 	Drive       DriveConfig      `json:"drive"`
 	Fallback    FallbackConfig   `json:"fallback"`
-	Telemetry   TelemetryConfig  `json:"telemetry"`
 }
 
 // ServiceConfig carries build identity stamped onto every log record.
@@ -49,17 +48,14 @@ type ServiceConfig struct {
 // The upload deadline is intentionally separate from the routing budget: a slow
 // client pushing a large file must never be classified as a Drive outage.
 type ServerConfig struct {
-	Host               string   `json:"host"`
-	Port               int      `json:"port"`
-	ReadHeaderTimeout  Duration `json:"read_header_timeout"`
-	ReadTimeout        Duration `json:"read_timeout"`
-	WriteTimeout       Duration `json:"write_timeout"`
-	IdleTimeout        Duration `json:"idle_timeout"`
-	UploadTimeout      Duration `json:"upload_timeout"`
-	DownloadTimeout    Duration `json:"download_timeout"`
-	ShutdownGrace      Duration `json:"shutdown_grace"`
-	MaxRequestBodySize int64    `json:"max_request_body_size"`
-	TrustedProxies     []string `json:"trusted_proxies"`
+	Host              string   `json:"host"`
+	Port              int      `json:"port"`
+	ReadHeaderTimeout Duration `json:"read_header_timeout"`
+	ReadTimeout       Duration `json:"read_timeout"`
+	WriteTimeout      Duration `json:"write_timeout"`
+	IdleTimeout       Duration `json:"idle_timeout"`
+	UploadTimeout     Duration `json:"upload_timeout"`
+	ShutdownGrace     Duration `json:"shutdown_grace"`
 }
 
 // Addr returns the listen address.
@@ -104,7 +100,6 @@ type DatabaseConfig struct {
 	ConnMaxLifetime Duration `json:"conn_max_lifetime"`
 	ConnMaxIdleTime Duration `json:"conn_max_idle_time"`
 	AutoMigrate     bool     `json:"auto_migrate"`
-	MigrationsDir   string   `json:"migrations_dir"`
 }
 
 // BuildDSN assembles the driver connection string from the plain parameters and
@@ -150,9 +145,6 @@ type CacheConfig struct {
 	RedisDatabase    int    `json:"redis_database"`
 
 	JanitorInterval   Duration `json:"janitor_interval"`
-	AccessTokenTTL    Duration `json:"access_token_ttl"`
-	PreflightTTL      Duration `json:"preflight_ttl"`
-	CircuitStateTTL   Duration `json:"circuit_state_ttl"`
 	AvailabilityScope string   `json:"availability_scope"`
 }
 
@@ -172,7 +164,6 @@ type AuthConfig struct {
 	SessionCookieName    string   `json:"session_cookie_name"`
 	SessionTTL           Duration `json:"session_ttl"`
 	SecureCookie         bool     `json:"secure_cookie"`
-	TrustedProxies       []string `json:"trusted_proxies"`
 }
 
 // AdminPanelConfig controls the local development panel used to exercise the
@@ -194,7 +185,6 @@ type SecurityConfig struct {
 	AllowedOrigins         []string `json:"allowed_origins"`
 	AllowedEndpointSchemes []string `json:"allowed_endpoint_schemes"`
 	AllowedEndpointHosts   []string `json:"allowed_endpoint_hosts"`
-	MaxClockSkew           Duration `json:"max_clock_skew"`
 }
 
 // UploadsConfig bounds what a tenant may store and how transfer proceeds.
@@ -205,7 +195,6 @@ type UploadsConfig struct {
 	DriveChunkSizeBytes int              `json:"drive_chunk_size_bytes"`
 	S3PartSizeBytes     int              `json:"s3_part_size_bytes"`
 	PresignedURLTTL     Duration         `json:"presigned_url_ttl"`
-	PresignedPartCount  int              `json:"presigned_part_count"`
 	MinPartSizeBytes    int              `json:"min_part_size_bytes"`
 	CategoryLimits      map[string]int64 `json:"category_limits"`
 }
@@ -289,7 +278,6 @@ type S3BackendConfig struct {
 	UsePathStyle       bool     `json:"use_path_style"`
 	Disabled           bool     `json:"disabled"`
 	MultipartAbortTTL  Duration `json:"multipart_abort_ttl"`
-	OrphanGracePeriod  Duration `json:"orphan_grace_period"`
 }
 
 // VendorCloudflareR2 and VendorAWSS3 are the vendors Storvia recognizes.
@@ -309,14 +297,6 @@ func (f FallbackConfig) ActiveBackends() []S3BackendConfig {
 		out = append(out, b)
 	}
 	return out
-}
-
-// TelemetryConfig controls metrics and health endpoints.
-type TelemetryConfig struct {
-	MetricsEnabled   bool     `json:"metrics_enabled"`
-	MetricsPath      string   `json:"metrics_path"`
-	HealthPath       string   `json:"health_path"`
-	ReadinessTimeout Duration `json:"readiness_timeout"`
 }
 
 // envPattern matches ${NAME} and ${NAME:-default}.
@@ -422,14 +402,8 @@ func (c *Config) applyDefaults() {
 	if c.Server.UploadTimeout == 0 {
 		c.Server.UploadTimeout = Duration(30 * time.Minute)
 	}
-	if c.Server.DownloadTimeout == 0 {
-		c.Server.DownloadTimeout = Duration(15 * time.Minute)
-	}
 	if c.Server.ShutdownGrace == 0 {
 		c.Server.ShutdownGrace = Duration(30 * time.Second)
-	}
-	if c.Server.MaxRequestBodySize == 0 {
-		c.Server.MaxRequestBodySize = 2 << 20
 	}
 	if c.Logging.Level == "" {
 		c.Logging.Level = "info"
@@ -449,25 +423,11 @@ func (c *Config) applyDefaults() {
 	if c.Database.ConnMaxIdleTime == 0 {
 		c.Database.ConnMaxIdleTime = Duration(5 * time.Minute)
 	}
-	if c.Database.MigrationsDir == "" {
-		c.Database.MigrationsDir = "migrations"
-	}
 	if c.Cache.Driver == "" {
 		c.Cache.Driver = DriverMemory
 	}
 	if c.Cache.JanitorInterval == 0 {
 		c.Cache.JanitorInterval = Duration(time.Minute)
-	}
-	if c.Cache.AccessTokenTTL == 0 {
-		// Deliberately under an hour: an access token outliving its expiry in
-		// the cache would turn a revocation into a delayed revocation.
-		c.Cache.AccessTokenTTL = Duration(30 * time.Minute)
-	}
-	if c.Cache.PreflightTTL == 0 {
-		c.Cache.PreflightTTL = Duration(5 * time.Second)
-	}
-	if c.Cache.CircuitStateTTL == 0 {
-		c.Cache.CircuitStateTTL = Duration(2 * time.Minute)
 	}
 	if c.Auth.SessionSigningKeyRef == "" {
 		c.Auth.SessionSigningKeyRef = "STORVIA_SESSION_SIGNING_KEY"
@@ -480,9 +440,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.AdminPanel.FlowCookie == "" {
 		c.AdminPanel.FlowCookie = "storvia_admin_flow"
-	}
-	if c.Security.MaxClockSkew == 0 {
-		c.Security.MaxClockSkew = Duration(2 * time.Minute)
 	}
 	if len(c.Security.AllowedEndpointSchemes) == 0 {
 		c.Security.AllowedEndpointSchemes = []string{"https"}
@@ -504,9 +461,6 @@ func (c *Config) applyDefaults() {
 	if c.Uploads.PresignedURLTTL == 0 {
 		c.Uploads.PresignedURLTTL = Duration(15 * time.Minute)
 	}
-	if c.Uploads.PresignedPartCount == 0 {
-		c.Uploads.PresignedPartCount = 8
-	}
 	if c.Drive.RootFolderName == "" {
 		c.Drive.RootFolderName = "Storvia"
 	}
@@ -527,15 +481,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Drive.CircuitCooldown == 0 {
 		c.Drive.CircuitCooldown = Duration(30 * time.Second)
-	}
-	if c.Telemetry.HealthPath == "" {
-		c.Telemetry.HealthPath = "/healthz"
-	}
-	if c.Telemetry.MetricsPath == "" {
-		c.Telemetry.MetricsPath = "/metrics"
-	}
-	if c.Telemetry.ReadinessTimeout == 0 {
-		c.Telemetry.ReadinessTimeout = Duration(3 * time.Second)
 	}
 }
 
@@ -878,15 +823,22 @@ var credentialPrefixes = []string{
 // looksLikeCredential reports whether a value resembles a real secret.
 //
 // It is a heuristic and deliberately narrow: it would rather miss an unusual
-// credential than reject a legitimate variable name.
+// credential than reject a legitimate value. URLs, file paths, and scope
+// identifiers are excluded, because a long string with no underscore is a very
+// ordinary shape for those and flagging them would make the check useless.
 func looksLikeCredential(value string) bool {
+	// A scheme or a path separator is strong evidence this is a URL or a path,
+	// not a credential. Real secrets do not carry either.
+	if strings.Contains(value, "://") || strings.Contains(value, "/") {
+		return false
+	}
 	for _, prefix := range credentialPrefixes {
 		if strings.HasPrefix(value, prefix) {
 			return true
 		}
 	}
-	// A long opaque string with no underscores is almost always a credential; a
-	// variable name nearly always contains one.
+	// A long opaque string with no separators is almost always a credential; an
+	// environment variable name nearly always contains an underscore.
 	if len(value) >= 40 && !strings.Contains(value, "_") {
 		return true
 	}
