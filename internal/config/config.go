@@ -262,9 +262,14 @@ type FallbackConfig struct {
 // the common S3 subset only. Endpoint and credentials are operator configuration,
 // which is what prevents a client from steering writes at an arbitrary host.
 type S3BackendConfig struct {
-	ID                string   `json:"id"`
-	Vendor            string   `json:"vendor"`
-	Endpoint          string   `json:"endpoint"`
+	ID     string `json:"id"`
+	Vendor string `json:"vendor"`
+	// Endpoint overrides the vendor's environment endpoint for this backend. It is
+	// optional: leaving it empty reads EndpointEnvVar(Vendor) from the environment.
+	// It exists for deployments running two backends of the same vendor against
+	// different endpoints, where a single vendor-level variable cannot say which is
+	// which.
+	Endpoint          string   `json:"endpoint,omitempty"`
 	Region            string   `json:"region"`
 	Bucket            string   `json:"bucket"`
 	Prefix            string   `json:"prefix"`
@@ -362,10 +367,44 @@ func Parse(raw []byte, lookup func(string) (string, bool)) (*Config, error) {
 		return nil, fmt.Errorf("config: decode: %w", err)
 	}
 	cfg.applyDefaults()
+
+	// The endpoint lives in the environment, so it is resolved before validation: the
+	// allow-list check has nothing to inspect until it has a value.
+	if err := cfg.resolveEndpoints(lookup); err != nil {
+		return nil, err
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// resolveEndpoints fills each backend's endpoint from the environment.
+//
+// A value already present in the JSON wins, so a deployment with two backends of one
+// vendor can still name them individually. A missing value is an error rather than an
+// empty string: an empty endpoint would silently send requests to the AWS default,
+// which for an R2 backend means an unconfigured client rather than a clear error.
+func (c *Config) resolveEndpoints(lookup func(string) (string, bool)) error {
+	for i := range c.Fallback.Backends {
+		backend := &c.Fallback.Backends[i]
+		if backend.Disabled {
+			continue
+		}
+		if backend.Endpoint != "" {
+			continue
+		}
+		name := EndpointEnvVar(backend.Vendor)
+		value, ok := lookup(name)
+		if !ok || value == "" {
+			return fmt.Errorf("config: fallback backend %q (%s) has no endpoint: "+
+				"set %s in the environment, or give the backend an explicit endpoint",
+				backend.ID, backend.Vendor, name)
+		}
+		backend.Endpoint = value
+	}
+	return nil
 }
 
 // applyDefaults fills optional values. It never invents a secret: a missing
@@ -645,6 +684,27 @@ func (c *Config) validateFallback() error {
 	return nil
 }
 
+// hostAllowed reports whether a host matches one allow-list entry.
+//
+// An entry may begin with "*." to match any single leading label, so
+// "*.r2.cloudflarestorage.com" permits a tenant's own account endpoint without the
+// account identifier having to appear in the checked-in configuration. The wildcard
+// is limited to one label deliberately: "*.r2.cloudflarestorage.com" matches
+// "abc123.r2.cloudflarestorage.com" and nothing deeper, so it cannot be widened into
+// a match for an unrelated host.
+func hostAllowed(allowed, host string) bool {
+	if strings.HasPrefix(allowed, "*.") {
+		suffix := allowed[1:] // ".r2.cloudflarestorage.com"
+		if !strings.HasSuffix(strings.ToLower(host), strings.ToLower(suffix)) {
+			return false
+		}
+		label := host[:len(host)-len(suffix)]
+		// Exactly one non-empty label before the suffix.
+		return label != "" && !strings.Contains(label, ".")
+	}
+	return strings.EqualFold(allowed, host)
+}
+
 // endpointAllowed enforces the operator allow-list that stops a misconfigured or
 // tampered endpoint from pointing Storvia at an internal or hostile host.
 func (c *Config) endpointAllowed(endpoint string) bool {
@@ -669,7 +729,7 @@ schemeOk:
 		return true
 	}
 	for _, allowed := range c.Security.AllowedEndpointHosts {
-		if strings.EqualFold(allowed, normalized) {
+		if hostAllowed(strings.TrimSpace(allowed), normalized) {
 			return true
 		}
 	}

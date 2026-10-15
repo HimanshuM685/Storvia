@@ -54,8 +54,9 @@
       "https"
     ],
     "allowed_endpoint_hosts": [
-      "YOUR_ACCOUNT_ID.r2.cloudflarestorage.com",
-      "s3.amazonaws.com"
+      "*.r2.cloudflarestorage.com",
+      "s3.amazonaws.com",
+      "*.amazonaws.com"
     ]
   },
   "uploads": {
@@ -101,7 +102,6 @@
       {
         "id": "r2-primary",
         "vendor": "cloudflare_r2",
-        "endpoint": "https://YOUR_ACCOUNT_ID.r2.cloudflarestorage.com",
         "region": "auto",
         "bucket": "storvia-fallback",
         "prefix": "prod",

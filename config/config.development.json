@@ -53,7 +53,11 @@
     "allowed_endpoint_schemes": [
       "https"
     ],
-    "allowed_endpoint_hosts": []
+    "allowed_endpoint_hosts": [
+      "*.r2.cloudflarestorage.com",
+      "s3.amazonaws.com",
+      "*.amazonaws.com"
+    ]
   },
   "uploads": {
     "max_file_size_bytes": 5368709120,
@@ -98,7 +102,6 @@
       {
         "id": "r2-primary",
         "vendor": "cloudflare_r2",
-        "endpoint": "https://f537476a76bae45a4f65fd8618326090.r2.cloudflarestorage.com",
         "region": "auto",
         "bucket": "storvia-testing",
         "prefix": "",

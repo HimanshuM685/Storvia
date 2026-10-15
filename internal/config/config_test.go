@@ -233,7 +233,7 @@ func TestValidateRejectsFallbackWithoutDisclosureAcceptance(t *testing.T) {
            {"id": "b1", "vendor": "cloudflare_r2", "bucket": "b"}
          ]}`, 1)
 
-	_, err := Parse([]byte(raw), lookupMap(nil))
+	_, err := Parse([]byte(raw), lookupMap(map[string]string{EnvR2Endpoint: r2TestEndpoint}))
 	if err == nil {
 		t.Fatal("fallback must refuse to enable while the outage disclosure is unaccepted")
 	}
@@ -453,6 +453,7 @@ func TestSecretFieldsAndRedactedSummaryDoNotLeak(t *testing.T) {
 		EnvGoogleClientSecret: "csecret",
 		EnvR2AccessKeyID:      "AKIAREALKEY",
 		EnvR2SecretAccessKey:  "veryrealsecret",
+		EnvR2Endpoint:         r2TestEndpoint,
 	}))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)

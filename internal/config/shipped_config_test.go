@@ -76,11 +76,7 @@ func TestShippedConfigFilesLoadAndValidate(t *testing.T) {
 // environment, so the assertion does not depend on what the developer happens to
 // have exported.
 func TestShippedConfigFilesParseInIsolation(t *testing.T) {
-	env := map[string]string{
-		EnvSessionSigningKey: "a-signing-key-long-enough-for-the-test",
-		EnvEncryptionKey:     strings.Repeat("a", 64),
-		EnvDatabasePassword:  "a-database-password",
-	}
+	env := shippedConfigEnv()
 
 	for _, name := range []string{"config.development.json", "config.production.json"} {
 		t.Run(name, func(t *testing.T) {
@@ -185,6 +181,12 @@ func TestEnvExampleHasNoOrphanVariables(t *testing.T) {
 	for _, ref := range AllSecretEnvVars() {
 		referenced[ref] = true
 	}
+	// The endpoint variables are read from the environment too. They are ordinary
+	// settings rather than secrets, so they are audited alongside without being
+	// treated as credentials.
+	for _, name := range AllEndpointEnvVars() {
+		referenced[name] = true
+	}
 
 	for _, name := range envNamesIn(envExample) {
 		if referenced[name] || composeOnly[name] {
@@ -251,11 +253,7 @@ func walkStrings(node any, visit func(key, value string)) {
 // itself, but it does assert that the shipped files still parse strictly, which
 // catches a field removed from the struct but left behind in a JSON file.
 func TestNoDeadConfigFieldsInShippedFiles(t *testing.T) {
-	env := map[string]string{
-		EnvSessionSigningKey: "a-signing-key-long-enough-for-the-test",
-		EnvEncryptionKey:     strings.Repeat("a", 64),
-		EnvDatabasePassword:  "a-database-password",
-	}
+	env := shippedConfigEnv()
 
 	for _, name := range []string{"config.development.json", "config.production.json"} {
 		t.Run(name, func(t *testing.T) {
@@ -266,5 +264,25 @@ func TestNoDeadConfigFieldsInShippedFiles(t *testing.T) {
 					"field was removed from the struct but left in the file: %v", name, err)
 			}
 		})
+	}
+}
+
+// r2TestEndpoint is a syntactically valid R2 endpoint for tests that need one.
+const r2TestEndpoint = "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com"
+
+// shippedConfigEnv is the environment both shipped files are checked against.
+//
+// It includes the endpoint variable because the endpoint is read from the
+// environment, not from the JSON. A shipped config that cannot load without it would
+// be a shipped config that does not work out of the box.
+func shippedConfigEnv() map[string]string {
+	return map[string]string{
+		EnvSessionSigningKey: "a-signing-key-long-enough-for-the-test",
+		EnvEncryptionKey:     strings.Repeat("a", 64),
+		EnvDatabasePassword:  "a-database-password",
+		EnvRedisPassword:     "",
+		EnvR2Endpoint:        "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com",
+		EnvR2AccessKeyID:     "r2-id",
+		EnvR2SecretAccessKey: "r2-secret",
 	}
 }

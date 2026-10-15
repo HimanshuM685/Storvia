@@ -152,12 +152,19 @@ the real thing.
 Configuration is split by secrecy, and the split is absolute:
 
 - **JSON** (`config/*.json`) holds every ordinary setting and **nothing else**:
-  timeouts, TTLs, booleans, size limits, hostnames, ports, bucket names, endpoints,
-  regions, prefixes, and redirect URIs. There is no secret in it — not a value, and
-  not a field that names one.
-- **`.env`** holds every actual credential: API keys, OAuth client credentials,
-  access keys, secret keys, passwords, the refresh-token encryption key, and the
-  session-signing key. `.env` files are never committed.
+  timeouts, TTLs, booleans, size limits, bucket names, regions, prefixes, and redirect
+  URIs. There is no secret in it — not a value, and not a field that names one. It also
+  holds no account-specific endpoint, so the same file works for every deployment of a
+  given version.
+- **`.env`** holds every actual credential — API keys, OAuth client credentials, access
+  keys, secret keys, passwords, the refresh-token encryption key, and the session-signing
+  key — plus the account-specific S3 endpoint (`STORVIA_R2_ENDPOINT`), which is not a
+  secret but does change per deployment. `.env` files are never committed.
+
+The endpoint variables are chosen by vendor (`STORVIA_R2_ENDPOINT`,
+`STORVIA_AWS_ENDPOINT`) for the same reason the credentials are. A backend may still
+name an explicit `endpoint` in its own JSON entry when two backends of one vendor point
+at different endpoints.
 
 A checked-in config file is read, reviewed, and committed by people who should never
 have to think about secrets. Leaving a `client_secret_ref` in it means the file is no

@@ -17,6 +17,73 @@ Related documents:
 
 ---
 
+## 2026-10-15 — Fallback endpoints moved out of the checked-in configuration
+
+### Why
+
+The owner asked for the account-specific endpoint to live in `.env` rather than in the
+committed JSON, alongside the credentials.
+
+This is not a secret — an endpoint is a hostname — but the reasoning holds: it is a
+property of the account you deploy into, so every line of it in a checked-in file is a
+line someone has to edit again when they move it. With it in the environment, the
+committed configuration is identical for every deployment of a given version.
+
+### Changed
+
+- **`endpoint` removed from both JSON files.** Every fallback backend entry is now
+  `id`, `vendor`, `region`, `bucket`, `prefix`, `use_path_style`, `disabled`, and
+  `multipart_abort_ttl`.
+- **`STORVIA_R2_ENDPOINT` and `STORVIA_AWS_ENDPOINT`**, declared in
+  `internal/config/endpoint_names.go`. Kept deliberately in a separate file from
+  `secrets_names.go`: the names are not secrets, nothing redacts them, and
+  `AllSecretEnvVars` does not include them. A test asserts that separation.
+- **`EndpointEnvVar(vendor)`** picks the variable by vendor, matching how the
+  credentials are chosen, so an R2 backend cannot be pointed at the AWS variable.
+- **`resolveEndpoints`** runs during `Parse`, before validation, because the
+  allow-list check has nothing to inspect until there is a value.
+
+### Two decisions worth stating
+
+**A missing endpoint is an error, not an empty string.** An empty endpoint would fall
+back to the AWS SDK's own default, which for an R2 backend is not an R2 request at all.
+The error names the variable to set.
+
+**The JSON `endpoint` field still exists as an optional per-backend override.** Two
+backends of the same vendor against different endpoints cannot both be served by one
+vendor-level variable, and silently breaking that seemed worse than keeping the escape
+hatch. A value in the JSON wins over the environment. Both shipped files omit it.
+
+### Security: wildcard host allow-listing
+
+With the account identifier gone from the configuration, the allow-list could no longer
+name it literally, and `YOUR_ACCOUNT_ID.r2.cloudflarestorage.com` in a committed file is
+worse than useless. Both files now carry `*.r2.cloudflarestorage.com`, `s3.amazonaws.com`,
+and `*.amazonaws.com`.
+
+A leading `*.` matches exactly one label, and `TestHostAllowedWildcardIsOneLabelOnly`
+pins that down. `*.r2.cloudflarestorage.com` matches
+`abc123.r2.cloudflarestorage.com` and nothing deeper, so it cannot be widened into
+matching `a.b.r2.cloudflarestorage.com` or `r2.cloudflarestorage.com.attacker.test`.
+
+### Tests
+
+Eight new tests in `internal/config/endpoint_test.go`: endpoint read from the
+environment, missing endpoint rejected by name, explicit JSON override, disabled backend
+needing no endpoint, vendor-selected variable, the one-label wildcard rule including the
+attacker-suffix cases, the shipped allow-list against real vendor host shapes, and
+`.env.example` documenting both variables.
+
+`TestEnvExampleHasNoOrphanVariables` now audits the endpoint variables alongside the
+secrets without treating them as credentials.
+
+### Checks run
+
+```
+make check      # fmt-check vet test — passed
+make test-live  # both live tests still pass; the endpoint now comes from .env.development
+```
+
 ## 2026-10-15 — Outage fallback verified against real Cloudflare R2, and three wiring bugs fixed
 
 ### Why
