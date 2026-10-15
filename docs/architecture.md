@@ -394,4 +394,103 @@ Metrics:
 
 Every state transition gets a correlation ID, tenant ID, logical object ID, upload/attempt ID, provider, operation, normalized error class, and attempt generation. Avoid provider file IDs and names in broad telemetry unless needed and redacted.
 
+### What `/metrics` actually exposes
+
+Prometheus text format 0.0.4, so an existing scraper reads it with no configuration. The
+series are chosen to answer one question: where did this upload go, and did it finish.
+
+| Metric | Type | Labels | Answers |
+|---|---|---|---|
+| `storvia_uploads_started_total` | counter | `provider` | How much traffic lands on each provider. |
+| `storvia_uploads_finished_total` | counter | `provider`, `outcome` | Did uploads complete, and on what. |
+| `storvia_uploads_outcome_unknown_total` | counter | `provider` | Work for a person. Each one is a real incident. |
+| `storvia_bytes_stored_total` | counter | `provider` | Where the bytes actually went. |
+| `storvia_fallback_routings_total` | counter | `reason` | Why Drive was skipped, not merely how often. |
+| `storvia_provider_calls_total` | counter | `provider`, `operation`, `class` | "How often is Drive unavailable" versus "refusing us". |
+| `storvia_job_runs_total` | counter | `kind`, `outcome` | Whether the queue is draining. |
+| `storvia_orphans_found_total` | counter | `provider` | Provider bytes with no Storvia record. |
+| `storvia_upload_duration_seconds` | histogram | `provider` | Whether a slow upload is the client's pace or Drive's health. |
+| `storvia_fallback_consent` | gauge | `tenant` | Whether the fallback is currently open. |
+| `storvia_objects_stored` | gauge | `provider`, `state` | Tenant object counts. |
+| `storvia_build_info` | gauge | `version`, `go`, `pid`, `environment` | Which build answered, without correlating against a deploy time. |
+
+Three properties are load-bearing rather than incidental:
+
+- **Series keys are built from sorted label names.** Go map iteration order is randomised,
+  so a key built by ranging over the map would mint a new series roughly half the time and
+  a counter would appear to reset at random.
+- **`Gather` is deterministic.** Families in registration order, label sets sorted. A
+  scrape that reorders between calls makes diffs useless.
+- **Every recorder tolerates a nil receiver.** Instrumentation that can panic takes down
+  the request it measures. A nil guard is only as deep as the first dereference — this bit
+  me when the guard existed on the leaf counter but not on the collector holding it.
+
+Counters that are obviously zero everywhere are omitted rather than shipped.
+
+### Operator routing control
+
+Two switches exist and they are not the same thing.
+
+**Fault injection** pretends Drive is broken so the fallback path can be exercised on
+demand. The provider is healthy; the service is lying to itself. It is gated on by
+environment, refused outside development, and driven at runtime through an atomic flag.
+
+**Forced fallback** actually prefers the fallback. It answers a different question:
+during an incident, "does the fallback work at all?" and "can we keep serving users?"
+are both unanswerable while routing still prefers Drive. It is `fallback.force` in
+configuration with a live override from the console, where the override is tri-state
+(force, prefer Drive, follow config) because "stop overriding me" is not expressible as a
+boolean.
+
+Two limits are deliberate and tested:
+
+- **Consent still applies.** An operator override changes which provider wins; it does
+  not manufacture the tenant's agreement to have files stored elsewhere.
+- **An in-flight mutation stays pinned to Drive.** The override chooses a provider for a
+  *new* upload. It cannot relocate bytes that may already have reached Drive, because
+  that is how a duplicate file gets created — the single failure this design exists to
+  prevent.
+
+Ordering inside `Evaluate` is the contract: hard stops first (validity, authorization),
+then the mutation check, then the operator override, then consent and configuration
+gates, then the provider preflight. An override that can do anything is not an override;
+it is a way to disable the safety rules.
+
+Forcing also **skips the Drive preflight** rather than merely ignoring its result. During
+an incident a wasted round trip to a struggling provider is not free.
+
+### Background work
+
+The `storage_jobs` table is a lease queue, and the lease is the point.
+
+- **Claiming is a lease, not a delete.** A crashed worker's jobs become claimable again
+  when the lease expires rather than being lost. The `UPDATE` is conditional on the row
+  still being claimable, so two workers racing for one row cannot both win.
+- **Finishing and renewing require ownership.** A worker that lost its lease stops, because
+  finishing would mark another worker's in-flight work as done. This is the double-delete
+  the lease exists to prevent.
+- **A failing job retries with backoff and is then parked** as `failed`. A job that always
+  fails is a problem for a person to look at, not something to spin on.
+- **Enqueue is idempotent per `(attempt_id, kind)`**, so a retrying client cannot produce
+  two jobs that both delete the same object.
+- A retrying delete stays pinned to the recorded provider, so it cannot move the deletion
+  somewhere else.
+- **Background work owns a cancellable context**, and `Stop` cancels before it waits.
+  Waiting for a goroutine to finish is only correct if something has cancelled it;
+  relying on the process signal handler having run first deadlocks every caller that is
+  not a signal.
+
+The orphan sweep **reports and never deletes**. Listing the provider is cleanup
+*evidence*, not permission to remove: Storvia keeps no second copy, and a key it does not
+recognise may be a file whose database commit is still in flight. Acting on that would be
+the worst thing this service could do. A grace period and an explicit decision are
+required first.
+
+The Drive change log is polled from a stored cursor rather than driven by push
+notifications, because a push is only a hint: it can arrive twice, be missed while a
+deployment is down, and arrive for accounts Storvia no longer cares about. **The cursor is
+advanced after the page is processed, never before** — advancing first and then failing
+skips changes permanently, while advancing second re-reads a page on a crash, and every
+change is idempotent. Re-reading is the safe direction.
+
 Security tests must cover OAuth state/tenant mix-up, IDOR by object ID, cross-tenant backend selection, signed URL leakage, session URI leakage, client-controlled object key, size-limit bypass, replayed completion, duplicate idempotency keys, and deletion authorization.

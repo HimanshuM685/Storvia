@@ -117,7 +117,8 @@ Deliverables:
 - [x] Attempt leases, operation generations, `mutation_may_have_started`,
       `outcome_unknown`, and cleanup states in the schema.
 - [x] Repository methods require an authenticated tenant/user scope.
-- [ ] Job claiming and lease acquisition on top of `storage_jobs`.
+- [x] Job claiming and lease acquisition on top of `storage_jobs`. Claim is a lease
+      with a conditional `UPDATE`; finish and renew require ownership.
 
 Tests:
 
@@ -125,10 +126,13 @@ Tests:
 - [x] Same idempotency key with different metadata returns conflict.
 - [x] Two tenants cannot observe or mutate one another's objects.
 - [ ] A lease expiry cannot authorize a replacement provider mutation while the first
-      attempt is unresolved. The schema forbids a second `MarkMutationStarted`; the
-      worker that would exercise it does not exist yet.
-- [ ] Completion is idempotent and has one ready transition. `CommitReady` is
-      idempotent and provider-pinned; the completion handler does not exist yet.
+      attempt is unresolved. The schema forbids a second `MarkMutationStarted`, and the
+      job lease is now implemented and unit tested (exclusive claim, ownership required
+      to finish, expiry recovery). What is still missing is a test that ties a *job* lease
+      expiry to a *provider* mutation, across both.
+- [x] Completion is idempotent and has one ready transition. `CommitReady` is
+      idempotent and provider-pinned, and the completion handler exists for both Drive
+      and the fallback provider.
 
 ### M3 — Drive OAuth and thin vertical slice
 
@@ -149,12 +153,16 @@ Deliverables:
 - [x] Configuration boundary documented and tested: credential values stay in ignored
       `.env`/runtime injection; checked-in JSON contains only non-secret settings or
       `STORVIA_*` environment-variable references.
-- [ ] Create/find the visible `Storvia/` folder and persist the folder ID.
-- [ ] Drive resumable session initiation.
-- [ ] Backend-proxied chunk upload.
-- [ ] Completion verification.
-- [ ] Private range download.
-- [ ] Delete.
+- [x] Create/find the visible `Storvia/` folder and persist the folder ID. Created at
+      connection time, not lazily; ambiguous names are reported, never auto-resolved.
+- [x] Drive resumable session initiation.
+- Backend-proxied chunk upload: **deliberately removed, not merely unfinished.** A Drive
+  resumable session is a write capability that cannot be proxied without breaking, so
+  `ModeDriveProxy` and `PATCH/POST .../chunks` were deleted from both the service and both
+  SDKs rather than left as an unreachable path.
+- [x] Completion verification.
+- [x] Private range download.
+- [x] Delete.
 
 Tests and manual checks:
 
@@ -162,7 +170,9 @@ Tests and manual checks:
 - [x] Declined consent and revoked-grant classification.
 - [x] Tenant isolation and application authorization on object operations.
 - [ ] Successful small upload/download/delete against a controlled Drive test account.
-- [ ] Successful admin-panel OAuth round trip against a controlled Google account.
+- [x] Successful admin-panel OAuth round trip against a controlled Google account.
+      Completed against a live account: subject `13735161528780792640`, scope
+      `drive.file`, refresh token stored encrypted, `Storvia/` folder created.
 - [ ] Interrupted chunk after body-before-response.
 - [ ] Drive quota, admin policy, missing folder, missing file, 401, 403, 404, 429, 5xx
       end to end.
@@ -185,8 +195,12 @@ Deliverables:
       streaming download, and delete.
 - [x] Short-lived presigned part planning, bounded by the configured TTL.
 - [x] Orphan listing restricted to the Storvia namespace.
-- [ ] Lifecycle cleanup for abandoned multipart uploads in a real bucket.
-- [ ] Contract suite run against the selected real provider in a non-production bucket.
+- [ ] Lifecycle cleanup for abandoned multipart uploads in a real bucket. The cleanup
+      *job* exists and sweeps the orphan namespace; aborting an in-flight multipart
+      upload against a real bucket does not.
+- [x] Contract suite run against the selected real provider in a non-production bucket.
+      Cloudflare R2, bucket `storvia-testing`: upload, verify via `HeadObject`, read back,
+      delete.
 
 Provider contract tests:
 

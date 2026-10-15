@@ -60,6 +60,21 @@ func (s *stubResolver) SaveConnection(_ context.Context, c Connection) error {
 	return nil
 }
 
+func (s *stubResolver) ConnectionByID(_ context.Context, id string) (Connection, error) {
+	if s.err != nil {
+		return Connection{}, s.err
+	}
+	connection := s.connection
+	connection.ID = id
+	return connection, nil
+}
+
+func (s *stubResolver) SetChangesCursor(_ context.Context, _, cursor string) error {
+	value := cursor
+	s.connection.ChangesCursor = &value
+	return nil
+}
+
 func (s *stubResolver) MarkStatus(_ context.Context, _ string, status string) error {
 	s.markedStatus = append(s.markedStatus, status)
 	return nil

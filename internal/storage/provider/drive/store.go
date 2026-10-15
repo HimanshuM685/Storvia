@@ -25,6 +25,20 @@ type Store interface {
 	SetStatus(ctx context.Context, connectionID, status string) error
 	// SetRootFolderID records the app-managed folder.
 	SetRootFolderID(ctx context.Context, connectionID, folderID string) error
+	// ConnectionByID reads a connection for background work.
+	ConnectionByID(ctx context.Context, connectionID string) (persistence.DriveConnection, error)
+	// SetChangesCursor advances how far the change log has been processed.
+	SetChangesCursor(ctx context.Context, connectionID, cursor string) error
+	// ConnectedConnectionIDs lists connections worth polling.
+	ConnectedConnectionIDs(ctx context.Context) ([]string, error)
+}
+
+// deref reads a nullable string column as a plain string.
+func deref(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 // storeResolver adapts a Store to the ConnectionResolver interface the client
@@ -105,6 +119,32 @@ func (c *Client) LogWarn(ctx context.Context, message string, args ...any) {
 	c.log.WarnContext(ctx, message, args...)
 }
 
+// ConnectionByID reads a connection by id for background work.
+func (r *storeResolver) ConnectionByID(ctx context.Context, connectionID string) (Connection, error) {
+	stored, err := r.store.ConnectionByID(ctx, connectionID)
+	if err != nil {
+		if errors.Is(err, persistence.ErrNoConnection) {
+			return Connection{}, persistence.ErrNoConnection
+		}
+		return Connection{}, err
+	}
+	return Connection{
+		ID:            stored.ID,
+		TenantID:      stored.TenantID,
+		UserID:        stored.UserID,
+		Subject:       stored.Subject,
+		RefreshToken:  stored.PlaintextRefreshToken,
+		RootFolderID:  deref(stored.RootFolderID),
+		Status:        stored.Status,
+		ChangesCursor: stored.ChangesCursor,
+	}, nil
+}
+
+// SetChangesCursor advances the change-log cursor.
+func (r *storeResolver) SetChangesCursor(ctx context.Context, connectionID, cursor string) error {
+	return r.store.SetChangesCursor(ctx, connectionID, cursor)
+}
+
 // SetRefreshToken persists a rotated refresh token.
 func (c *Client) SetRefreshToken(ctx context.Context, connectionID, refreshToken string) error {
 	store, ok := c.conns.(*storeResolver)
@@ -126,4 +166,22 @@ func Stale(lastSuccess *time.Time, now time.Time) bool {
 		return true
 	}
 	return now.Sub(*lastSuccess) > StalenessThreshold
+}
+
+// AdvanceChangesCursor records how far the change log has been read.
+func (c *Client) AdvanceChangesCursor(ctx context.Context, connectionID, cursor string) error {
+	store, ok := c.conns.(*storeResolver)
+	if !ok {
+		return errors.New("drive: this connection store cannot persist a changes cursor")
+	}
+	return store.store.SetChangesCursor(ctx, connectionID, cursor)
+}
+
+// ConnectedIDs lists the connections whose change logs should be polled.
+func (c *Client) ConnectedIDs(ctx context.Context) ([]string, error) {
+	store, ok := c.conns.(*storeResolver)
+	if !ok {
+		return nil, errors.New("drive: this connection store cannot be enumerated")
+	}
+	return store.store.ConnectedConnectionIDs(ctx)
 }

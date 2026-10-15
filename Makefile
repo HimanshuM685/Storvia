@@ -90,6 +90,14 @@ test-live: ## Run tests that talk to a real fallback provider (needs .env.develo
 	@test -f .env.development || { echo ".env.development is missing; copy .env.example and fill it in"; exit 1; }
 	STORVIA_LIVE_FALLBACK_TEST=1 $(GO) test ./internal/app/ -run LiveFallback -v
 
+test-live-drive: ## Run tests that read AND WRITE a real Google Drive account (needs a signed-in console)
+	@command -v $(GO) >/dev/null || { echo "go is not on PATH"; exit 1; }
+	@test -f .env.development || { echo ".env.development is missing; copy .env.example and fill it in"; exit 1; }
+	@echo "These create, read, and delete files in the real Drive account."
+	STORVIA_LIVE_DRIVE_TEST=1 STORVIA_LIVE_FALLBACK_TEST=1 $(GO) test ./internal/app/ -run Live -v
+
+.PHONY: test-live-drive
+
 .PHONY: cover
 cover: ## Write a coverage profile to coverage.out
 	$(GO) test ./... -coverprofile=coverage.out

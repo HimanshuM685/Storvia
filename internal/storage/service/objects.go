@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"io"
+	"log/slog"
 
 	"github.com/shovan04/storvia/internal/apperr"
 	"github.com/shovan04/storvia/internal/persistence"
@@ -24,11 +25,30 @@ type ObjectService struct {
 	objects *persistence.ObjectRepository
 	uploads *persistence.UploadRepository
 	source  ContentSource
+	// jobs schedules deferred work for an operation that did not complete. It is nil
+	// when the deployment runs no worker, and then a failed delete stays failed
+	// rather than being retried.
+	jobs   *persistence.JobRepository
+	logger *slog.Logger
 }
 
 // NewObjectService builds the service.
 func NewObjectService(objects *persistence.ObjectRepository, uploads *persistence.UploadRepository, source ContentSource) *ObjectService {
-	return &ObjectService{objects: objects, uploads: uploads, source: source}
+	return &ObjectService{
+		objects: objects,
+		uploads: uploads,
+		source:  source,
+		logger:  slog.Default(),
+	}
+}
+
+// WithJobs attaches the retry queue.
+func (s *ObjectService) WithJobs(jobs *persistence.JobRepository, logger *slog.Logger) *ObjectService {
+	s.jobs = jobs
+	if logger != nil {
+		s.logger = logger
+	}
+	return s
 }
 
 // GetObject returns one object, scoped to the tenant.
@@ -131,9 +151,36 @@ func (s *ObjectService) DeleteObject(ctx context.Context, scope persistence.Scop
 			// delete anything elsewhere.
 			return s.finishDelete(ctx, scope, object, model.ObjectMissing)
 		}
+		// The delete did not happen. Schedule it rather than leaving the object
+		// stuck in `deleting`, which is what a caller retrying would then see as a
+		// permanent conflict.
+		//
+		// The object stays in `deleting` on purpose: the job is pinned to this
+		// object and this provider, so retrying cannot move the deletion somewhere
+		// else.
+		s.scheduleRetry(scope, object, persistence.JobDelete)
 		return providerErrorToAppError(provider, "delete", err)
 	}
 	return s.finishDelete(ctx, scope, object, model.ObjectDeleted)
+}
+
+// scheduleRetry queues deferred work for an operation that did not complete.
+//
+// A failure here is logged rather than returned: the caller already has an error, and
+// replacing it with "could not schedule" would hide the real reason the delete failed.
+func (s *ObjectService) scheduleRetry(scope persistence.Scope, object model.LogicalObject, kind string) {
+	if s.jobs == nil {
+		return
+	}
+	objectID := object.ID
+	if _, err := s.jobs.Enqueue(context.Background(), persistence.Job{
+		ObjectID: &objectID,
+		TenantID: scope.TenantID,
+		Kind:     kind,
+	}); err != nil {
+		s.logger.Error("could not schedule a retry job",
+			"object_id", object.ID, "kind", kind, "error", err.Error())
+	}
 }
 
 // finishDelete records the terminal deletion state.

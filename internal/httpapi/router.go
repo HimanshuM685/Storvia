@@ -23,7 +23,7 @@ type Config struct {
 	Objects     *ObjectHandler
 	Connections *ConnectionHandler
 	Consent     *ConsentHandler
-	Admin       *AdminHandler
+	Console     *Console
 	Health      *HealthHandler
 
 	// AllowedOrigins is the CORS allow-list. An empty list disables CORS headers
@@ -118,14 +118,39 @@ func Router(cfg Config) http.Handler {
 	// The OAuth callback is public: Google redirects the browser here without any
 	// Storvia credential. The OAuth state value is what authenticates it.
 	root.Handle("GET /v1/storage/connections/google-drive/callback", http.HandlerFunc(cfg.Connections.Callback))
-	if cfg.Admin != nil {
-		root.Handle("GET /admin", http.HandlerFunc(cfg.Admin.Show))
-		root.Handle("GET /admin/connect", http.HandlerFunc(cfg.Admin.Connect))
-		root.Handle("GET /admin/oauth/callback", http.HandlerFunc(cfg.Admin.Callback))
-		root.Handle("POST /admin/disconnect", http.HandlerFunc(cfg.Admin.Disconnect))
-		root.Handle("POST /admin/fallback-consent", http.HandlerFunc(cfg.Admin.AcceptFallbackConsent))
-		root.Handle("POST /admin/ensure-folder", http.HandlerFunc(cfg.Admin.EnsureFolder))
-		root.Handle("POST /admin/logout", http.HandlerFunc(cfg.Admin.Logout))
+	// The testing console. It replaces the earlier admin panel, which had grown a
+	// set of form posts that could not show what an upload actually did.
+	if cfg.Console != nil {
+		root.Handle("GET /console", http.HandlerFunc(cfg.Console.Index))
+		root.Handle("GET /console/", http.HandlerFunc(cfg.Console.Index))
+
+		// The OAuth callback is public: Google redirects here without any Storvia
+		// credential, and the state value is what authenticates it.
+		root.Handle("GET /console/oauth/callback", http.HandlerFunc(cfg.Console.Callback))
+		root.Handle("GET /console/sign-in", http.HandlerFunc(cfg.Console.SignIn))
+		root.Handle("POST /console/sign-out", http.HandlerFunc(cfg.Console.SignOut))
+		// A server-side reload, so the redirect lands on a clean URL rather than on a
+		// copy of one with a query string.
+		root.Handle("GET /console/refresh", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/console", http.StatusFound)
+		}))
+
+		console := func(h http.HandlerFunc) http.Handler {
+			return Chain(h, RequestID(), AccessLog(cfg.Logger), Recovery(), limiter.Middleware())
+		}
+		for pattern, handler := range map[string]http.HandlerFunc{
+			"GET /console/api/state":                       cfg.Console.State,
+			"POST /console/api/upload":                     cfg.Console.Upload,
+			"POST /console/api/routing":                    cfg.Console.SetRouting,
+			"POST /console/api/faults":                     cfg.Console.SetFaults,
+			"POST /console/api/consent":                    cfg.Console.SetConsent,
+			"POST /console/api/folder":                     cfg.Console.EnsureFolder,
+			"POST /console/api/disconnect":                 cfg.Console.Disconnect,
+			"GET /console/api/objects/{object_id}/content": cfg.Console.DownloadContent,
+			"DELETE /console/api/objects/{object_id}":      cfg.Console.DeleteObject,
+		} {
+			root.Handle(pattern, console(handler))
+		}
 	}
 	root.Handle("/v1/", guarded)
 

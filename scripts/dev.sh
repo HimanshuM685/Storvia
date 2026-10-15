@@ -34,7 +34,7 @@ readonly ENV_FILE="${STORVIA_ENV:-.env.development}"
 readonly LOG_DIR="${STORVIA_LOG_DIR:-logs}"
 readonly LOG_FILE="$LOG_DIR/storvia-api.log"
 readonly PID_FILE="$LOG_DIR/storvia-api.pid"
-readonly ADMIN_URL="http://127.0.0.1:8080/admin"
+readonly ADMIN_URL="http://127.0.0.1:8080/console"
 readonly READY_URL="http://127.0.0.1:8080/readyz"
 readonly PORT=8080
 

@@ -99,15 +99,20 @@ func (c *Client) InitiateUpload(ctx context.Context, scope persistence.Scope, re
 		return InitiateUploadResult{}, err
 	}
 
-	// Drive requires the declared size so it can reject an over- or under-sized
-	// upload before any bytes are committed.
+	// Only name, parents, and mimeType are writable on a Drive file at create time.
+	//
+	// `size` is deliberately NOT here. It looks like the way to declare a length, and
+	// the old comment claimed Drive required it, but `size` is a computed field on the
+	// file resource: sending it makes every initiation fail with
+	//   403 fieldNotWritable "The resource body includes fields which are not directly writable"
+	// The declared length goes in the X-Upload-Content-Length header below, which is
+	// how Drive is actually told how much to expect. This cost a full live round trip
+	// to find, because the mocked tests assert on our own request rather than Drive's
+	// opinion of it.
 	metadata := map[string]any{
 		"name":     req.FileName,
 		"parents":  []string{connection.RootFolderID},
 		"mimeType": req.MimeType,
-	}
-	if req.SizeBytes > 0 {
-		metadata["size"] = req.SizeBytes
 	}
 	body, err := json.Marshal(metadata)
 	if err != nil {

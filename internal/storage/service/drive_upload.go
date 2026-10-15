@@ -171,6 +171,9 @@ func (s *UploadService) CompleteDriveUpload(
 			"Internal error", "the upload was stored but its state could not be recorded")
 	}
 
+	s.deps.Metrics.RecordUploadFinished(string(model.ProviderGoogleDrive), "ready")
+	s.deps.Metrics.RecordBytesStored(string(model.ProviderGoogleDrive), verified.SizeBytes)
+
 	ready, err := s.deps.Objects.Get(ctx, scope, object.ID)
 	if err != nil {
 		return CompleteUploadResult{}, apperr.NotFound("no such object for this account")

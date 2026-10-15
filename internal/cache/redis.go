@@ -97,3 +97,15 @@ func (r *Redis) Ping(ctx context.Context) error {
 	}
 	return nil
 }
+
+// Client exposes the underlying Redis client.
+//
+// It exists so another component can use the same connection rather than opening a
+// second one. Sessions use it: a service with a pool for its cache and a separate pool
+// for sessions is two pools to size, monitor, and eventually leak.
+func (r *Redis) Client(context.Context) (redis.UniversalClient, error) {
+	if r == nil || r.client == nil {
+		return nil, errors.New("cache: this redis backend has no client")
+	}
+	return r.client, nil
+}

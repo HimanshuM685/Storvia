@@ -70,17 +70,75 @@ Early. The foundations are built and tested; the file transfer paths are not fin
 | Routing policy engine | Complete, table-driven tests |
 | Error handling, logging, caching, configuration | Complete, tested |
 | Metadata store with enforced single-location invariant | Complete, tested on SQLite |
-| Google OAuth (consent, token refresh, revocation) | Complete, tested against stubs |
-| Development admin panel | Complete locally; live Google callback not yet verified |
-| S3-compatible adapter | Complete, **never run against a real bucket** |
-| HTTP API surface | Complete; transfer endpoints return `provider_not_configured` |
+| Google OAuth (consent, token refresh, revocation) | Complete; **verified against a live Google account** |
+| Development admin panel | Complete; live OAuth round trip verified |
+| S3-compatible adapter | Complete, **verified against a live Cloudflare R2 bucket** |
+| HTTP API surface | Complete |
 | Go and TypeScript SDKs | Complete, tested |
-| Drive resumable upload / download / delete | **Not implemented** |
-| Reconciliation and job workers | **Not implemented** |
+| Drive resumable upload / download / delete | Complete, **verified against a real Drive account** |
+| Reconciliation | Implemented; Drive's outcome is honestly `unknown` by design |
+| Job workers, leases, orphan sweep | Implemented; a worker was observed claiming and completing a real job |
+| Metrics (`/metrics`, Prometheus) | Implemented; 12 families served by the running binary |
+| Drive change-log poller | Implemented; cursor advancing against a live account |
+| Testing console at `/console` | Implemented; backend verified against real R2, **the page has not been clicked in a browser** |
+| Forced-fallback operator switch | Implemented; verified with a real R2 upload while Drive was healthy |
+| Redis-backed session store | Implemented, **never run against a real Redis** |
 
-No code path has been exercised against a live Google account, a real S3 or R2
-bucket, or PostgreSQL. See [`CHANGELOG.md`](CHANGELOG.md) for exactly what is missing
-and [`docs/implementation-plan.md`](docs/implementation-plan.md) for milestone status.
+### What has actually been verified
+
+This distinction matters more than the feature list, so it is stated plainly:
+
+- **Verified live against a real provider:** the R2 fallback round trip (upload planned,
+  bytes transferred, verified with `HeadObject`, read back, deleted), Google OAuth
+  consent and token refresh, Drive folder creation, the Drive change-log cursor, and the
+  background worker's claim-and-complete cycle.
+- **Verified against a real Drive account:** an upload lands in the `Storvia/` folder, the
+  bytes read back identical, and the delete works — and with Drive forced unavailable the
+  same upload routes to R2 instead. Both directions are covered by `make test-live-drive`.
+- **Verified against real R2 through the console:** forcing the fallback uploads to R2
+  even while Drive is healthy, the bytes come back identical, and the routing decision is
+  visible in the reported state.
+- **Never run at all:** the PostgreSQL migrations (all testing is SQLite), and the Redis
+  session store (only a failing stub).
+
+See [`CHANGELOG.md`](CHANGELOG.md) for exactly what is missing and
+[`docs/implementation-plan.md`](docs/implementation-plan.md) for milestone status.
+
+---
+
+## The testing console
+
+`/console` is the operator surface. It replaces an earlier `/admin` panel that could show
+a connection status and nothing else — it could not perform an upload, so it could not
+answer the question it existed to answer.
+
+```bash
+./scripts/dev.sh start          # starts the API and opens http://127.0.0.1:8080/console
+```
+
+Sign in with the Google account whose Drive you want to use. You stay signed in until you
+press **Sign out**; the console's session lasts 30 days and is not tied to the browser
+process.
+
+What it does:
+
+- **Upload a file** and see where it actually landed — the provider, the provider-side
+  reference, the bytes transferred, and the elapsed time. This runs the whole client
+  sequence (create, transfer, verify, commit), including the resumable `PUT` to Google
+  that an SDK performs. With Drive connected, files go to Drive.
+- **Download and delete** any stored object, so an upload can be verified rather than
+  assumed.
+- **See the Drive connection**, create the `Storvia/` folder, or disconnect.
+- **Force the fallback provider** — three states: force it, prefer Drive, or follow
+  `fallback.force` from `config.json`.
+- **Simulate a Drive outage.** Off by default, so uploads use the real Drive path.
+
+Google Drive is the upload default. Uploads only go elsewhere when Drive is unavailable
+*and* you have accepted the outage-fallback disclosure — an operator switch cannot write
+a file outside Drive without that consent, and cannot move bytes that may already have
+reached Drive.
+
+The console has no build step and no external assets.
 
 ---
 
@@ -350,7 +408,16 @@ so a client needs exactly one error parser.
 ```text
 GET    /healthz
 GET    /readyz
-GET    /metrics
+GET    /metrics            Prometheus exposition
+
+GET    /console                        Testing console (Google sign-in required)
+GET    /console/api/state              Everything the console shows
+POST   /console/api/upload             Upload a file end to end
+POST   /console/api/routing            Force or unforce the fallback provider
+POST   /console/api/faults             Simulate a Drive outage
+POST   /console/api/consent            Accept or withdraw the fallback disclosure
+GET    /console/api/objects/{id}/content
+DELETE /console/api/objects/{id}
 
 GET    /v1/storage/status
 GET    /v1/storage/connections/google-drive

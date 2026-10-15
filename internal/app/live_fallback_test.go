@@ -145,9 +145,10 @@ func TestLiveFallbackDriveOutageRoutesUploadToR2(t *testing.T) {
 	if !cfg.Fallback.Enabled {
 		t.Skip("fallback is not enabled in the development configuration")
 	}
-	if !cfg.AdminPanel.SimulateDriveOutage {
-		t.Skip("admin_panel.simulate_drive_outage is not armed, so Drive would not be forced down")
-	}
+	// This test routes to the fallback the way an operator would during an incident:
+	// by switching routing, not by making Drive lie. Fault injection is left off by
+	// default now that the real Drive path is the default to test, and a test that
+	// only runs when someone has armed a fault is a test that silently stops running.
 	cfg.Database.SQLitePath = "file::memory:"
 
 	built, err := Build(context.Background(), Options{
@@ -160,10 +161,10 @@ func TestLiveFallbackDriveOutageRoutesUploadToR2(t *testing.T) {
 	defer built.Store.Close()
 	defer built.Cache.Close()
 
-	if !built.DriveFaultsEnabled {
-		t.Fatal("fault injection is not enabled, so Drive would have been reachable and " +
-			"this test would prove nothing about the fallback")
-	}
+	// Force the fallback for the duration of the test, and put it back afterwards so
+	// one test cannot leave the process routing somewhere surprising.
+	built.RoutingSwitch.SetForced(boolPtr(true))
+	t.Cleanup(func() { built.RoutingSwitch.SetForced(nil) })
 
 	ctx := context.Background()
 	scope := persistence.Scope{TenantID: "tenant_dev_admin", UserID: "user_dev_admin"}
@@ -339,3 +340,6 @@ func seedTenant(t *testing.T, store *persistence.Store, tenantID string) {
 		t.Fatalf("seed tenant %s: %v", tenantID, err)
 	}
 }
+
+// boolPtr is a helper for the tri-state routing override.
+func boolPtr(v bool) *bool { return &v }

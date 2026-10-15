@@ -10,6 +10,7 @@ import (
 	"github.com/shovan04/storvia/internal/apperr"
 	"github.com/shovan04/storvia/internal/cache"
 	"github.com/shovan04/storvia/internal/config"
+	"github.com/shovan04/storvia/internal/metrics"
 	"github.com/shovan04/storvia/internal/storage/service"
 )
 
@@ -265,6 +266,13 @@ type HealthHandler struct {
 	Ready func(ctx context.Context) error
 
 	cacheBackend cache.Cache
+	metrics      *metrics.Storvia
+}
+
+// WithMetrics attaches the metric set served at /metrics.
+func (h *HealthHandler) WithMetrics(m *metrics.Storvia) *HealthHandler {
+	h.metrics = m
+	return h
 }
 
 // NewHealthHandler builds the handler.
@@ -298,8 +306,14 @@ func (h *HealthHandler) Readyz(w http.ResponseWriter, r *http.Request) {
 // client is a decision about operational ownership, not a prerequisite for the
 // routing policy to be correct.
 func (h *HealthHandler) Metrics(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	// The exposition format is a contract with the scraper. Content type and status
+	// are part of it; a 200 with no body is worse than a 503, because it looks like a
+	// healthy service with nothing to say.
+	if h.metrics == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", metrics.ContentType())
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("# storvia metrics\n"))
-	_, _ = w.Write([]byte("storvia_build_info 1\n"))
+	_, _ = io.WriteString(w, h.metrics.Gather())
 }

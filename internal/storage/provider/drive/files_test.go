@@ -692,3 +692,164 @@ func TestFolderWorkToleratesAMissingRootFolderID(t *testing.T) {
 		t.Errorf("folder = %q, want folder-1", state.FolderID)
 	}
 }
+
+// TestStartPageTokenIsFetchedWhenNoCursorExists is the bug this guards.
+//
+// Drive requires pageToken on every changes.list call, including the first. Sending
+// the list without one returns 400 "Required parameter: pageToken", so a first poll
+// would fail forever and the change log would never advance.
+func TestStartPageTokenIsFetchedWhenNoCursorExists(t *testing.T) {
+	var sawStartRequest bool
+	client, _ := newFileTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/startPageToken"):
+			sawStartRequest = true
+			_, _ = w.Write([]byte(`{"startPageToken":"start-1"}`))
+		case r.URL.Path == "/drive/v3/changes":
+			if got := r.URL.Query().Get("pageToken"); got != "start-1" {
+				t.Errorf("pageToken = %q, want the start token just minted", got)
+			}
+			_, _ = w.Write([]byte(`{"newStartPageToken":"next-1","changes":[]}`))
+		default:
+			t.Errorf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+
+	page, err := client.ListChanges(context.Background(), "dc-1", "", 10)
+	if err != nil {
+		t.Fatalf("ListChanges: %v", err)
+	}
+	if !sawStartRequest {
+		t.Error("no start page token was requested")
+	}
+	if page.NewestCursor != "next-1" {
+		t.Errorf("newest cursor = %q, want next-1", page.NewestCursor)
+	}
+}
+
+// TestListChangesUsesTheStoredCursor checks the incremental path: once a cursor is
+// stored it is sent rather than a fresh start token.
+func TestListChangesUsesTheStoredCursor(t *testing.T) {
+	client, resolver := newFileTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/startPageToken") {
+			t.Error("a start token was minted even though a cursor was stored")
+			return
+		}
+		if got := r.URL.Query().Get("pageToken"); got != "stored-1" {
+			t.Errorf("pageToken = %q, want the stored cursor", got)
+		}
+		_, _ = w.Write([]byte(`{"changes":[{"fileId":"f1","removed":true}]}`))
+	}))
+	cursor := "stored-1"
+	resolver.connection.ChangesCursor = &cursor
+
+	page, err := client.ListChanges(context.Background(), "dc-1", "stored-1", 10)
+	if err != nil {
+		t.Fatalf("ListChanges: %v", err)
+	}
+	if len(page.Changes) != 1 || page.Changes[0].FileID != "f1" || !page.Changes[0].Removed {
+		t.Errorf("changes = %+v, want one removal for f1", page.Changes)
+	}
+}
+
+// TestExpiredPageTokenErrorKeepsItsBody guards a bug in the diagnostic itself:
+// isExpiredPageToken reads the response body, and anything that classified the error
+// afterwards saw an empty body, so Google's actual message was lost.
+func TestExpiredPageTokenErrorKeepsItsBody(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"Invalid Value: pageToken"}}`)),
+	}
+
+	if !isExpiredPageToken(resp) {
+		t.Fatal("a stale page token must be recognised")
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "pageToken") {
+		t.Errorf("the body was consumed and not restored: %q", body)
+	}
+}
+
+// TestInitiateSendsOnlyWritableFields is the regression test for a real 403.
+//
+// Drive rejected every resumable initiation with
+//
+//	403 fieldNotWritable "The resource body includes fields which are not directly writable"
+//
+// because the create metadata carried `size`. `size` is a computed field on a Drive
+// file: it is returned by the API and cannot be set. The declared length belongs in
+// the X-Upload-Content-Length header.
+//
+// This went undetected because every other test asserts on what Storvia sent rather
+// than on what Drive accepts. Encoding the writable-field list here means the next
+// person to add a convenient field trips a test instead of a live account.
+func TestInitiateSendsOnlyWritableFields(t *testing.T) {
+	var metadata map[string]any
+
+	client, _ := newFileTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/upload/drive/v3/files" {
+			_ = json.NewDecoder(r.Body).Decode(&metadata)
+			w.Header().Set("Location", "https://www.googleapis.com/upload/session/xyz")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+	}))
+
+	_, err := client.InitiateUpload(context.Background(), testScope(), InitiateUploadRequest{
+		FileName:  "notes.txt",
+		MimeType:  "text/plain",
+		SizeBytes: 4096,
+	})
+	if err != nil {
+		t.Fatalf("InitiateUpload: %v", err)
+	}
+
+	// Drive rejects a create that carries any of these. Each was at some point a
+	// plausible-looking thing to send.
+	for _, notWritable := range []string{"size", "id", "createdTime", "modifiedTime",
+		"md5Checksum", "webViewLink", "owners", "quotaBytesUsed", "version"} {
+		if _, present := metadata[notWritable]; present {
+			t.Errorf("the create metadata carries %q, which drive will refuse with "+
+				"fieldNotWritable; the length belongs in X-Upload-Content-Length",
+				notWritable)
+		}
+	}
+
+	for _, required := range []string{"name", "parents", "mimeType"} {
+		if _, present := metadata[required]; !present {
+			t.Errorf("the create metadata is missing %q", required)
+		}
+	}
+}
+
+// TestInitiateDeclaresLengthInTheHeader. The length is still communicated -- just not
+// as a body field -- so this pins where it went rather than only what left.
+func TestInitiateDeclaresLengthInTheHeader(t *testing.T) {
+	var declared string
+
+	client, _ := newFileTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/upload/drive/v3/files" {
+			declared = r.Header.Get("X-Upload-Content-Length")
+			w.Header().Set("Location", "https://www.googleapis.com/upload/session/xyz")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+	}))
+
+	if _, err := client.InitiateUpload(context.Background(), testScope(), InitiateUploadRequest{
+		FileName: "notes.txt", MimeType: "text/plain", SizeBytes: 4096,
+	}); err != nil {
+		t.Fatalf("InitiateUpload: %v", err)
+	}
+
+	if declared != "4096" {
+		t.Errorf("X-Upload-Content-Length = %q, want 4096; drive must be told the "+
+			"expected length by header, since it cannot be set on the resource",
+			declared)
+	}
+}

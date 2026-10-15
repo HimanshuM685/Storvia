@@ -178,6 +178,14 @@ type Gates struct {
 	FallbackConfigured bool
 	// FallbackBudgetRemaining is false once the fallback attempt budget is spent.
 	FallbackBudgetRemaining bool
+	// OperatorForcedFallback is true when an operator has deliberately switched
+	// routing away from Drive, regardless of whether Drive is healthy.
+	//
+	// This is not a fault. It is a decision: "send everything to the fallback until I
+	// turn this off." It exists because during a Drive incident the useful questions
+	// are "does the fallback work at all?" and "can we keep serving users?", and
+	// neither can be answered while routing still prefers Drive.
+	OperatorForcedFallback bool
 }
 
 // RoutingDecision is the result of a routing evaluation.
@@ -197,6 +205,7 @@ type RoutingDecision struct {
 // Decision reason codes. They are persisted, so changing a value is a schema-level
 // decision, not a refactor.
 const (
+	ReasonForceFallback        = "drive_bypassed_by_operator"
 	ReasonDriveAvailable       = "drive_available"
 	ReasonPreflightSucceeded   = "drive_preflight_succeeded"
 	ReasonUnavailablePreflight = "drive_unavailable_preflight"
@@ -232,6 +241,11 @@ func Evaluate(req RoutingRequest) RoutingDecision {
 
 	// 2. A mutation that may already have been sent closes the door on a second
 	//    provider. This is the invariant that prevents duplicate files.
+	//
+	//    It is checked before the operator override on purpose. The override changes
+	//    which provider a *new* upload prefers; it cannot reach back and relocate
+	//    bytes that may already be sitting in Drive, and pretending otherwise is
+	//    exactly how a duplicate file gets created.
 	if req.MutationMayHaveStarted {
 		if req.PreflightError == nil && !req.CircuitOpen {
 			return decision(DecisionUseDrive, ReasonPreflightSucceeded,
@@ -242,7 +256,36 @@ func Evaluate(req RoutingRequest) RoutingDecision {
 			false)
 	}
 
-	// 3. No usable connection is a stop, not a routing input. Without a connected
+	// 3. An operator's explicit routing decision outranks a healthy Drive.
+	//
+	//    It sits after the mutation check and the hard stops, and before the
+	//    preflight, because during an incident the useful questions are "does the
+	//    fallback work at all?" and "can we keep serving users?" -- and neither can
+	//    be answered while routing still prefers Drive.
+	//
+	//    It does *not* remove the obligation to have consent before writing a
+	//    tenant's file somewhere else. An override changes which provider wins; it
+	//    does not manufacture agreement.
+	if req.Gates.OperatorForcedFallback {
+		if !req.Gates.FallbackConfigured {
+			return reject(ReasonNoFallbackConfigured,
+				"fallback routing is forced but no enabled fallback backend is configured")
+		}
+		if !req.Gates.FallbackConsent {
+			return reject(ReasonNoFallbackConsent,
+				"fallback routing is forced but this account has not accepted the outage-fallback disclosure")
+		}
+		if !req.Gates.FallbackBudgetRemaining {
+			return reject(ReasonFallbackBudgetSpent, "the fallback attempt budget is spent")
+		}
+		// The fallback stays eligible for a later failure on this same upload: the
+		// override is about which provider to prefer, not about closing the door
+		// once the upload is under way.
+		return decision(DecisionUseFallback, ReasonForceFallback,
+			"fallback routing forced by operator; Drive is bypassed", true)
+	}
+
+	// 4. No usable connection is a stop, not a routing input. Without a connected
 	//    Drive account there is nothing to preflight and nothing to fall back
 	//    from: the user must connect first.
 	if !req.Gates.ConnectionUsable {
@@ -250,13 +293,13 @@ func Evaluate(req RoutingRequest) RoutingDecision {
 			"no usable google drive connection; the user must connect or reconnect", false)
 	}
 
-	// 4. Success path.
+	// 5. Success path.
 	if req.PreflightError == nil {
 		return decision(DecisionUseDrive, ReasonPreflightSucceeded,
 			"drive preflight succeeded", true)
 	}
 
-	// 5. Classify the preflight failure.
+	// 6. Classify the preflight failure.
 	class := req.PreflightError.Class
 
 	switch class {

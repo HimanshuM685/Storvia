@@ -719,3 +719,136 @@ func TestReadyHasNoTransitionBackToUploading(t *testing.T) {
 		}
 	}
 }
+
+// TestOperatorForceFallbackBeatsHealthyDrive is the point of the switch: an operator
+// must be able to send everything to the fallback while Drive is perfectly healthy,
+// because during an incident "does the fallback work?" is unanswerable otherwise.
+func TestOperatorForceFallbackBeatsHealthyDrive(t *testing.T) {
+	got := Evaluate(RoutingRequest{
+		Gates: gatesWith(func(g *Gates) { g.OperatorForcedFallback = true }),
+		// No preflight error at all: Drive answered fine.
+	})
+	if got.Decision != DecisionUseFallback {
+		t.Fatalf("decision = %q, want use_fallback", got.Decision)
+	}
+	if got.Reason != ReasonForceFallback {
+		t.Errorf("reason = %q, want %q", got.Reason, ReasonForceFallback)
+	}
+	if got.Provider != "s3_compatible" {
+		t.Errorf("provider = %q, want s3_compatible", got.Provider)
+	}
+}
+
+// TestOperatorForceFallbackStillRequiresConsent is the important limit. An operator
+// override changes which provider Drive's health chooses; it does not remove the
+// obligation to have consent before writing a tenant's file somewhere else.
+func TestOperatorForceFallbackStillRequiresConsent(t *testing.T) {
+	got := Evaluate(RoutingRequest{
+		Gates: gatesWith(func(g *Gates) {
+			g.OperatorForcedFallback = true
+			g.FallbackConsent = false
+		}),
+	})
+	if got.Decision != DecisionReject {
+		t.Fatalf("decision = %q, want reject", got.Decision)
+	}
+	if got.Reason != ReasonNoFallbackConsent {
+		t.Errorf("reason = %q, want %q", got.Reason, ReasonNoFallbackConsent)
+	}
+}
+
+// TestOperatorForceFallbackWithNoBackendFailsLoudly. Routing to a fallback that does
+// not exist would otherwise surface as a confusing provider error much later.
+func TestOperatorForceFallbackWithNoBackendFailsLoudly(t *testing.T) {
+	got := Evaluate(RoutingRequest{
+		Gates: gatesWith(func(g *Gates) {
+			g.OperatorForcedFallback = true
+			g.FallbackConfigured = false
+		}),
+	})
+	if got.Decision != DecisionReject || got.Reason != ReasonNoFallbackConfigured {
+		t.Errorf("got %q/%q, want reject/%q", got.Decision, got.Reason, ReasonNoFallbackConfigured)
+	}
+}
+
+// TestOperatorForceFallbackDoesNotOverrideInvalidOrUnauthorized. The override is a
+// routing preference, not a way to push an invalid or unauthorized request through.
+func TestOperatorForceFallbackDoesNotOverrideInvalidOrUnauthorized(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Gates)
+		reason string
+	}{
+		{"invalid request", func(g *Gates) {
+			g.OperatorForcedFallback = true
+			g.RequestValid = false
+		}, ReasonInvalidRequest},
+		{"unauthorized", func(g *Gates) {
+			g.OperatorForcedFallback = true
+			g.Authorized = false
+		}, ReasonNotAuthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Evaluate(RoutingRequest{Gates: gatesWith(tc.mutate)})
+			if got.Decision != DecisionReject || got.Reason != tc.reason {
+				t.Errorf("got %q/%q, want reject/%q", got.Decision, got.Reason, tc.reason)
+			}
+		})
+	}
+}
+
+// TestOperatorForceFallbackLeavesFallbackEligible. The override is about which provider
+// to prefer for a *new* upload. If the fallback then fails mid-flight, retrying it is
+// still permitted, because closing the door would strand the upload.
+func TestOperatorForceFallbackLeavesFallbackEligible(t *testing.T) {
+	got := Evaluate(RoutingRequest{
+		Gates: gatesWith(func(g *Gates) { g.OperatorForcedFallback = true }),
+	})
+	if !got.EligibleForFallback {
+		t.Error("forcing fallback must not close the fallback door for a later failure")
+	}
+}
+
+// TestForceFallbackCannotRelocateAnInFlightMutation is the invariant that matters
+// most. Even with the override on, an upload whose mutation may have started stays
+// pinned to Drive: the override chooses a provider for a *new* upload and cannot
+// reach back and relocate bytes that may already be sitting in Drive.
+//
+// Note the assertion is on the decision, not on EligibleForFallback. The policy
+// reports eligibility=true there on purpose -- a preflight succeeded, so fallback
+// would be permissible for some future attempt. What must not happen is that this
+// upload is routed to the fallback.
+func TestForceFallbackCannotRelocateAnInFlightMutation(t *testing.T) {
+	got := Evaluate(RoutingRequest{
+		MutationMayHaveStarted: true,
+		Gates:                  gatesWith(func(g *Gates) { g.OperatorForcedFallback = true }),
+	})
+	if got.Decision != DecisionUseDrive {
+		t.Fatalf("decision = %q (%s), want use_drive", got.Decision, got.Reason)
+	}
+	if got.Reason != ReasonPreflightSucceeded {
+		t.Errorf("reason = %q, want %q", got.Reason, ReasonPreflightSucceeded)
+	}
+}
+
+// TestForceFallbackWithFailingPreflightStaysPinned is the same invariant when the
+// preflight fails, which is the case that would otherwise look fallback-eligible.
+func TestForceFallbackWithFailingPreflightStaysPinned(t *testing.T) {
+	got := Evaluate(RoutingRequest{
+		MutationMayHaveStarted: true,
+		PreflightError: &ProviderError{
+			Provider: "google_drive", Operation: "Availability", Class: ClassUnavailable,
+		},
+		Gates: gatesWith(func(g *Gates) { g.OperatorForcedFallback = true }),
+	})
+	if got.Decision != DecisionUseDrive {
+		t.Fatalf("decision = %q (%s), want use_drive: an in-flight mutation must not be relocated",
+			got.Decision, got.Reason)
+	}
+	if got.Reason != ReasonMutationInFlight {
+		t.Errorf("reason = %q, want %q", got.Reason, ReasonMutationInFlight)
+	}
+	if got.EligibleForFallback {
+		t.Error("fallback must be ineligible while a mutation is unresolved")
+	}
+}

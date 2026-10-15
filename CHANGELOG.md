@@ -1712,3 +1712,498 @@ remain in `.env`.
 2. Start the API and complete `/admin` against a controlled Google test account.
 3. Record the observed callback, connection status, and any provider errors.
 4. Implement the Drive `Storvia/` folder creation and resumable transfer verbs.
+
+---
+
+## 2026-10-15 — Implement the remaining unimplemented features
+
+The owner asked for everything still unimplemented to be built. There were five. Each is
+below with what it does, why it is shaped that way, what was actually verified, and what
+was not.
+
+### Metrics
+
+`/metrics` returned two hardcoded lines and no counters. It now serves a real
+Prometheus-compatible exposition.
+
+- `internal/metrics/` — a small registry: labelled counters, gauges, histograms, and a
+  build-info constant. Prometheus text format 0.0.4, so an existing scraper reads it
+  with no configuration.
+- Instrumented at the decisions that matter: upload planned (`provider`), upload finished
+  (`provider`, `outcome`), outcome unknown, bytes committed, fallback routing and why,
+  provider calls by failure class, job runs, orphans found, consent state, upload
+  duration histogram.
+- `HealthHandler.Metrics` returns 503 when no registry is wired, rather than a 200 with an
+  empty body. A green response with nothing in it reads as "healthy, nothing to say",
+  which is worse than an honest failure.
+
+Design decisions worth stating:
+
+- **Label sets are rendered from sorted keys.** Go map iteration order is randomised, so
+  building a series key by ranging over the map would mint a new series on roughly half of
+  all calls and a counter would look like it reset at random. `TestLabelKeyIsOrderIndependent`
+  pins this.
+- **`Gather` is deterministic** — families in registration order, label sets sorted. A
+  scrape that reorders between calls makes diffs useless.
+- **Histogram buckets are cumulative**, which is what a scraper requires.
+- **Every recorder tolerates a nil receiver**, and `*Counter`/`*Gauge`/`*Histogram` do
+  too. Instrumentation that can panic takes down the request it measures. This was not
+  hypothetical: wiring metrics broke two existing tests, because nil-safety had been
+  written on `*Counter` and not on `*Storvia`.
+
+### Job workers and leases
+
+The `storage_jobs` table had existed since the first migration and nothing claimed from
+it. A failed delete left its object stuck in `deleting` forever, and every client retry
+read as a permanent conflict.
+
+- `internal/persistence/jobs.go` — `Enqueue`, `Claim`, `Renew`, `Finish`, `Fail`, `Pending`.
+- `internal/app/worker.go` — the worker loop, lease renewal on a timer, and dispatch for
+  `reconcile`, `delete`, and `cleanup`.
+- Claiming is a **lease, not a delete**. A crashed worker's jobs become claimable again
+  when the lease expires rather than being lost. The `UPDATE` is conditional on the row
+  still being claimable, so two workers racing for the same row cannot both win.
+- `Finish`/`Renew` require ownership. A worker that lost its lease must stop rather than
+  act on an object another worker may already be acting on — that is the double-delete the
+  lease exists to prevent. `ErrJobLeaseLost`.
+- `Fail` retries with backoff and parks the job as `failed` after `max_attempts`. A job
+  that always fails is a problem for a person to look at, not something to spin on.
+- `Enqueue` is idempotent per `(attempt_id, kind)` via the existing unique index, so a
+  retrying client cannot produce two jobs that both delete the same object.
+- Config added: `worker.{enabled,owner,lease,poll,max_attempts}` in JSON. Ordinary
+  settings, no secret — a lease owner is an identity string, not a credential.
+- `validateWorker` rejects `poll >= lease`: that combination means a worker can hold a job,
+  go away for a poll cycle, and have its work taken while it is still running.
+- A failed delete now enqueues a retry (`ObjectService.scheduleRetry`). The object stays
+  in `deleting` on purpose: the job is pinned to that object and that provider, so a retry
+  cannot move the deletion somewhere else.
+- Worker and poller are stopped and joined on shutdown, including the failure path. A
+  worker left running would keep claiming jobs from a process on its way out.
+
+### Orphan sweep
+
+`ListStorviaPrefix` and `OwnsKey` existed in the S3-compatible client and nothing called
+them.
+
+- `internal/app/orphans.go` walks each backend's Storvia prefix, paginated, and reports
+  keys with no `storage_objects` row.
+- **It only reports. It never deletes.** Listing is cleanup *evidence*, never permission to
+  delete: Storvia keeps no second copy, and a key it does not recognise may be a file whose
+  database commit is still in flight. Acting on that would be the worst thing this service
+  could do. `orphanGrace` (one hour) is documented for when that decision is made.
+- Keys outside the Storvia prefix are skipped without being counted or touched.
+- One unreachable bucket does not stop the sweep of the others.
+- The page cap is a safety bound, not a correctness requirement; a truncated sweep is
+  reported so it is never mistaken for a clean one.
+- Added `ObjectRepository.ExistsByProviderKey`.
+
+### Drive change-log poller
+
+The `changes_cursor` column existed and nothing advanced it.
+
+- `internal/storage/provider/drive/changes.go` — `ListChanges`, `StartPageToken`,
+  `ChangeCursor`, `AdvanceChangesCursor`; `persistence.ConnectionByID` and
+  `ConnectedConnectionIDs`.
+- `internal/app/changes_poller.go` — the poller loop and `PollOnce`.
+- It is a poller rather than a webhook subscriber on purpose. Push notifications are only
+  a hint that something changed: they can be delivered more than once, missed while a
+  deployment is down, and arrive for accounts Storvia no longer cares about. The change
+  log is the source of truth.
+- **The cursor is advanced after the page is processed, never before.** Advancing first
+  and then failing skips changes permanently; advancing second re-reads a page on a crash,
+  and every change here is idempotent. Re-reading is the safe direction.
+- Only `connected` connections are polled — a revoked grant has nothing to poll, and
+  calling Drive with a revoked token just produces errors that look like an outage.
+- One account failing never stops the others.
+
+### Redis-backed session store
+
+Production used `NewMemorySessions`, which is correct for one process and silently wrong
+for two: a token issued by one instance is invisible to the other, so every second request
+from a user fails, intermittently.
+
+- `internal/auth/sessions_redis.go` — selected whenever the deployment's cache is already
+  Redis, so no new configuration and no second connection pool.
+- **It does not fall back to memory when Redis is unreachable.** Falling back would start
+  working and quietly log users out at random as instances disagreed. It refuses to start.
+- `ErrSessionBackendUnavailable` is distinct from "session not found". Conflating them logs
+  everybody out the moment Redis blinks, which looks like an attack and is not.
+- TTL is session lifetime plus an hour. A key that expires before its token does logs the
+  user out while their cookie is still valid, which presents as random auth failures.
+- `RevokeSession` so a logout takes effect at once.
+- Readiness now checks the session backend. Without it a Redis outage leaves `/readyz`
+  green while every authenticated request fails and traffic keeps arriving.
+
+### Bugs found and fixed while implementing
+
+1. **`isExpiredPageToken` drained the response body and never restored it**, so
+   `normalizeStatus` classified the following error against an empty body. This is how a
+   real Google error message got replaced with `google returned 400` and no reason.
+   Fixed, and `TestExpiredPageTokenErrorKeepsItsBody` guards it.
+2. **`extractReason` never returned Google's `error.message`** — only `reason` or
+   `status`. The message is the actionable part ("Invalid value at 'changes'"). It now
+   prefers message over status.
+3. **`normalizeStatus` produced an unusable detail.** It now includes the parsed reason,
+   and falls back to a capped raw body when there is none. This runs unattended; an error
+   nobody can act on is worse than a slightly longer message.
+4. **`tenantIDPtr` was used for job fields**, which is not a tenant. Renamed to
+   `nullableString`, which is what it always was.
+5. **Three of my own new tests were wrong** — claiming into the past cannot expire a lease
+   that way, a retry was reset after the claim instead of before, and an `attempt_id` needs
+   a real parent row because of the foreign key. All three fixed in the test, not in the
+   production code; where the production behaviour was right, the test changed.
+6. **A `Redis.UniversalClient` stub implementing the whole interface** was replaced by
+   embedding it. Only three commands are overridden; anything else panics loudly rather
+   than silently returning a plausible zero.
+
+### The real bug the change poller found
+
+The first live poll failed with a 400 and an empty body. Chasing it:
+
+- My whitespace hypothesis was **wrong** — `first_whitespace_at: 6` is the space in
+  `"Bearer "`, which is required. Recorded because it cost time.
+- The empty body was my own `isExpiredPageToken` bug (fix 1 above), not Google's.
+- The actual cause: **`changes.list` requires `pageToken` on every call, including the
+  first.** With no stored cursor there was nothing to send, so the first poll would have
+  failed forever and the change log would never have advanced.
+  Fixed with `StartPageToken` (`changes/startPageToken`), so a first poll begins from
+  *now* rather than walking the entire history of an account that may have been using
+  Drive for years. `TestStartPageTokenIsFetchedWhenNoCursorExists` pins it.
+
+Verified against the real connected Google account: cursor stored, second and third poll
+cycles quiet, zero errors.
+
+### Commands actually run
+
+```
+make check          # fmt-check, vet, test                     — pass
+make check-all      # adds -race                               — pass
+make sdk-ts-test    # 22 pass, 0 fail
+make test-live      # real R2: TestLiveFallbackBackendIsUsable,
+                    #         TestLiveFallbackDriveOutageRoutesUploadToR2 — both PASS
+```
+
+Live system (`scripts/dev.sh restart --no-open`):
+
+```
+GET /admin   200
+GET /readyz  200
+GET /metrics content-type: text/plain; version=0.0.4; charset=utf-8
+```
+
+11 metric families exposed: `storvia_uploads_started_total`,
+`storvia_uploads_finished_total`, `storvia_uploads_outcome_unknown_total`,
+`storvia_bytes_stored_total`, `storvia_fallback_routings_total`,
+`storvia_provider_calls_total`, `storvia_job_runs_total`, `storvia_orphans_found_total`,
+`storvia_fallback_consent`, `storvia_objects_stored`,
+`storvia_upload_duration_seconds`, `storvia_build_info`.
+
+Worker, against a real enqueued job:
+
+```
+inserted job_live_test (cleanup, pending) directly into storage_jobs
+after one poll cycle: state=done, attempts=1, last_error=''
+log:  "job completed" kind=cleanup
+metrics: storvia_job_runs_total{kind="cleanup",outcome="ok"} 1
+```
+
+The cleanup job ran the orphan sweep against the real R2 bucket and found no orphans,
+which is the correct result — the live tests clean up after themselves.
+
+### Not done
+
+- **Drive upload/download/delete have still never run against Google.** The resumable path
+  is unblocked but unverified. Four consecutive defects lived in that code because no live
+  request had ever run; treat it the same way.
+- **Fault injection is still armed** (`simulate_drive_outage: true`), so uploads route to
+  R2 rather than Drive until the server is restarted with `--faults-off`.
+- **PostgreSQL migrations 0001 and 0002 have never been executed.** All testing is SQLite.
+- **The orphan sweep reports only.** No deletion, no grace-period enforcement, no operator
+  surface for acting on what it finds.
+- **The Redis session store has never run against a real Redis.** It is exercised only by
+  a stub that fails every command, which covers the error paths and not the round trip.
+- The change poller advances its cursor and counts changes; it does not yet act on them.
+  Nothing reconciles a drive-side deletion into a Storvia object.
+- `isExpiredPageToken` classifies an expired cursor as `ClassConfiguration`, which stops
+  the poll. There is no recovery path that resets the cursor and continues; a deployment
+  running long enough will eventually hit an expired token and stop polling that account
+  until someone intervenes.
+- No commit was created.
+
+### Next step, in order
+
+1. `scripts/dev.sh stop && scripts/dev.sh start --faults-off`, then drive a real upload,
+   download, and delete against the connected account. This is the same gap that hid four
+   defects before.
+2. Run the PostgreSQL migrations against a real instance.
+3. Stand up Redis and verify a session issued by one process resolves in another.
+4. Decide what the orphan sweep should *do* about what it finds.
+
+---
+
+## 2026-10-15 — The testing console, persistent sign-in, and forced fallback
+
+Requested by the owner as one change. Six parts: unblock the real Drive path, build a
+full testing console, make sign-in last across browser restarts, keep Drive as the
+upload default, remove the old admin panel, and add a forceful fallback switch.
+
+### The blocking issue is fixed
+
+`admin_panel.simulate_drive_outage` was `true` in `config/config.development.json`, so
+every upload was being routed to R2 and the Drive transfer path stayed cold. It is now
+`false`, and the fault toggle is a runtime control rather than something you edit a
+checked-in file to change.
+
+### The console replaces the admin panel
+
+The old `/admin` panel was a set of server-rendered form posts. It could show a
+connection status and nothing else — it could not perform an upload, so it could not
+answer the question it existed to answer. It is **deleted**: `admin_handlers.go`,
+`admin_dashboard.go`, and their tests. `GET /admin` now returns 404.
+
+The new console is at **`/console`**. It is a single document with no build step and no
+external assets, because a testing panel that needs a bundler stops working exactly when
+a toolchain breaks and someone needs it.
+
+- **Sign-in is the gate.** The document is served signed-out so there is something to
+  click; every value on the page comes from a session-gated API call, and every API
+  route independently rejects an unauthenticated request. A cookie for another tenant is
+  rejected with 403 even though its signature verifies.
+- **Upload, download, delete.** The panel runs the whole client sequence in one request
+  — create, transfer to the provider, verify, commit — and reports the provider, the
+  provider-side reference, the byte count, and the elapsed time. The Drive branch
+  performs the resumable `PUT` itself and parses the file id out of Google's response,
+  exactly as an SDK does; it is the same write, only the caller differs.
+- **Object listing, download, and delete**, so an upload can be verified rather than
+  assumed. Added `ObjectRepository.ListObjects` — the tenant scope is applied in the
+  query, not filtered afterwards, because a listing that read other tenants' rows and
+  discarded some has still read them.
+- **Connection state, folder creation, and disconnect** on one screen.
+
+### Sign-in now survives closing the browser
+
+The session cookie gets `MaxAge` alongside `Expires`, and the console uses its own
+lifetime (`auth.admin_session_ttl`, 720h) rather than the API's 12 hours. A cookie with
+only `Expires` is treated as a session cookie by some browsers, so the two are set
+together. `MaxAge` truncates to whole seconds — a sub-second remainder truncating to
+zero would produce a cookie that expires immediately.
+
+### Drive remains the upload default
+
+It already was, and it still is. What changed is that the console states it explicitly
+("Google Drive is the default…") and shows a blocked reason when uploads would be
+refused. Force is off by default in both config files.
+
+### Forced fallback
+
+`fallback.force` in config, plus a live switch in the console with three states: force
+the fallback, prefer Drive, or follow the configured default. The tri-state matters —
+"stop overriding me" cannot be expressed by a plain boolean, and it is the option an
+operator reaches for most.
+
+Two deliberate limits, both tested:
+
+- **Consent still applies.** An operator switching providers does not manufacture the
+  tenant's agreement to have files stored elsewhere. `TestLiveConsoleForcedFallbackStillNeedsConsent`
+  proves a forced upload without consent is refused.
+- **An in-flight mutation stays pinned.** The override chooses a provider for a *new*
+  upload; it cannot reach back and relocate bytes that may already be in Drive.
+
+Forcing also **skips the Drive preflight** rather than merely ignoring it. During an
+incident, a wasted round trip to a struggling provider is not free.
+
+Ordering inside `Evaluate` was wrong on the first attempt — the override was inserted
+before the `Authorized` and `MutationMayHaveStarted` checks, so it overrode both. Two of
+my own tests caught it.
+
+### Bugs found and fixed while building this
+
+1. **`Dependencies.Metrics` was never set.** Every upload counter had been recording into
+   a nil pointer since it was introduced, so the families stayed permanently empty on a
+   healthy `/metrics`. This is the third time a dependency has been declared and never
+   constructed, and the same lesson applies: unit tests cannot see wiring.
+2. **The S3 part capabilities carried no byte ranges.** No client — including both SDKs
+   — could know where to split a multipart upload, because the server chose the part size
+   and never said so. `PresignedPartInfo` now carries `start_byte`/`end_byte`. Without
+   this the multipart contract was unusable by anyone.
+3. **`StopBackground` could deadlock.** It waited for the worker and poller without
+   cancelling anything, so it only worked because the signal handler had cancelled the
+   context first. A clean stop from a test, a library caller, or an in-process restart
+   waited forever. Background work now gets its own cancellable context and `Stop`
+   cancels before it waits. This was found by a live test timing out in cleanup.
+4. **The console rejected every upload on validation.** It hardcoded the category `other`
+   and defaulted an absent part `Content-Type` to `application/octet-stream`, neither of
+   which the development allow-list permits — and Go's own form writer sends no part
+   content type. The panel now infers from the extension and the configured allow-list,
+   and picks a real category. The substitution is reported rather than silent.
+5. **The final multipart part went out unbounded and chunked.** `want < size-sent` left
+   the last part reading the raw reader, so it carried no `Content-Length`. A presigned
+   S3 URL is signed over the headers it was issued with, so that request stalls or fails
+   the signature — and a stall looks like an outage. The part-length guard also missed a
+   single-byte part, because it compared `EndByte > 0` instead of the two bounds.
+6. **`FaultInjection` held a static bool**, so no runtime toggle could reach it. It now
+   carries an `*FaultFlag`, and `SetFaultsEnabled` refuses when injection was never gated
+   on — a provider that can be told to lie about its health must not be reachable in
+   production.
+
+Three of my own new tests were wrong again (asserting on `EligibleForFallback` where the
+production decision was correct; expecting `evil drop` from `sanitizeFilename`; a nil
+issuer in the test helper). In each the production code was right and the expectation was
+not.
+
+### Verified
+
+```
+make check, make check-all, make sdk-ts-test (22 pass, 0 fail)   — pass
+make test-live                                                    — 4 pass, 0 fail
+```
+
+Live against real Cloudflare R2:
+
+- `TestLiveConsoleForcedFallbackUpload` — force the fallback, upload 4138 bytes,
+  assert the provider is `s3_compatible` **even though Drive was healthy**, read the
+  bytes back byte-identical, confirm the routing decision is visible in the state, and
+  delete. **PASS**
+- `TestLiveConsoleForcedFallbackStillNeedsConsent` — forced upload without consent is
+  refused. **PASS**
+- `TestLiveFallbackDriveOutageRoutesUploadToR2` — now switches routing rather than
+  injecting a fault, so it does not silently stop running. **PASS**
+
+Running system: `/console` 200, `/admin` 404, `/console/api/state` 401 signed out, zero
+injected faults.
+
+### Not done
+
+- **Drive upload/download/delete still have never run against Google.** The path is no
+  longer blocked by fault injection, but nothing has been uploaded through it. The
+  console is now the tool for doing that: sign in, pick a file, upload.
+- **The console has not been driven through a browser.** The backend is verified; the
+  page itself has only been fetched, not clicked.
+- The forced switch and the fault switch are in-memory. Neither survives a restart. That
+  is deliberate for fault injection; for the forced switch it means an operator who
+  forces the fallback during an incident has to re-apply it after a deploy. `fallback.force`
+  in config is the durable form.
+- **The fallback's forced path bypasses the Drive preflight entirely**, so there is no
+  per-request evidence that Drive was healthy when the switch was flipped. The console
+  shows the switch state, which is the intended reading.
+- PostgreSQL migrations and the Redis session store remain unproven.
+- No commit was created.
+
+### Next step, in order
+
+1. Open `/console`, sign in with Google, and upload a real file. This is the gap that has
+   hidden four consecutive defects, and the console now makes it a two-click exercise.
+2. Run the PostgreSQL migrations against a real instance.
+3. Stand up Redis and verify a session crosses a process boundary.
+
+---
+
+## 2026-10-15 — The Drive upload path, verified against real Google
+
+Requested as "fix the default upload to the user's gdrive, and only fall back when
+gdrive is unable". The routing already preferred Drive, so the honest way to answer was
+to prove it rather than argue it — and the first live run of the Drive path found a real
+defect that had been shipping the whole time.
+
+### The routing was already correct; the upload was not
+
+`TestLiveDefaultUploadGoesToDrive` connects the real account, uploads through the console,
+and asserts the provider is `google_drive`. It failed:
+
+```
+transfer failed: drive refused the upload with 403:
+  "The resource body includes fields which are not directly writable."   (reason: fieldNotWritable)
+```
+
+`InitiateUpload` was putting `size` into the create metadata. The comment above it said
+*"Drive requires the declared size so it can reject an over- or under-sized upload"*.
+That is wrong: **`size` is a computed field on a Drive file resource.** It is returned by
+the API and cannot be set. Every resumable initiation failed.
+
+The declared length was already being sent correctly, in `X-Upload-Content-Length` —
+three lines below. The metadata field was not merely redundant, it was fatal.
+
+Removed, with a comment explaining why it must not come back. Two regression tests:
+
+- `TestInitiateSendsOnlyWritableFields` — enumerates the fields Drive refuses
+  (`size`, `id`, `createdTime`, `md5Checksum`, `owners`, `version`, …) so the next person
+  to add a convenient field trips a test rather than a live account.
+- `TestInitiateDeclaresLengthInTheHeader` — pins *where* the length went, not only that
+  it left, so a later "fix" cannot quietly drop it.
+
+### Both directions verified against the real providers
+
+| Scenario | Result |
+|---|---|
+| Drive connected and healthy | `google_drive`, file created in `Storvia/`, bytes read back identical, deleted |
+| Drive unavailable (preflight forced to fail) | `s3_compatible`, stored at the R2 key, deleted |
+
+- `TestLiveDefaultUploadGoesToDrive` — file `1FjmhI6aCbris2eY2HRMwRjx2_-FKUhSW` created in
+  the real `Storvia/` folder, read back byte-identical, deleted. **PASS**
+- `TestLiveUnavailableDriveFallsBackToTheProvider` — **PASS**, routed to
+  `storvia/tenants/…/objects/upl_000038a0egnpy0000008etdkfyza07aatex9`.
+
+The second test deliberately uses a **real connected account** and makes the preflight
+fail the way an outage would, rather than switching routing. With no connection at all,
+routing refuses the upload instead of falling back — a different and much easier thing to
+get right, and one that would have passed a weaker test.
+
+### Two things about the test harness worth recording
+
+**The relative database path nearly made this a silent no-op.** `sqlite_path` is
+`file:./storvia.dev.db`, relative to the *process* working directory, and `go test` runs
+from the package directory. The first run reported "no google drive connection" and
+skipped — a green run proving nothing, because it had opened a different, empty database.
+`findRepoRoot` now resolves the path against the module root, and the test **fails** rather
+than skips when there is no connection, so a broken harness can never look like a pass.
+
+**The 403 was truncated twice before it was readable.** The console capped provider
+detail at 300 characters, which cut the message off mid-JSON, and the probe that followed
+printed only its first 90 characters. Both caps were raised; a diagnosis you cannot read
+is a diagnosis you have to guess at.
+
+### How the bug survived
+
+Every existing test asserted on what Storvia *sent*. A test that checks its own outgoing
+request cannot detect that the recipient rejects it. The whole suite was green, the
+`/console` backend was green, and the feature was broken against the only provider that
+matters.
+
+This is the fifth defect in the Drive path and the first found by exercising it rather
+than by reading it. The four before it (`/files/files`, `/drive/v3/files/about`, the
+token-endpoint content type, the missing `pageToken`) were all found the same way, and
+all four would have shipped.
+
+Added `make test-live-drive`, which runs the Drive tests. It is separate from
+`make test-live` on purpose: these create, read, and delete files in a real account,
+which is a different kind of risk from writing to a test bucket and should not be turned
+on by surprise.
+
+### Verified
+
+```
+make check, make check-all            — pass
+make sdk-ts-test                     — 22 pass, 0 fail
+make test-live                       — 2 pass
+make test-live-drive                 — 6 pass, 0 fail (real Drive + real R2)
+```
+
+`/console` 200, `/admin` 404, `/healthz` and `/readyz` 200, Drive connection `connected`.
+
+### Not done
+
+- The console's frontend is still unclicked. Every API route is driven by tests, but
+  nobody has looked at the page in a browser.
+- The two Drive tests require a signed-in console session in the development database and
+  **skip if there is none.** They are honest about that — they `t.Skip` rather than
+  pretend — but a skip is not a pass.
+- Only the small-file path is exercised: 3 KB and 4 KB. Chunked resumable uploads above
+  `drive_chunk_size_bytes` (8 MB) have still never run.
+- PostgreSQL migrations and the Redis session store remain unproven.
+- No commit was created.
+
+### Next step, in order
+
+1. Upload a file larger than 8 MB through `/console`, so the chunked resumable path runs.
+2. Open `/console` in a browser and confirm the page renders and signs in.
+3. Run the PostgreSQL migrations against a real instance.

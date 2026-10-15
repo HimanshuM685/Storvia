@@ -9,6 +9,7 @@ import (
 	"github.com/shovan04/storvia/internal/httpapi"
 	"github.com/shovan04/storvia/internal/persistence"
 	"github.com/shovan04/storvia/internal/storage/policy"
+	"github.com/shovan04/storvia/internal/storage/provider/drive"
 	"github.com/shovan04/storvia/internal/storage/provider/s3compat"
 	"github.com/shovan04/storvia/internal/storage/service"
 )
@@ -162,4 +163,54 @@ func (c consentAccepter) Accept(ctx context.Context, scope persistence.Scope) (b
 		return false, err
 	}
 	return view.Granted, nil
+}
+
+// consentController adapts the consent service to the console's port.
+//
+// The console reads the current state as often as it changes it, which the accept-only
+// port the old panel used could not express. Reading is deliberately a separate method:
+// "is it granted" and "grant it" have different failure modes, and collapsing them
+// means a read can silently accept.
+type consentController struct{ svc *service.ConsentService }
+
+func (c consentController) ConsentGranted(ctx context.Context, scope persistence.Scope) (bool, error) {
+	if c.svc == nil {
+		return false, errors.New("app: the consent service is not configured")
+	}
+	view, err := c.svc.Show(ctx, scope)
+	if err != nil {
+		return false, err
+	}
+	return view.Granted, nil
+}
+
+func (c consentController) GrantConsent(ctx context.Context, scope persistence.Scope) error {
+	if c.svc == nil {
+		return errors.New("app: the consent service is not configured")
+	}
+	_, err := c.svc.Accept(ctx, scope)
+	return err
+}
+
+func (c consentController) WithdrawConsent(ctx context.Context, scope persistence.Scope) error {
+	if c.svc == nil {
+		return errors.New("app: the consent service is not configured")
+	}
+	_, err := c.svc.Withdraw(ctx, scope)
+	return err
+}
+
+// faultToggle lets the console drive the drive client's fault injector.
+type faultToggle struct{ client *drive.Client }
+
+// Save applies the switch. A refusal means injection was never gated on, which the
+// console reports as a failed toggle rather than silently doing nothing.
+func (f faultToggle) Save(on bool) error {
+	if f.client == nil {
+		return errors.New("app: no drive client to arm fault injection on")
+	}
+	if !f.client.SetFaultsEnabled(on) {
+		return errors.New("app: fault injection is not available in this deployment")
+	}
+	return nil
 }

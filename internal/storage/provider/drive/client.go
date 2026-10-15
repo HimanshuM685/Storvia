@@ -153,6 +153,11 @@ type ConnectionResolver interface {
 	SaveConnection(ctx context.Context, connection Connection) error
 	// MarkStatus changes a connection's status.
 	MarkStatus(ctx context.Context, connectionID, status string) error
+	// ConnectionByID reads a connection when the tenant is already known, which is
+	// the shape background work has.
+	ConnectionByID(ctx context.Context, connectionID string) (Connection, error)
+	// SetChangesCursor advances how far the change log has been processed.
+	SetChangesCursor(ctx context.Context, connectionID, cursor string) error
 }
 
 // Connection is the stored Drive connection for a tenant.
@@ -164,6 +169,10 @@ type Connection struct {
 	RefreshToken string
 	RootFolderID string
 	Status       string
+	// ChangesCursor is how far the change log has been processed. It is empty until
+	// the first poll succeeds, which is what makes the first poll start from the
+	// newest change rather than from the beginning of time.
+	ChangesCursor *string
 }
 
 // Connection status values.
@@ -453,6 +462,22 @@ func (c *Client) normalizeStatus(operation string, resp *http.Response) error {
 	reason := extractReason(body)
 	class := policy.ClassifyGoogleError(resp.StatusCode, reason)
 
+	// When the structured reason is empty, the raw body is the only thing that says
+	// what went wrong. This runs unattended, so an error nobody can act on is worse
+	// than a slightly longer message. The body is provider text, capped, and never
+	// contains a credential.
+	detail := fmt.Sprintf("google returned %d during %s", resp.StatusCode, operation)
+	if reason == "" {
+		if raw := strings.TrimSpace(string(body)); raw != "" {
+			if len(raw) > 240 {
+				raw = raw[:240] + "..."
+			}
+			detail += ": " + raw
+		}
+	} else {
+		detail += ": " + reason
+	}
+
 	return &policy.ProviderError{
 		Provider:   c.Name(),
 		Operation:  operation,
@@ -460,7 +485,7 @@ func (c *Client) normalizeStatus(operation string, resp *http.Response) error {
 		StatusCode: resp.StatusCode,
 		Reason:     reason,
 		Retryable:  class == policy.ClassUnavailable || class == policy.ClassRateLimited,
-		SafeDetail: fmt.Sprintf("google returned %d during %s", resp.StatusCode, operation),
+		SafeDetail: detail,
 		Err:        fmt.Errorf("google drive: %s: status %d", operation, resp.StatusCode),
 	}
 }
@@ -481,6 +506,12 @@ func extractReason(body []byte) string {
 	}
 	if len(payload.Error.Errors) > 0 && payload.Error.Errors[0].Reason != "" {
 		return payload.Error.Errors[0].Reason
+	}
+	// The message is preferred over the status because it names the offending field.
+	// "google returned 400" is not actionable; "Invalid value at 'changes'
+	// (type.googleapis.com/...)" is, and this runs unattended.
+	if payload.Error.Message != "" {
+		return payload.Error.Message
 	}
 	return payload.Error.Status
 }

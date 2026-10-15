@@ -205,11 +205,21 @@ func constantTimeEqual(a, b string) bool {
 }
 
 // SetSessionCookie writes the session cookie with conservative attributes.
+//
+// MaxAge is set alongside Expires, not instead of it. Browsers honour both, but
+// MaxAge is the more widely and reliably implemented of the two, and a cookie that
+// some browsers treat as a session cookie disappears when the browser closes. The
+// operator expectation here is explicit -- stay signed in until signing out -- so the
+// cookie is given both.
 func (i *Issuer) SetSessionCookie(w http.ResponseWriter, token string, expires time.Time) {
 	http.SetCookie(w, &http.Cookie{
-		Name:     i.cookie,
-		Value:    token,
-		Path:     "/",
+		Name:  i.cookie,
+		Value: token,
+		Path:  "/",
+		// MaxAge is truncated to whole seconds because the header is an integer, and
+		// a sub-second remainder truncating to zero would produce a cookie that
+		// expires immediately.
+		MaxAge:   int(time.Until(expires).Seconds()),
 		Expires:  expires,
 		HttpOnly: true,
 		Secure:   i.secure,

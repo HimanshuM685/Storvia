@@ -20,6 +20,7 @@ import (
 	"github.com/shovan04/storvia/internal/apperr"
 	"github.com/shovan04/storvia/internal/config"
 	"github.com/shovan04/storvia/internal/idid"
+	"github.com/shovan04/storvia/internal/metrics"
 	"github.com/shovan04/storvia/internal/persistence"
 	"github.com/shovan04/storvia/internal/storage/model"
 	"github.com/shovan04/storvia/internal/storage/policy"
@@ -93,6 +94,17 @@ type Dependencies struct {
 	UploadLimits config.UploadsConfig
 	DriveCfg     config.DriveConfig
 	Fallback     config.FallbackConfig
+	// ForceFallback reports whether an operator has deliberately switched routing
+	// away from Drive. It is optional: nil means "follow the normal routing policy".
+	//
+	// It is a function rather than a bool so a runtime toggle in the admin panel takes
+	// effect on the next upload without a restart, and so the service does not need to
+	// know how the switch is stored.
+	ForceFallback func() bool
+	// Metrics is optional instrumentation. It is a pointer so the service does not
+	// require it, and every recorder tolerates nil, so a deployment that has not
+	// wired metrics loses observation rather than correctness.
+	Metrics *metrics.Storvia
 	// FallbackUploader plans and verifies uploads on the S3-compatible provider.
 	// It is nil when the fallback is disabled, which is what makes completion
 	// report honestly rather than pretending to work.
@@ -204,6 +216,16 @@ type PresignedPartInfo struct {
 	URL        string              `json:"url"`
 	Headers    map[string][]string `json:"headers,omitempty"`
 	ExpiresAt  time.Time           `json:"expires_at"`
+	// StartByte and EndByte are this part's half-open byte range within the object,
+	// with EndByte inclusive.
+	//
+	// They are here because a client cannot derive them otherwise. The server chose
+	// the part size when it initiated the multipart upload, and S3 will only accept a
+	// part that matches the boundaries it was created with. Without these, a client
+	// has to guess a part size and be right, which is a contract that fails silently
+	// at the provider.
+	StartByte int64 `json:"start_byte"`
+	EndByte   int64 `json:"end_byte"`
 }
 
 // Validate checks an inbound request against the configured limits.
@@ -409,6 +431,7 @@ func (s *UploadService) routeAndSelect(ctx context.Context, scope persistence.Sc
 		}
 		id := backend.ID
 		backendID = &id
+		s.deps.Metrics.RecordFallbackRouting(string(decision.Reason))
 	} else {
 		if connectionID == "" {
 			return CreateUploadResult{}, apperr.ConsentRequired(
@@ -416,6 +439,11 @@ func (s *UploadService) routeAndSelect(ctx context.Context, scope persistence.Sc
 		}
 		ref := connectionID
 		connectionRef = &ref
+	}
+
+	s.deps.Metrics.RecordUploadStarted(string(selectedProvider))
+	if selectedProvider == model.ProviderS3Compatible {
+		s.deps.Metrics.RecordFallbackRouting(string(fallbackReason))
 	}
 
 	// Generate the planned provider identity before the mutation. It is derived
@@ -517,12 +545,15 @@ func (s *UploadService) driveConnection(ctx context.Context, scope persistence.S
 
 // decide runs the bounded read-only preflight and evaluates the routing policy.
 func (s *UploadService) decide(ctx context.Context, scope persistence.Scope, connectionID string, connectionUsable bool) (policy.RoutingDecision, error) {
+	forced := s.deps.ForceFallback != nil && s.deps.ForceFallback()
+
 	gates := policy.Gates{
 		ConnectionUsable:        connectionUsable,
 		Authorized:              true,
 		RequestValid:            true,
 		FallbackConfigured:      s.fallbackConfigured(ctx, scope),
 		FallbackBudgetRemaining: true,
+		OperatorForcedFallback:  forced,
 	}
 
 	consent, err := s.deps.FallbackConsent(ctx, scope)
@@ -534,6 +565,20 @@ func (s *UploadService) decide(ctx context.Context, scope persistence.Scope, con
 		consent = false
 	}
 	gates.FallbackConsent = consent
+
+	// With the fallback forced, the Drive preflight is not merely unnecessary -- it is
+	// a wasted round trip on every upload during an incident, and one more request to
+	// a provider that may already be struggling. Skipping it is what makes this
+	// "route away from Drive" rather than "prefer not to".
+	//
+	// It is evaluated after the consent lookup because consent is still a gate: an
+	// operator switching providers does not manufacture the tenant's agreement to the
+	// fallback.
+	if forced {
+		s.deps.Logger.InfoContext(ctx, "routing to the fallback provider by operator request",
+			"tenant_id", scope.TenantID)
+		return policy.Evaluate(policy.RoutingRequest{Gates: gates}), nil
+	}
 
 	// Without a usable Drive connection there is nothing to preflight. The gates
 	// already carry the reason, so the policy rejects without a provider call.
@@ -674,6 +719,11 @@ func (s *UploadService) plannedIdentity(object model.LogicalObject, provider mod
 }
 
 // SortedMIMETypes returns the allow-list for diagnostics.
+// AllowedCategories returns the categories this deployment accepts.
+func (s *UploadService) AllowedCategories() []string {
+	return append([]string(nil), s.deps.UploadLimits.AllowedCategories...)
+}
+
 func (s *UploadService) SortedMIMETypes() []string {
 	out := append([]string(nil), s.deps.UploadLimits.AllowedMIMETypes...)
 	sort.Strings(out)

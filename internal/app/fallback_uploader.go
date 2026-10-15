@@ -67,13 +67,24 @@ func (u *fallbackUploader) PlanUpload(ctx context.Context, backendID, objectKey 
 		return nil, err
 	}
 
+	// Each capability carries the byte range it covers. The client cannot derive
+	// these: it does not know the part size chosen here, and S3 rejects a part whose
+	// boundaries differ from the ones the upload was created with. Returning them is
+	// what makes the multipart contract usable at all.
 	out := make([]service.PresignedPartInfo, 0, len(planned))
-	for _, part := range planned {
+	for i, part := range planned {
+		start := int64(i) * int64(u.partSize)
+		end := start + int64(u.partSize) - 1
+		if end > sizeBytes-1 {
+			end = sizeBytes - 1
+		}
 		out = append(out, service.PresignedPartInfo{
 			PartNumber: part.PartNumber,
 			URL:        part.URL,
 			Headers:    part.Headers,
 			ExpiresAt:  part.ExpiresAt,
+			StartByte:  start,
+			EndByte:    end,
 		})
 	}
 	return out, nil

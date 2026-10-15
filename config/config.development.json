@@ -36,14 +36,15 @@
   "auth": {
     "session_cookie_name": "storvia_session",
     "session_ttl": "12h",
-    "secure_cookie": false
+    "secure_cookie": false,
+    "admin_session_ttl": "720h"
   },
   "admin_panel": {
     "enabled": true,
     "tenant_id": "tenant_dev_admin",
     "user_id": "user_dev_admin",
     "flow_cookie": "storvia_admin_flow",
-    "simulate_drive_outage": true
+    "simulate_drive_outage": false
   },
   "security": {
     "allowed_origins": [
@@ -98,6 +99,7 @@
   "fallback": {
     "enabled": true,
     "consent_required": false,
+    "force": false,
     "backends": [
       {
         "id": "r2-primary",
@@ -110,5 +112,12 @@
         "multipart_abort_ttl": "24h"
       }
     ]
+  },
+  "worker": {
+    "enabled": true,
+    "owner": "",
+    "lease": "2m",
+    "poll": "5s",
+    "max_attempts": 5
   }
 }

@@ -485,7 +485,7 @@ func (r *BackendRepository) GetActive(ctx context.Context, tenantID string) (Bac
 	if err != nil {
 		return Backend{}, fmt.Errorf("persistence: get backend: %w", err)
 	}
-	backend.TenantID = tenantIDPtr(tenant)
+	backend.TenantID = nullableString(tenant)
 	return backend, nil
 }
 
@@ -536,7 +536,7 @@ func nullablePtr(value string) *string {
 	return &out
 }
 
-func tenantIDPtr(value sql.NullString) *string {
+func nullableString(value sql.NullString) *string {
 	if !value.Valid {
 		return nil
 	}
@@ -585,4 +585,75 @@ func isUniqueViolation(err error) bool {
 	return strings.Contains(text, "unique constraint") ||
 		strings.Contains(text, "duplicate key value") ||
 		strings.Contains(text, "unique_violation")
+}
+
+// ExistsByProviderKey reports whether any object row claims a provider key.
+//
+// It exists for orphan detection. The sweep lists what is at a provider and asks this
+// for each key; a false result is evidence for a person to look at, never permission to
+// delete, because the commit for a good object may still be in flight.
+func (r *ObjectRepository) ExistsByProviderKey(ctx context.Context, objectKey string) (bool, error) {
+	if objectKey == "" {
+		return false, nil
+	}
+	var found bool
+	err := r.store.db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM storage_objects WHERE provider_object_key = ?)`,
+		objectKey).Scan(&found)
+	if err != nil {
+		return false, fmt.Errorf("persistence: check provider key: %w", err)
+	}
+	return found, nil
+}
+
+// ListObjects returns an account's objects, newest first.
+//
+// It exists for the testing console and for the object API. The tenant scope is
+// mandatory and is applied in the query rather than filtered afterwards: a listing
+// that fetched rows across tenants and discarded some would still have read another
+// tenant's rows.
+func (r *ObjectRepository) ListObjects(ctx context.Context, scope Scope, limit int) ([]model.LogicalObject, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+
+	rows, err := r.store.db.QueryContext(ctx, r.store.Rebind(`
+		SELECT id, logical_key, original_name, mime_type, category, expected_size,
+		       provider, status, provider_object_key, provider_file_id, backend_id,
+		       created_at, updated_at
+		FROM storage_objects
+		WHERE tenant_id = ?
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?`), scope.TenantID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("persistence: list objects: %w", err)
+	}
+	defer rows.Close()
+
+	var out []model.LogicalObject
+	for rows.Next() {
+		var (
+			object   model.LogicalObject
+			size     sql.NullInt64
+			provider sql.NullString
+			key      sql.NullString
+			fileID   sql.NullString
+			backend  sql.NullString
+		)
+		if err := rows.Scan(&object.ID, &object.LogicalKey, &object.OriginalName,
+			&object.MIMEType, &object.Category, &size, &provider, &object.Status,
+			&key, &fileID, &backend, &object.CreatedAt, &object.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("persistence: scan object: %w", err)
+		}
+		object.ExpectedSize = size.Int64
+		object.Provider = model.Provider(provider.String)
+		object.ProviderObjectKey = nullableString(key)
+		object.ProviderFileID = nullableString(fileID)
+		object.BackendID = nullableString(backend)
+		out = append(out, object)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("persistence: list objects: %w", err)
+	}
+	return out, nil
 }

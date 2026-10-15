@@ -40,7 +40,8 @@
   "auth": {
     "session_cookie_name": "storvia_session",
     "session_ttl": "12h",
-    "secure_cookie": true
+    "secure_cookie": true,
+    "admin_session_ttl": "720h"
   },
   "admin_panel": {
     "enabled": false,
@@ -98,6 +99,7 @@
   "fallback": {
     "enabled": false,
     "consent_required": false,
+    "force": false,
     "backends": [
       {
         "id": "r2-primary",
@@ -110,5 +112,12 @@
         "multipart_abort_ttl": "24h"
       }
     ]
+  },
+  "worker": {
+    "enabled": true,
+    "owner": "",
+    "lease": "2m",
+    "poll": "5s",
+    "max_attempts": 5
   }
 }

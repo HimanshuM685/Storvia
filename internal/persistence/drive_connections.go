@@ -20,6 +20,9 @@ type DriveConnection struct {
 	// EncryptedRefreshToken is ciphertext. It is never decrypted outside the
 	// Drive adapter.
 	EncryptedRefreshToken []byte
+	// PlaintextRefreshToken is set only by ConnectionByID, which reads a connection
+	// for the Drive adapter. Nothing else should populate or read it.
+	PlaintextRefreshToken string
 	KeyReference          string
 	GrantedScopes         string
 	RootFolderID          *string
@@ -222,4 +225,72 @@ func (r *DriveConnectionRepository) Delete(ctx context.Context, connectionID str
 		return fmt.Errorf("persistence: delete drive connection: %w", err)
 	}
 	return nil
+}
+
+// ConnectionByID reads a connection without a tenant scope.
+//
+// It is for background work, which already knows which connection it is acting on.
+// It is deliberately not a way to bypass tenant scoping: a caller still needs the
+// connection id, and that id is never accepted from a client.
+func (r *DriveConnectionRepository) ConnectionByID(ctx context.Context, connectionID string) (DriveConnection, error) {
+	row := r.store.db.QueryRowContext(ctx, r.store.Rebind(`SELECT
+		tenant_id, user_id, google_subject, encrypted_refresh_token, status,
+		root_folder_id, changes_cursor
+		FROM drive_connections WHERE id = ?`), connectionID)
+
+	var (
+		out        DriveConnection
+		ciphertext []byte
+		keyRef     sql.NullString
+		folder     sql.NullString
+		cursor     sql.NullString
+	)
+	err := row.Scan(&out.TenantID, &out.UserID, &out.Subject, &ciphertext, &out.Status,
+		&folder, &cursor)
+	if errors.Is(err, sql.ErrNoRows) {
+		return DriveConnection{}, ErrNoConnection
+	}
+	if err != nil {
+		return DriveConnection{}, fmt.Errorf("persistence: get drive connection by id: %w", err)
+	}
+	out.ID = connectionID
+	out.KeyReference = keyRef.String
+	out.RootFolderID = nullableString(folder)
+	out.ChangesCursor = nullableString(cursor)
+
+	plaintext, err := r.keyring.Decrypt(keyRef.String, ciphertext)
+	if err != nil {
+		return DriveConnection{}, fmt.Errorf("persistence: decrypt refresh token: %w", err)
+	}
+	// The record type carries ciphertext and the adapter needs the plaintext, so the
+	// decrypted value rides along here rather than being returned separately. It is
+	// only ever read by the Drive adapter.
+	out.PlaintextRefreshToken = string(plaintext)
+	return out, nil
+}
+
+// ConnectedConnectionIDs lists the connections that are worth polling.
+//
+// Only `connected` ones: a revoked or disconnected grant has nothing to poll, and
+// calling Drive with a revoked token just produces errors that look like an outage.
+func (r *DriveConnectionRepository) ConnectedConnectionIDs(ctx context.Context) ([]string, error) {
+	rows, err := r.store.db.QueryContext(ctx,
+		`SELECT id FROM drive_connections WHERE status = 'connected' ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("persistence: list connected drives: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("persistence: scan connected drive: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("persistence: list connected drives: %w", err)
+	}
+	return ids, nil
 }

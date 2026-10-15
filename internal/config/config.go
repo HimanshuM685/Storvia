@@ -35,6 +35,7 @@ type Config struct {
 	Uploads     UploadsConfig    `json:"uploads"`
 	Drive       DriveConfig      `json:"drive"`
 	Fallback    FallbackConfig   `json:"fallback"`
+	Worker      WorkerConfig     `json:"worker"`
 }
 
 // ServiceConfig carries build identity stamped onto every log record.
@@ -154,7 +155,15 @@ const (
 type AuthConfig struct {
 	SessionCookieName string   `json:"session_cookie_name"`
 	SessionTTL        Duration `json:"session_ttl"`
-	SecureCookie      bool     `json:"secure_cookie"`
+	// AdminSessionTTL is the lifetime of the admin panel's sign-in cookie.
+	//
+	// It is separate from SessionTTL and much longer on purpose. An operator closing
+	// the panel for a day should not find themselves logged out and having to run a
+	// Google consent round trip again to look at a queue. The session is still
+	// revocable at any moment through the panel's sign-out button, so a long lifetime
+	// does not mean an inescapable session.
+	AdminSessionTTL Duration `json:"admin_session_ttl"`
+	SecureCookie    bool     `json:"secure_cookie"`
 }
 
 // AdminPanelConfig controls the local development panel used to exercise the
@@ -247,6 +256,25 @@ type DriveConfig struct {
 	CircuitCooldown   Duration `json:"circuit_cooldown"`
 }
 
+// WorkerConfig tunes the background job runner.
+//
+// It is ordinary configuration, so it belongs in the JSON. There is deliberately no
+// secret here: the worker's identity is a lease owner string, not a credential.
+type WorkerConfig struct {
+	// Enabled turns the worker on. It is on by default because a queue nothing
+	// drains is worse than no queue: a failed delete would sit in `deleting`
+	// forever and every retry would read as a conflict.
+	Enabled bool `json:"enabled"`
+	// Owner identifies this worker in the lease. Empty means hostname and pid.
+	Owner string `json:"owner"`
+	// Lease is how long a claimed job is reserved.
+	Lease Duration `json:"lease"`
+	// Poll is how long to wait when there is nothing to do.
+	Poll Duration `json:"poll"`
+	// MaxAttempts before a failing job is parked for a person.
+	MaxAttempts int `json:"max_attempts"`
+}
+
 // FallbackConfig lists the S3-compatible backends eligible for outage uploads.
 // One backend is active per deployment at first; selection is operator
 // configuration and never client supplied.
@@ -254,6 +282,17 @@ type FallbackConfig struct {
 	Enabled         bool              `json:"enabled"`
 	ConsentRequired bool              `json:"consent_required"`
 	Backends        []S3BackendConfig `json:"backends"`
+	// Force routes every new upload to the fallback provider even when Drive is
+	// healthy.
+	//
+	// This is an operator decision, not a fault injection. Fault injection pretends
+	// Drive is broken so the fallback path can be exercised; this actually prefers
+	// the fallback, which is what you want when Drive is refusing traffic and the
+	// question is whether users can keep working at all.
+	//
+	// It never overrides consent, authorization, request validity, or the rule that an
+	// upload whose bytes may already have reached a provider stays pinned there.
+	Force bool `json:"force"`
 }
 
 // S3BackendConfig is one S3-compatible destination.
@@ -413,6 +452,15 @@ func (c *Config) applyDefaults() {
 	if c.Service.Name == "" {
 		c.Service.Name = "storvia-api"
 	}
+	if c.Worker.Lease.Duration() == 0 {
+		c.Worker.Lease = Duration(2 * time.Minute)
+	}
+	if c.Worker.Poll.Duration() == 0 {
+		c.Worker.Poll = Duration(5 * time.Second)
+	}
+	if c.Worker.MaxAttempts <= 0 {
+		c.Worker.MaxAttempts = 5
+	}
 	if c.Server.Host == "" {
 		c.Server.Host = "127.0.0.1"
 	}
@@ -466,6 +514,15 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Auth.SessionTTL == 0 {
 		c.Auth.SessionTTL = Duration(12 * time.Hour)
+	}
+	if c.Auth.AdminSessionTTL == 0 {
+		c.Auth.AdminSessionTTL = Duration(30 * 24 * time.Hour)
+	}
+	// A panel session that outlives the API session is fine; the reverse is not,
+	// because the cookie would outlive the server-side record and every request
+	// would fail as an expired session rather than as a clear "signed out".
+	if c.Auth.SessionTTL > 0 && c.Auth.AdminSessionTTL < c.Auth.SessionTTL {
+		c.Auth.AdminSessionTTL = c.Auth.SessionTTL
 	}
 	if c.AdminPanel.FlowCookie == "" {
 		c.AdminPanel.FlowCookie = "storvia_admin_flow"
@@ -525,6 +582,9 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := c.validateAdminPanel(); err != nil {
+		return err
+	}
+	if err := c.validateWorker(); err != nil {
 		return err
 	}
 	if err := c.validateFallback(); err != nil {
@@ -643,6 +703,21 @@ func (c *Config) validateDrive() error {
 	}
 	if c.Drive.CircuitFailures < 1 || c.Drive.CircuitCooldown <= 0 {
 		return fmt.Errorf("config: drive circuit thresholds must be positive")
+	}
+	return nil
+}
+
+func (c *Config) validateWorker() error {
+	if c.Worker.Lease.Duration() < 0 {
+		return fmt.Errorf("config: worker.lease must be positive")
+	}
+	// A lease shorter than the poll interval means a worker can hold a job, go away
+	// for a poll cycle, and have its work taken while it is still running.
+	if c.Worker.Poll.Duration() > 0 && c.Worker.Lease.Duration() > 0 &&
+		c.Worker.Poll.Duration() >= c.Worker.Lease.Duration() {
+		return fmt.Errorf("config: worker.poll (%s) must be shorter than worker.lease (%s); "+
+			"otherwise a job can be taken from a worker that is still running it",
+			c.Worker.Poll.Duration(), c.Worker.Lease.Duration())
 	}
 	return nil
 }
