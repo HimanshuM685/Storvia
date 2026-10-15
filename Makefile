@@ -62,6 +62,14 @@ test-race: ## Run all Go tests with the race detector
 test-cover: ## Run tests with a coverage summary
 	$(GO) test ./... -cover
 
+# Live provider tests are opt-in. The unit suite must never reach the network
+# implicitly, so this target is the only way to run them.
+.PHONY: test-live
+test-live: ## Run tests that talk to a real fallback provider (needs .env.development)
+	@command -v $(GO) >/dev/null || { echo "go is not on PATH"; exit 1; }
+	@test -f .env.development || { echo ".env.development is missing; copy .env.example and fill it in"; exit 1; }
+	STORVIA_LIVE_FALLBACK_TEST=1 $(GO) test ./internal/app/ -run LiveFallback -v
+
 .PHONY: cover
 cover: ## Write a coverage profile to coverage.out
 	$(GO) test ./... -coverprofile=coverage.out

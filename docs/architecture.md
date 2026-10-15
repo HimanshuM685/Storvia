@@ -42,12 +42,20 @@ Go API + workers -> metadata DB
 
 ### Configuration boundary
 
-Checked-in JSON contains only non-secret deployment settings and references to secret
-environment variables. Environment files contain the actual values for Google OAuth
-client credentials, S3/R2 access keys, database credentials/DSNs, Redis passwords,
-encryption keys, and session-signing keys. A field ending in `_ref` names an
-environment variable; it is not the credential itself. Never replace a reference with
-a literal secret in JSON, examples, tests, or documentation.
+Checked-in JSON contains only non-secret deployment settings, and nothing else. There
+is no field in it that names a secret: no `client_secret_ref`, no `*_ref` of any kind.
+An earlier design allowed a reference field naming the environment variable; it was
+removed because a committed file should be unambiguously clean for anyone reviewing
+it, with nothing secret-adjacent to interpret.
+
+Ignored environment files hold the actual values for Google OAuth client credentials,
+S3/R2 access keys, database passwords, Redis passwords, encryption keys, and
+session-signing keys. The variable names the code reads are a convention, declared in
+`internal/config/secrets_names.go` and listed by `AllSecretEnvVars()`, so validation,
+redaction, and tests all read one source. Fallback credentials are chosen by vendor
+rather than by backend id, so an `aws_s3` backend cannot be pointed at the R2 keys.
+
+`TestCheckedInJSONHasNoSecretFields` enforces this against the real shipped files.
 
 For the proposed visible folder, create `Storvia/` in the user's My Drive at connection setup. Save the folder ID; names are not unique. If the user deletes the folder, request explicit recovery rather than silently creating a replacement or falling back to S3. Folder creation needs its own idempotency/reconciliation handling.
 
@@ -87,7 +95,7 @@ drive_connections
 storage_backends
   id, scope: deployment | tenant, tenant_id (required for tenant scope)
   provider: s3_compatible, vendor: aws_s3 | cloudflare_r2 | other
-  endpoint, region, bucket, credential_reference
+  endpoint, region, bucket, vendor (selects which credential variable name applies)
   status: active | disabled, capabilities, created_at, updated_at
 ```
 

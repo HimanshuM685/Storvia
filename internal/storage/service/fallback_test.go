@@ -70,7 +70,6 @@ func newFallbackService(t *testing.T, drive DriveAvailability, fallback Fallback
 			Enabled: fallback != nil,
 			Backends: []config.S3BackendConfig{{
 				ID: "b1", Vendor: config.VendorCloudflareR2, Bucket: "bucket",
-				AccessKeyIDRef: "K", SecretAccessKeyRef: "S",
 			}},
 		}
 		deps.FallbackUploader = fallback

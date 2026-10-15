@@ -45,6 +45,9 @@ type App struct {
 	// without going through HTTP.
 	Uploads *service.UploadService
 	Objects *service.ObjectService
+	// Consent exposes the tenant's fallback-consent record and the endpoint that
+	// changes it.
+	Consent *service.ConsentService
 	// DriveFaultsEnabled reports whether deliberate Drive fault injection is armed.
 	// The admin panel shows it, because a service that believes Drive is down when
 	// it is not would otherwise be very confusing to debug.
@@ -85,7 +88,7 @@ func Build(ctx context.Context, opts Options) (*App, error) {
 	}
 	app.secrets = resolvedSecrets
 
-	store, err := persistence.Open(ctx, cfg.Database, resolvedSecrets[cfg.Database.PasswordRef])
+	store, err := persistence.Open(ctx, cfg.Database, resolvedSecrets[config.EnvDatabasePassword])
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +136,7 @@ func Build(ctx context.Context, opts Options) (*App, error) {
 			"google drive credentials are absent: drive uploads and reads are unavailable until they are set")
 	}
 
-	uploads, objects, connections, err := buildServices(cfg, store, keyring, driveClient, backends, logger)
+	uploads, objects, connections, consent, err := buildServices(cfg, store, keyring, driveClient, backends, logger)
 	if err != nil {
 		cacheBackend.Close()
 		store.Close()
@@ -141,6 +144,7 @@ func Build(ctx context.Context, opts Options) (*App, error) {
 	}
 	app.Uploads = uploads
 	app.Objects = objects
+	app.Consent = consent
 
 	issuer, sessions, err := buildAuth(cfg, resolvedSecrets)
 	if err != nil {
@@ -157,7 +161,7 @@ func Build(ctx context.Context, opts Options) (*App, error) {
 		RedirectURI: cfg.Drive.AdminRedirectURI,
 		Secure:      cfg.Auth.SecureCookie,
 	}, issuer, sessions, connections)
-	app.Server = buildServer(cfg, logger, store, issuer, sessions, uploads, objects, connections, admin, driveClient, cacheBackend)
+	app.Server = buildServer(cfg, logger, store, issuer, sessions, uploads, objects, connections, consent, admin, driveClient, cacheBackend)
 
 	app.DriveFaultsEnabled = driveClient.FaultsEnabled()
 	if cfg.AdminPanel.SimulateDriveOutage && cfg.Environment == "development" {
@@ -172,6 +176,20 @@ func Build(ctx context.Context, opts Options) (*App, error) {
 	return app, nil
 }
 
+// credentialNames returns the environment variable names holding one vendor's
+// fallback credentials.
+//
+// The names come from the vendor, not from configuration and not from the backend
+// identifier, so an R2 backend cannot be pointed at the AWS credentials by mistake.
+func credentialNames(vendor string) struct{ id, secret, token string } {
+	if vendor == config.VendorAWSS3 {
+		return struct{ id, secret, token string }{
+			config.EnvAWSAccessKeyID, config.EnvAWSSecretAccessKey, ""}
+	}
+	return struct{ id, secret, token string }{
+		config.EnvR2AccessKeyID, config.EnvR2SecretAccessKey, config.EnvR2SessionToken}
+}
+
 // buildCache constructs the configured cache backend.
 func buildCache(ctx context.Context, cfg config.CacheConfig, resolved map[string]string) (cache.Cache, error) {
 	switch cfg.Driver {
@@ -179,7 +197,7 @@ func buildCache(ctx context.Context, cfg config.CacheConfig, resolved map[string
 		return cache.NewMemory(cache.WithJanitorInterval(cfg.JanitorInterval.Duration())), nil
 	case config.DriverRedis:
 		return cache.NewRedis(ctx, cfg.RedisAddress,
-			cache.WithPassword(resolved[cfg.RedisPasswordRef]),
+			cache.WithPassword(resolved[config.EnvRedisPassword]),
 			cache.WithDatabase(cfg.RedisDatabase),
 			cache.WithClientName("storvia-api"),
 		)
@@ -214,9 +232,9 @@ func buildBackends(ctx context.Context, cfg *config.Config, resolved map[string]
 			PresignTTL:    cfg.Uploads.PresignedURLTTL.Duration(),
 			RetryAttempts: 2,
 			Credentials: s3compat.Credentials{
-				AccessKeyID:     resolved[backendCfg.AccessKeyIDRef],
-				SecretAccessKey: resolved[backendCfg.SecretAccessKeyRef],
-				SessionToken:    resolved[backendCfg.SessionTokenRef],
+				AccessKeyID:     resolved[credentialNames(backendCfg.Vendor).id],
+				SecretAccessKey: resolved[credentialNames(backendCfg.Vendor).secret],
+				SessionToken:    resolved[credentialNames(backendCfg.Vendor).token],
 			},
 		}, s3compat.Options{MultipartTTL: backendCfg.MultipartAbortTTL.Duration()})
 		if err != nil {
@@ -233,16 +251,16 @@ func buildBackends(ctx context.Context, cfg *config.Config, resolved map[string]
 // buildKeyring constructs the encryption keyring.
 func buildKeyring(cfg *config.Config, resolved map[string]string) (*secrets.AESGCMKeyring, error) {
 	// A missing key was already reported by ResolveSecrets; this is a backstop.
-	active := resolved[cfg.Security.EncryptionKeyRef]
+	active := resolved[config.EnvEncryptionKey]
 	if active == "" {
 		return nil, fmt.Errorf("app: the encryption key %q is not set; refresh tokens cannot be stored safely",
-			cfg.Security.EncryptionKeyRef)
+			config.EnvEncryptionKey)
 	}
 	keyring, err := secrets.NewAESGCMKeyring(secrets.KeyringOptions{
-		ActiveReference:   cfg.Security.EncryptionKeyRef,
+		ActiveReference:   config.EnvEncryptionKey,
 		ActiveKey:         active,
-		PreviousReference: cfg.Security.EncryptionKeyPrevious,
-		PreviousKey:       resolved[cfg.Security.EncryptionKeyPrevious],
+		PreviousReference: config.EnvEncryptionKeyPrevious,
+		PreviousKey:       resolved[config.EnvEncryptionKeyPrevious],
 	})
 	if err != nil {
 		return nil, fmt.Errorf("app: encryption keyring: %w", err)
@@ -256,8 +274,8 @@ func buildDrive(ctx context.Context, cfg *config.Config, store *persistence.Stor
 
 	client, err := drive.New(ctx, drive.Config{
 		Credentials: drive.Credentials{
-			ClientID:     resolved[cfg.Drive.ClientIDRef],
-			ClientSecret: resolved[cfg.Drive.ClientSecretRef],
+			ClientID:     resolved[config.EnvGoogleClientID],
+			ClientSecret: resolved[config.EnvGoogleClientSecret],
 			RedirectURI:  cfg.Drive.RedirectURI,
 		},
 		Scopes:           cfg.Drive.Scopes,
@@ -281,9 +299,17 @@ func buildDrive(ctx context.Context, cfg *config.Config, store *persistence.Stor
 }
 
 // buildServices constructs the use cases.
-func buildServices(cfg *config.Config, store *persistence.Store, keyring secrets.Keyring, driveClient *drive.Client, backends map[string]*s3compat.Client, logger *slog.Logger) (*service.UploadService, *service.ObjectService, *service.ConnectionService, error) {
+func buildServices(cfg *config.Config, store *persistence.Store, keyring secrets.Keyring, driveClient *drive.Client, backends map[string]*s3compat.Client, logger *slog.Logger) (*service.UploadService, *service.ObjectService, *service.ConnectionService, *service.ConsentService, error) {
 	objects := persistence.NewObjectRepository(store)
 	uploadsRepo := persistence.NewUploadRepository(store)
+
+	// The outage-fallback gate reads a tenant's recorded acceptance.
+	//
+	// This was previously never wired, so FallbackConsent fell through to its
+	// default of "false" and the fallback could not fire in a real deployment at
+	// all, however the fallback was configured. A deployment that enables the
+	// fallback has to obtain consent to benefit from it.
+	consentRepo := persistence.NewFallbackConsentRepository(store)
 	attempts := persistence.NewAttemptRepository(store)
 	backendRepo := persistence.NewBackendRepository(store)
 
@@ -311,32 +337,36 @@ func buildServices(cfg *config.Config, store *persistence.Store, keyring secrets
 	}
 
 	uploads, err := service.NewUploadService(service.Dependencies{
-		Objects:      objects,
-		Uploads:      uploadsRepo,
-		Attempts:     attempts,
-		Backends:     backendRepo,
-		Drive:        driveClient,
-		UploadLimits: cfg.Uploads,
-		DriveCfg:     cfg.Drive,
-		Fallback:     cfg.Fallback,
-		IDs:          idid.NewGenerator("upl"),
-		Logger:       logger,
+		Objects:          objects,
+		Uploads:          uploadsRepo,
+		Attempts:         attempts,
+		Backends:         backendRepo,
+		FallbackUploader: newFallbackUploader(backends, int64(cfg.Uploads.S3PartSizeBytes), cfg.Uploads.PresignedURLTTL.Duration()),
+		Drive:            driveClient,
+		UploadLimits:     cfg.Uploads,
+		DriveCfg:         cfg.Drive,
+		Fallback:         cfg.Fallback,
+		IDs:              idid.NewGenerator("upl"),
+		Logger:           logger,
+		FallbackConsent:  service.ConsentGate(consentRepo),
 	})
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("app: upload service: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("app: upload service: %w", err)
 	}
 
 	source := newContentSource(store, backends, driveClient, logger)
 	objectService := service.NewObjectService(objects, uploadsRepo, source)
 	connectionService := service.NewConnectionService(service.NewDriveConnector(driveClient))
 
-	return uploads, objectService, connectionService, nil
+	appConsent := service.NewConsentService(consentRepo)
+
+	return uploads, objectService, connectionService, appConsent, nil
 }
 
 // buildAuth constructs the session issuer and store.
 func buildAuth(cfg *config.Config, resolved map[string]string) (*auth.Issuer, auth.Lookup, error) {
 	issuer, err := auth.NewIssuer(auth.IssuerOptions{
-		SigningKey: resolved[cfg.Auth.SessionSigningKeyRef],
+		SigningKey: resolved[config.EnvSessionSigningKey],
 		CookieName: cfg.Auth.SessionCookieName,
 		TTL:        cfg.Auth.SessionTTL.Duration(),
 		Secure:     cfg.Auth.SecureCookie,
@@ -348,7 +378,7 @@ func buildAuth(cfg *config.Config, resolved map[string]string) (*auth.Issuer, au
 }
 
 // buildServer assembles the HTTP server.
-func buildServer(cfg *config.Config, logger *slog.Logger, store *persistence.Store, issuer *auth.Issuer, sessions auth.Lookup, uploads *service.UploadService, objects *service.ObjectService, connections *service.ConnectionService, admin *httpapi.AdminHandler, driveClient *drive.Client, cacheBackend cache.Cache) *http.Server {
+func buildServer(cfg *config.Config, logger *slog.Logger, store *persistence.Store, issuer *auth.Issuer, sessions auth.Lookup, uploads *service.UploadService, objects *service.ObjectService, connections *service.ConnectionService, consent *service.ConsentService, admin *httpapi.AdminHandler, driveClient *drive.Client, cacheBackend cache.Cache) *http.Server {
 	ready := func(ctx context.Context) error {
 		// Readiness consults the database. Liveness deliberately does not: a
 		// database blip should not get the process restarted into the same blip,
@@ -361,6 +391,7 @@ func buildServer(cfg *config.Config, logger *slog.Logger, store *persistence.Sto
 		Sessions:       sessions,
 		Logger:         logger,
 		Uploads:        httpapi.NewUploadHandler(uploads, driveClient, cfg.Uploads),
+		Consent:        httpapi.NewConsentHandler(consent),
 		Objects:        httpapi.NewObjectHandler(objects),
 		Connections:    httpapi.NewConnectionHandler(connections),
 		Admin:          admin,

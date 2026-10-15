@@ -31,11 +31,9 @@
     "driver": "memory",
     "redis_address": "",
     "redis_database": 0,
-    "janitor_interval": "1m",
-    "redis_password_ref": "STORVIA_REDIS_PASSWORD"
+    "janitor_interval": "1m"
   },
   "auth": {
-    "session_signing_key_ref": "STORVIA_SESSION_SIGNING_KEY",
     "session_cookie_name": "storvia_session",
     "session_ttl": "12h",
     "secure_cookie": false
@@ -48,8 +46,6 @@
     "simulate_drive_outage": true
   },
   "security": {
-    "encryption_key_ref": "STORVIA_ENCRYPTION_KEY",
-    "encryption_key_previous_ref": "",
     "allowed_origins": [
       "http://localhost:5173",
       "http://127.0.0.1:5173"
@@ -83,8 +79,6 @@
     }
   },
   "drive": {
-    "client_id_ref": "STORVIA_GOOGLE_CLIENT_ID",
-    "client_secret_ref": "STORVIA_GOOGLE_CLIENT_SECRET",
     "redirect_uri": "http://127.0.0.1:8080/v1/storage/connections/google-drive/callback",
     "admin_redirect_uri": "http://127.0.0.1:8080/admin/oauth/callback",
     "scopes": [
@@ -104,13 +98,10 @@
       {
         "id": "r2-primary",
         "vendor": "cloudflare_r2",
-        "endpoint": "https://YOUR_ACCOUNT_ID.r2.cloudflarestorage.com",
+        "endpoint": "https://f537476a76bae45a4f65fd8618326090.r2.cloudflarestorage.com",
         "region": "auto",
-        "bucket": "storvia-fallback",
+        "bucket": "storvia-testing",
         "prefix": "",
-        "access_key_id_ref": "STORVIA_R2_ACCESS_KEY_ID",
-        "secret_access_key_ref": "STORVIA_R2_SECRET_ACCESS_KEY",
-        "session_token_ref": "STORVIA_R2_SESSION_TOKEN",
         "use_path_style": true,
         "disabled": false,
         "multipart_abort_ttl": "24h"

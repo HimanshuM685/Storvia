@@ -149,57 +149,82 @@ the real thing.
 
 ### Configuration
 
-Configuration is split by secrecy, not by convenience:
+Configuration is split by secrecy, and the split is absolute:
 
-- **JSON** (`config/*.json`) holds every ordinary setting: timeouts, TTLs, booleans,
-  size limits, hostnames, ports, bucket names, endpoints, regions, prefixes, and
-  redirect URIs. A field ending in `_ref` holds the **name** of an environment
-  variable, never its value.
+- **JSON** (`config/*.json`) holds every ordinary setting and **nothing else**:
+  timeouts, TTLs, booleans, size limits, hostnames, ports, bucket names, endpoints,
+  regions, prefixes, and redirect URIs. There is no secret in it — not a value, and
+  not a field that names one.
 - **`.env`** holds every actual credential: API keys, OAuth client credentials,
   access keys, secret keys, passwords, the refresh-token encryption key, and the
   session-signing key. `.env` files are never committed.
 
-The split is by secrecy, which means ordinary settings never get pushed into a
-secrets file as a side effect. For example:
+A checked-in config file is read, reviewed, and committed by people who should never
+have to think about secrets. Leaving a `client_secret_ref` in it means the file is no
+longer unambiguously clean, and a reviewer has to decide what it means. So it is not
+there. The variable names the code reads are a convention, declared in
+`internal/config/secrets_names.go`.
+
+This is why a secret-shaped field must be split rather than moved. An earlier version
+read a whole Postgres connection string from the environment; because the string
+contained a password, four ordinary settings were quietly pushed into `.env` too. The
+current shape keeps the ordinary parts in the file:
 
 ```json
 {
   "database": {
+    "driver": "postgres",
     "host": "postgres",
     "port": 5432,
     "user": "storvia",
     "database": "storvia",
-    "sslmode": "require",
-    "password_ref": "STORVIA_DATABASE_PASSWORD"
+    "sslmode": "require"
   }
 }
 ```
 
-Host, port, user, and database name are not secrets, so they are plain values. Only
-the password is a reference. An earlier version of this project read a whole
-connection string from the environment, which quietly moved four ordinary settings
-into `.env` because the string happened to contain a password.
+Host, port, user, and database name are not secrets, so they are plain values here.
+`STORVIA_DATABASE_PASSWORD` is read from the environment and the DSN is assembled at
+runtime. Nothing about where the password lives needs to appear in this file.
 
-Two rules are enforced at startup rather than left to code review:
+The rule is enforced by tests against the real committed files, not by code review:
 
 - **A missing required secret stops the service.** It does not become an empty
   credential. The error names the field and the variable.
-- **A credential pasted where a reference belongs is rejected.** If
-  `access_key_id_ref` holds something shaped like an AWS key rather than a variable
-  name, startup fails and says so, without reprinting the value.
+- **A secret-bearing key in a JSON file fails the build.** A test walks both shipped
+  files and rejects any `_ref` field, any secret-bearing key, and any value shaped
+  like a credential.
+- **A credential-shaped value is rejected anywhere it appears**, and the error never
+  reprints the value it rejected.
 
-```json
-{
-  "drive": {
-    "client_id_ref": "STORVIA_GOOGLE_CLIENT_ID",
-    "client_secret_ref": "STORVIA_GOOGLE_CLIENT_SECRET"
-  }
-}
-```
-
-The loader refuses configuration that would be unsafe: the broad `drive` scope, a
+The loader also refuses configuration that would be unsafe: the broad `drive` scope, a
 non-allow-listed endpoint, a retry budget that cannot fit its own attempts, and
 enabling fallback while the outage disclosure is unaccepted.
+
+### Outage fallback consent
+
+When Drive is unavailable, a new upload may be routed to the fallback provider instead.
+That means a file can be stored outside the user's own Drive, so it only happens when the
+**tenant has accepted the outage-fallback disclosure**. It is a per-tenant record, not a
+deployment switch: consent is not transferable between tenants and a deployment cannot
+imply it on someone's behalf.
+
+```sh
+GET    /v1/storage/fallback/consent   # current state
+POST   /v1/storage/fallback/consent   # accept the current disclosure
+DELETE /v1/storage/fallback/consent   # withdraw; closes the gate immediately
+```
+
+A tenant that has never been asked and a tenant that declined both read as *not granted*,
+because both mean the same thing to the router. The record carries the disclosure version
+the tenant agreed to, so when the wording changes they are asked again rather than being
+held to terms they never saw.
+
+Withdrawal is the direction that has to work instantly — it is what stops a tenant's files
+being routed somewhere new.
+
+Enabling `fallback.enabled` in the configuration does **not** grant consent. It only says
+where files would go if the tenant agreed.
 
 ### Google OAuth setup
 

@@ -117,7 +117,6 @@ func newS3ObjectService(t *testing.T, source ContentSource) (*ObjectService, *Up
 			Enabled: true,
 			Backends: []config.S3BackendConfig{{
 				ID: "b1", Vendor: config.VendorCloudflareR2, Bucket: "bucket",
-				AccessKeyIDRef: "K", SecretAccessKeyRef: "S",
 			}},
 		}
 		deps.FallbackConsent = func(context.Context, persistence.Scope) (bool, error) {

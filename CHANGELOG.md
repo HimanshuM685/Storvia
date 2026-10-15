@@ -17,6 +17,405 @@ Related documents:
 
 ---
 
+## 2026-10-15 — Outage fallback verified against real Cloudflare R2, and three wiring bugs fixed
+
+### Why
+
+The goal was always to prove the outage mechanism end to end: force Drive to fail, watch
+an upload land in R2. Getting there turned up three defects that made the fallback
+**unreachable in any real deployment** while the entire test suite passed.
+
+### Fixed: the fallback could never fire
+
+Three dependencies were written, unit-tested in isolation, and then never handed to the
+service that uses them. Each defaulted to a safe-looking value that quietly disabled the
+feature.
+
+| Dependency | Symptom when unwired |
+|---|---|
+| `FallbackConsent` | Defaulted to `return false, nil`. Every fallback was refused with `fallback_consent_missing`. |
+| `FallbackUploader` | Nil. A completed fallback upload answered `provider_not_configured`. |
+| `newFallbackUploader(...)` | The adapter existed and was tested; nothing ever called it. |
+
+Every existing test passed, because the tests inject their own stubs. The configuration
+said `fallback.enabled: true`, uploads went to Drive, and nothing reported a problem. This
+is the worst class of bug: a feature that is configured, believed working, and inert.
+
+`TestBuildWiresTheOutageFallbackDependencies` now asserts the real dependencies are
+present after `Build` and that consent opens and closes against real storage.
+
+### Added: tenant fallback consent
+
+The consent gate existed as a policy condition with no way to satisfy it. There was no
+consent table in either migration, so nothing could ever grant it.
+
+- **Migration `0002_tenant_fallback_consent.sql`** for both dialects. Per tenant, not
+  per deployment: consent to have files held outside the user's own Drive is not
+  transferable. Carries a `disclosure_version` so a tenant is never held to wording they
+  did not see, and `withdrawn_at` so a withdrawal is explicit rather than an absence.
+- **`FallbackConsentRepository`** with `Resolve`, `Granted`, `Accept`, `Withdraw`.
+  `Granted()` requires the flag, a matching disclosure version, and no withdrawal.
+  A missing record and a refusal are distinguishable, because a caller has to tell a new
+  tenant from a declining one. Both mean "not granted".
+- **`ConsentService`** and **`ConsentGate`**, which adapts the store to the coordinator's
+  routing dependency. The gate states once, in one place, that a lookup failure must
+  never open the gate: a database problem closing the fallback shut is the safe direction.
+- **`ConsentHandler`** serving `GET`, `POST`, and `DELETE /v1/storage/fallback/consent`.
+- **Wired in `buildServices`**, which is the actual fix.
+
+Four repository tests cover the default (not granted), the full lifecycle, the disclosure
+version check, and tenant isolation.
+
+### Fixed: a tenant with no Drive connection got an internal error
+
+`drive.Client.ConnectionID` documented that it returns `""` when no connection exists, but
+it propagated `persistence.ErrNoConnection` as an error. The coordinator's
+`connectionID == ""` branch was therefore unreachable, and a tenant who had never
+connected Drive received a wrapped internal error out of `CreateUpload` instead of a
+routing decision. Both `ConnectionID` and `ConnectionUsable` now treat "no connection" as
+an ordinary state.
+
+### Verified end to end against Cloudflare R2
+
+`make test-live`, opt-in via `STORVIA_LIVE_FALLBACK_TEST=1`:
+
+```
+routed to s3_compatible because "drive_unavailable_preflight" (1 part, mode s3_presigned_parts)
+VERIFIED: Drive was forced unavailable, and 39 bytes are in R2 bucket "storvia-testing"
+          at key "storvia/tenants/tenant_dev_admin/objects/upl_..."
+demonstration object deleted; the bucket is clean
+```
+
+Drive was forced down with fault injection, the upload was planned against the fallback,
+the bytes were transferred to the presigned URL the service issued, the upload was
+completed and verified with `HeadObject`, and the object was read back out of R2 through
+the provider client rather than from the database. The single-location invariant was
+asserted: no Drive file ID and no Drive connection on the completed object.
+
+### Credential resolution
+
+The bucket was named `storvia-testing`, not the `storvia-fallback` that had been guessed.
+That wrong name produced `AccessDenied`, which is returned *before* the signature is
+evaluated — so the secret access key was untestable until the bucket name was right, at
+which point it returned `SignatureDoesNotMatch` and pointed straight at the real problem.
+Four pasted non-`STORVIA_*` lines were removed from `.env.development`; nothing read them.
+
+### Checks run
+
+```
+make check      # fmt-check vet test — passed
+make test-live  # both live tests pass against real R2
+```
+
+## 2026-10-15 — Secret references removed from the checked-in configuration
+
+### Why
+
+The owner has stated repeatedly that secrets belong strictly in `.env`, and that the
+JSON configuration files must carry no secret keys at all. The previous boundary was
+`client_secret_ref`, `encryption_key_ref`, `access_key_id_ref` and friends: field
+names in a committed file whose values were environment variable *names*. The owner
+considered that still too much — a checked-in config should describe ordinary
+settings and nothing else.
+
+### Changed
+
+**The checked-in JSON now has no secret-bearing field of any kind.** Every
+`*_ref` field was removed from both `config/config.development.json` and
+`config/config.production.json`, and from the Go structs that decoded them
+(`DatabaseConfig.PasswordRef`, `CacheConfig.RedisPasswordRef`,
+`AuthConfig.SessionSigningKeyRef`, `SecurityConfig.EncryptionKeyRef`,
+`SecurityConfig.EncryptionKeyPrevious`, `DriveConfig.ClientIDRef`,
+`DriveConfig.ClientSecretRef`, `S3BackendConfig.AccessKeyIDRef`,
+`S3BackendConfig.SecretAccessKeyRef`, `S3BackendConfig.SessionTokenRef`).
+
+Because the loader uses `DisallowUnknownFields`, leaving any of them in a JSON file
+would now be a startup error rather than a silent no-op.
+
+**The variable names became a code convention** in `internal/config/secrets_names.go`
+(`EnvEncryptionKey`, `EnvGoogleClientSecret`, `EnvR2SecretAccessKey`, and the rest),
+with `AllSecretEnvVars()` so tooling and tests read one list. `SecretRefs()` now
+derives every reference from those constants instead of from configuration.
+
+**Credentials are chosen by vendor, not by backend id.** `SecretRefs()` and
+`credentialNames` in `internal/app/app.go` select the R2 variables for a
+`cloudflare_r2` backend and the AWS variables for an `aws_s3` backend. Previously the
+backend's own `id` chose the variable names, which meant a copy-pasted configuration
+could point an R2 bucket at the AWS keys with no error.
+
+### Validation that was removed with it
+
+`ValidateSecretRefs` previously guarded against a developer pasting a real key into a
+`*_ref` field. That failure mode no longer exists — there is no field to paste into —
+but the helper is kept and still tested, because it now guards the constants: a
+credential-shaped string reaching `SecretRefs` (a ref that resolves to itself, say)
+still fails startup rather than becoming an empty credential.
+
+### Tests
+
+- `TestCheckedInJSONHasNoSecretFields` (new, replaces
+  `TestCheckedInJSONUsesEnvironmentReferencesForCredentials`) fails if any checked-in
+  config file gains a `_ref` field, a secret-bearing key, or a credential-shaped
+  value. The replaced test asserted the **opposite** — that the refs are present — so
+  it was inverted rather than merely deleted.
+- `TestShippedConfigContainsNoCredentials` inverted its secret-field rule: a
+  secret-bearing field no longer has a legitimate form, so it is now an error
+  outright.
+- `TestEnvExampleHasNoOrphanVariables` and `TestEverySecretRefIsDocumentedInEnvExample`
+  now compare `.env.example` against `AllSecretEnvVars()` rather than against refs
+  scraped out of the JSON.
+- `TestSecretEnvVarNamesAreCanonical` (new) checks every name uses the `STORVIA_`
+  prefix and is a valid environment variable name.
+- `TestFallbackCredentialsAreChosenByVendor` (new) resolves an R2 configuration and
+  an AWS configuration against one environment and asserts neither pulls in the
+  other's credentials.
+
+### `.env.example`
+
+Documented `STORVIA_AWS_ACCESS_KEY_ID` and `STORVIA_AWS_SECRET_ACCESS_KEY` as
+commented-out optionals. They were previously invisible, so an operator running an
+`aws_s3` backend had no template for them.
+
+### Checks run
+
+```
+make check      # fmt-check vet test — passed
+go vet ./...    # clean
+```
+
+`STORVIA_LIVE_FALLBACK_TEST=1 go test ./internal/app/ -run LiveFallback` fails, as
+described in the next entry. That is a credential problem in the Cloudflare account,
+not a code failure.
+
+---
+
+## 2026-10-15 — Live R2 verification attempt, and an opt-in test for it
+
+### Why
+
+Everything about the fallback provider had been verified against a mock. A signing
+bug, a wrong endpoint, or an under-scoped token would pass every test in the suite
+and only surface in production, so it needed a check that talks to a real R2 bucket.
+
+### Added
+
+`internal/app/live_fallback_test.go` — `TestLiveFallbackBackendIsUsable`. It writes one
+object under the Storvia prefix through the real `s3compat` client, reads the metadata,
+reads the bytes back, and deletes the object.
+
+It is **opt-in**: it skips unless `STORVIA_LIVE_FALLBACK_TEST=1`. A unit suite that
+reaches the network implicitly becomes slow, becomes flaky, and stops telling you
+which layer broke. `make test-live` is the only supported way to run it.
+
+It deliberately does not exercise the Drive-failure path. The routing decision is
+covered deterministically by `TestInjectedDriveOutageRoutesToTheFallback`; mixing a
+real provider into it would replace a precise assertion with a flaky one.
+
+### Result: the keys reach Cloudflare and are refused
+
+The owner populated `.env.development` with real credentials and supplied the account ID.
+The 403 persisted, so this entry records what was actually established rather than a
+list of things to try.
+
+**Confirmed working:** the endpoint in `config/config.development.json` and the account ID
+in the environment agree; the access key ID is 32 lowercase hex and the secret is 64 hex,
+both free of whitespace and quoting; Storvia's own loader resolves them (`-check` passes).
+
+**Confirmed not the cause:** the signing implementation. The same result was reproduced
+with `boto3`, an independent SigV4 implementation, against both path-style and
+virtual-hosted addressing, with and without a session token, and across five candidate
+bucket names. Every combination returned `403 AccessDenied`.
+
+**A correction to an earlier note.** An earlier entry in this file treated successful DNS
+resolution and a matching TLS certificate CN as evidence the account was real. That was
+wrong: `r2.cloudflarestorage.com` is wildcard-resolved, so a fabricated account ID
+resolves and is served a valid wildcard certificate too. Neither check carries any
+information about whether the account exists. They were listed among the things confirmed
+working and should not have been.
+
+**The discriminating probe.** Four credential sets, one identical signed request:
+
+```
+invented key (all zeros)             -> HTTP 401  Unauthorized
+invented key (all f's)               -> HTTP 401  Unauthorized
+the real key + the real secret       -> HTTP 403  AccessDenied
+the real key + one wrong secret char -> HTTP 403  AccessDenied
+```
+
+401 means Cloudflare does not recognise the key; 403 means it does and is declining to
+authorise. The access key ID is therefore real and live in that account — not a typo, not
+stale, not from the wrong account. That is the hypothesis a 403 usually invites, and it is
+now excluded.
+
+Cloudflare collapses "wrong secret" and "valid secret without permission" into the same
+403 and does not return `SignatureDoesNotMatch`, so the signature cannot be verified from
+outside. Remaining causes, in order of likelihood:
+
+1. The bucket `storvia-fallback` does not exist under account `f537476a76bae45a4f65fd8618326090`,
+   or is spelled differently. **R2 answers `AccessDenied` rather than `NoSuchBucket` for a
+   bucket the token cannot see** — verified by requesting a deliberately nonexistent bucket
+   and receiving an identical 403 — so a wrong bucket name is permanently indistinguishable
+   from missing permission.
+2. The token is valid but scoped to a different bucket.
+3. The token carries `Object Read` rather than `Object Read & Write`.
+
+A `cfat_`-prefixed Cloudflare API token was also present in the environment under a
+non-standard name. It returns `401 Invalid API Token` against the Cloudflare API, and
+`9109 Unauthorized` against the account endpoint, so it is invalid at the source. It is an
+API token, not an S3 session token; signing it as `x-amz-security-token` does not change the
+outcome, which was also verified.
+
+### Root cause found: the bucket name was wrong
+
+The owner supplied the S3 API endpoint from the Cloudflare R2 dashboard:
+
+```
+https://f537476a76bae45a4f65fd8618326090.r2.cloudflarestorage.com/storvia-testing
+```
+
+The path segment is the bucket name: **`storvia-testing`**, not `storvia-fallback`. The
+configuration had been written with a guessed name, and the guessed name was the entire
+problem.
+
+Correcting the bucket in `config/config.development.json` changed the provider's response
+from `AccessDenied` to **`SignatureDoesNotMatch`** — a different failure with a completely
+different meaning:
+
+| Error | Meaning |
+|---|---|
+| `AccessDenied` | Authorisation refused before the signature was evaluated. The earlier error masked the real one. |
+| `SignatureDoesNotMatch` | The bucket was found, the request was authorised, and the signature was computed and **rejected**. |
+
+Reproduced identically through `boto3`, so this is the provider's verdict on the
+credentials rather than a difference between signers.
+
+`config/config.development.json` now points at `storvia-testing`, and `make test-live`
+reaches the bucket and returns the provider's explicit instruction: *"Check your secret
+access key and signing method."*
+
+### What the owner needs to do
+
+Re-copy the **Secret Access Key** from the `storvia-testing` token's detail view into
+`.env.development` as `STORVIA_R2_SECRET_ACCESS_KEY`. The current value is 64 hex
+characters with no whitespace or quoting, so it is well-formed but wrong — almost
+certainly a partial or stale copy. The access key ID is confirmed good: an invented key
+returns `401` while this one returns `403`, which means Cloudflare recognises it.
+
+### Not done
+
+- The end-to-end "Drive fails, upload lands in R2" demonstration is still **not**
+  achieved. It is blocked on the above, and the fault-injection wiring is verified
+  only against a mock backend.
+- The `Dockerfile` still has never been built; no Docker daemon was available.
+
+---
+
+## 2026-10-15 — Fault injection and the S3 fallback upload path
+
+Commit: *feat: add development-only fault injection and implement fallback upload completion*
+
+### Why
+
+The owner asked to be able to test the outage mechanism: force Drive to fail and see
+an upload land in R2. Two things made that impossible.
+
+### What was blocking it
+
+1. **The upload transfer path did not exist.** `POST /uploads/{id}/complete` returned
+   `provider_not_configured`, and `createUpload` never populated `Parts`, so a
+   fallback upload had no way to move bytes or to finish.
+2. **There was no way to make Drive fail on demand.** A real outage is rare and
+   unreproducible, so the mechanism could only be reasoned about, never exercised.
+
+### Added
+
+- **Development-only fault injection.** `admin_panel.simulate_drive_outage` forces the
+  read-only Drive availability preflight to report a transport failure. It is gated on
+  **two independent conditions**, both required: the configuration flag, and
+  `environment == "development"` passed from the wiring rather than read from
+  configuration. A config file can be copied from development into production by
+  accident; an environment cannot. `admin_panel.simulate_drive_outage` is refused by
+  the loader outside development, and the check runs before the `enabled` flag so a
+  configuration cannot arm a fault with the panel switched off.
+- `FallbackUploader`, a narrow port in the service layer for planning and verifying
+  fallback uploads. The service never sees an SDK type.
+- `UploadService.CompleteUpload` — verifies the object at its recorded key with
+  `HeadObject`, compares the provider's confirmed size against the declared size, and
+  commits exactly one location. It refuses a size mismatch rather than marking a
+  truncated upload ready, and a provider `404` is surfaced as missing, never as a
+  reason to write elsewhere.
+- `createUpload` now returns short-lived presigned capabilities once the policy has
+  selected the fallback and the attempt row is durable, so a client cannot reach the
+  path for a Drive upload. It rejects any capability whose URL does not reference the
+  planned object key.
+- `internal/app/fallback_uploader.go` adapts the S3 clients to the port, choosing a
+  part count from the declared size and the S3 ten-thousand-part ceiling.
+- `App.DriveFaultsEnabled`, surfaced so the admin panel can show that a simulated
+  outage is armed. A service that believes Drive is down when it is not is otherwise
+  very confusing to debug.
+
+### Fixed
+
+- **`buildDrive` still read the environment directly** with `os.Getenv` instead of the
+  resolved secrets map. It worked only because the entry point exports the variables
+  first, and it would have broken the moment secrets came from a runtime secret file
+  rather than the environment. The earlier audit missed it because the grep looked for
+  hardcoded literal names, not `os.Getenv(cfg.Drive.ClientIDRef)`.
+- **Fault injection was not reaching the client.** Three separate patch attempts
+  silently failed to match the gofmt-aligned source, so `deps.Faults` was never stored
+  on the client and the injector was inert. Found because a test asserted on
+  `FaultsEnabled` instead of trusting that the wiring compiled.
+- **A completed upload could not be completed twice.** The idempotency check ran after
+  the active-attempt lookup, but a finished attempt is no longer active, so the repeat
+  failed instead of returning the existing object.
+
+### Tests
+
+Nine new tests in `internal/storage/service/fallback_test.go` and four in
+`internal/app/wiring_test.go`:
+
+- an injected Drive outage selects the fallback and returns capabilities scoped to the
+  object's own tenant
+- a healthy Drive selects Drive even with a fallback configured and plans nothing
+- completion commits exactly one location, with no Drive pointer present
+- completion is idempotent and plans no second upload
+- a size mismatch is refused and the object is not marked ready
+- a missing object is reported as not-found and triggers no re-plan
+- a capability for the wrong key is rejected
+- fault injection is impossible when the environment gate is closed
+- a production configuration that injects an outage is refused
+- the real development configuration builds with the fallback wired and the fault armed
+
+### Verified
+
+```text
+make check                                      -> pass
+go test -race ./...                             -> pass
+internal/app wiring tests                        -> 4 pass
+internal/storage/service fallback tests          -> 9 pass
+storvia-api with the fault armed                -> logs "simulation is ACTIVE"
+```
+
+### Still blocked, and why
+
+The R2 endpoint in `config/config.development.json` is still the placeholder
+`https://YOUR_ACCOUNT_ID.r2.cloudflarestorage.com`. The account ID is not a secret, so
+it does not belong in `.env`, and it is the one value needed to complete a real
+end-to-end run against the bucket. Until it is filled in, the fallback path is proven
+against a stub adapter and by the policy tests, but no byte has been written to R2.
+
+Drive chunk upload is still unimplemented, so a Drive-selected upload still cannot be
+completed, and the Drive happy path remains unverified against a live Google account.
+
+### Next step, in order
+
+1. Set the real R2 account endpoint in the configuration.
+2. Run one real fallback upload against R2 with the fault armed, and confirm the object
+   and its size in the bucket.
+3. Implement the Drive resumable upload verbs.
+
+---
+
 ## 2026-10-15 — Remove dead configuration and guard the config files with tests
 
 Commit: *chore: remove dead configuration, add shipped-config guard tests*

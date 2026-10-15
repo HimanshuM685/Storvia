@@ -24,8 +24,6 @@ func minimalConfig() string {
       "database": {"driver": "sqlite", "sqlite_path": "file::memory:"},
       "cache": {"driver": "memory"},
       "drive": {
-        "client_id_ref": "TEST_CLIENT_ID",
-        "client_secret_ref": "TEST_CLIENT_SECRET",
         "redirect_uri": "http://127.0.0.1:8080/callback",
         "scopes": ["https://www.googleapis.com/auth/drive.file"]
       },
@@ -40,8 +38,8 @@ func minimalConfig() string {
 
 func TestParseMinimalConfigAppliesDefaults(t *testing.T) {
 	cfg, err := Parse([]byte(minimalConfig()), lookupMap(map[string]string{
-		"TEST_CLIENT_ID":     "id",
-		"TEST_CLIENT_SECRET": "secret",
+		EnvGoogleClientID:     "id",
+		EnvGoogleClientSecret: "secret",
 	}))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
@@ -193,8 +191,8 @@ func TestValidateRejectsEnabledAdminPanelOutsideDevelopment(t *testing.T) {
 	raw := strings.Replace(minimalConfig(), `"environment": "test"`, `"environment": "production"`, 1)
 	raw = strings.Replace(raw, `"fallback": {"enabled": false},`, `"fallback": {"enabled": false}, "admin_panel": {"enabled": true, "tenant_id": "tenant", "user_id": "user"},`, 1)
 	if _, err := Parse([]byte(raw), lookupMap(map[string]string{
-		"TEST_CLIENT_ID":     "id",
-		"TEST_CLIENT_SECRET": "secret",
+		EnvGoogleClientID:     "id",
+		EnvGoogleClientSecret: "secret",
 	})); err == nil || !strings.Contains(err.Error(), "admin_panel.enabled") {
 		t.Fatalf("Parse error = %v, want the development-only admin-panel error", err)
 	}
@@ -204,8 +202,8 @@ func TestValidateEnabledAdminPanelRequiresSeparateRedirectURI(t *testing.T) {
 	raw := strings.Replace(minimalConfig(), `"environment": "test"`, `"environment": "development"`, 1)
 	raw = strings.Replace(raw, `"fallback": {"enabled": false},`, `"fallback": {"enabled": false}, "admin_panel": {"enabled": true, "tenant_id": "tenant", "user_id": "user"},`, 1)
 	if _, err := Parse([]byte(raw), lookupMap(map[string]string{
-		"TEST_CLIENT_ID":     "id",
-		"TEST_CLIENT_SECRET": "secret",
+		EnvGoogleClientID:     "id",
+		EnvGoogleClientSecret: "secret",
 	})); err == nil || !strings.Contains(err.Error(), "admin_redirect_uri") {
 		t.Fatalf("Parse error = %v, want the separate callback error", err)
 	}
@@ -232,7 +230,7 @@ func TestValidateRejectsImpossibleRetryBudget(t *testing.T) {
 func TestValidateRejectsFallbackWithoutDisclosureAcceptance(t *testing.T) {
 	raw := strings.Replace(minimalConfig(), `"fallback": {"enabled": false}`,
 		`"fallback": {"enabled": true, "consent_required": true, "backends": [
-           {"id": "b1", "vendor": "cloudflare_r2", "bucket": "b", "access_key_id_ref": "K", "secret_access_key_ref": "S"}
+           {"id": "b1", "vendor": "cloudflare_r2", "bucket": "b"}
          ]}`, 1)
 
 	_, err := Parse([]byte(raw), lookupMap(nil))
@@ -247,7 +245,7 @@ func TestValidateRejectsFallbackWithoutDisclosureAcceptance(t *testing.T) {
 func TestValidateRejectsUnknownVendor(t *testing.T) {
 	raw := strings.Replace(minimalConfig(), `"fallback": {"enabled": false}`,
 		`"fallback": {"enabled": true, "consent_required": false, "backends": [
-           {"id": "b1", "vendor": "minio", "bucket": "b", "access_key_id_ref": "K", "secret_access_key_ref": "S"}
+           {"id": "b1", "vendor": "minio", "bucket": "b"}
          ]}`, 1)
 
 	if _, err := Parse([]byte(raw), lookupMap(nil)); err == nil {
@@ -258,8 +256,8 @@ func TestValidateRejectsUnknownVendor(t *testing.T) {
 func TestValidateRejectsDuplicateBackendIDs(t *testing.T) {
 	raw := strings.Replace(minimalConfig(), `"fallback": {"enabled": false}`,
 		`"fallback": {"enabled": true, "consent_required": false, "backends": [
-           {"id": "dup", "vendor": "aws_s3", "bucket": "b", "access_key_id_ref": "K", "secret_access_key_ref": "S"},
-           {"id": "dup", "vendor": "cloudflare_r2", "bucket": "c", "access_key_id_ref": "K", "secret_access_key_ref": "S"}
+           {"id": "dup", "vendor": "aws_s3", "bucket": "b"},
+           {"id": "dup", "vendor": "cloudflare_r2", "bucket": "c"}
          ]}`, 1)
 
 	if _, err := Parse([]byte(raw), lookupMap(nil)); err == nil {
@@ -271,7 +269,7 @@ func TestValidateRejectsNonHTTPSEndpoint(t *testing.T) {
 	raw := strings.Replace(minimalConfig(), `"fallback": {"enabled": false}`,
 		`"fallback": {"enabled": true, "consent_required": false, "backends": [
            {"id": "b1", "vendor": "aws_s3", "endpoint": "http://evil.example.com",
-            "bucket": "b", "access_key_id_ref": "K", "secret_access_key_ref": "S"}
+            "bucket": "b"}
          ]}`, 1)
 
 	_, err := Parse([]byte(raw), lookupMap(nil))
@@ -288,7 +286,7 @@ func TestValidateRejectsEndpointOutsideHostAllowList(t *testing.T) {
 		`"security": {"allowed_endpoint_schemes": ["https"], "allowed_endpoint_hosts": ["s3.amazonaws.com"]},
          "fallback": {"enabled": true, "consent_required": false, "backends": [
            {"id": "b1", "vendor": "aws_s3", "endpoint": "https://169.254.169.254",
-            "bucket": "b", "access_key_id_ref": "K", "secret_access_key_ref": "S"}
+            "bucket": "b"}
          ]}`, 1)
 
 	_, err := Parse([]byte(raw), lookupMap(nil))
@@ -305,7 +303,7 @@ func TestValidateAllowsEndpointInsideHostAllowList(t *testing.T) {
 		`"security": {"allowed_endpoint_schemes": ["https"], "allowed_endpoint_hosts": ["s3.amazonaws.com"]},
          "fallback": {"enabled": true, "consent_required": false, "backends": [
            {"id": "b1", "vendor": "aws_s3", "endpoint": "https://s3.amazonaws.com",
-            "bucket": "b", "access_key_id_ref": "K", "secret_access_key_ref": "S"}
+            "bucket": "b"}
          ]}`, 1)
 
 	if _, err := Parse([]byte(raw), lookupMap(nil)); err != nil {
@@ -373,8 +371,8 @@ func TestLoadReadsFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte(minimalConfig()), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("TEST_CLIENT_ID", "id")
-	t.Setenv("TEST_CLIENT_SECRET", "secret")
+	t.Setenv(EnvGoogleClientID, "id")
+	t.Setenv(EnvGoogleClientSecret, "secret")
 
 	if _, err := Load(path); err != nil {
 		t.Fatalf("Load: %v", err)
@@ -448,11 +446,13 @@ func TestEmptyMIMEAllowListRejectsEverything(t *testing.T) {
 func TestSecretFieldsAndRedactedSummaryDoNotLeak(t *testing.T) {
 	raw := strings.Replace(minimalConfig(), `"fallback": {"enabled": false}`,
 		`"fallback": {"enabled": true, "consent_required": false, "backends": [
-           {"id": "r2", "vendor": "cloudflare_r2", "bucket": "b",
-            "access_key_id_ref": "AK", "secret_access_key_ref": "SK"}
+           {"id": "r2", "vendor": "cloudflare_r2", "bucket": "b"}
          ]}`, 1)
 	cfg, err := Parse([]byte(raw), lookupMap(map[string]string{
-		"AK": "AKIAREALKEY", "SK": "veryrealsecret", "TEST_CLIENT_ID": "cid", "TEST_CLIENT_SECRET": "csecret",
+		EnvGoogleClientID:     "cid",
+		EnvGoogleClientSecret: "csecret",
+		EnvR2AccessKeyID:      "AKIAREALKEY",
+		EnvR2SecretAccessKey:  "veryrealsecret",
 	}))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
@@ -477,43 +477,96 @@ func TestSecretFieldsAndRedactedSummaryDoNotLeak(t *testing.T) {
 	}
 }
 
-func TestCheckedInJSONUsesEnvironmentReferencesForCredentials(t *testing.T) {
-	type backendRefs struct {
-		AccessKeyIDRef     string `json:"access_key_id_ref"`
-		SecretAccessKeyRef string `json:"secret_access_key_ref"`
-		SessionTokenRef    string `json:"session_token_ref"`
-	}
-	type checkedInConfig struct {
-		Drive struct {
-			ClientIDRef     string `json:"client_id_ref"`
-			ClientSecretRef string `json:"client_secret_ref"`
-		} `json:"drive"`
-		Security struct {
-			EncryptionKeyRef string `json:"encryption_key_ref"`
-		} `json:"security"`
-		Fallback struct {
-			Backends []backendRefs `json:"backends"`
-		} `json:"fallback"`
-	}
-
+// TestCheckedInJSONHasNoSecretFields is the boundary the owner asked for: a
+// checked-in configuration file contains ordinary settings only. There is no
+// secret reference in it at all, so there is nothing secret-adjacent to review.
+func TestCheckedInJSONHasNoSecretFields(t *testing.T) {
 	for _, path := range []string{"../../config/config.development.json", "../../config/config.production.json"} {
 		raw, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}
-		var checkedIn checkedInConfig
-		if err := json.Unmarshal(raw, &checkedIn); err != nil {
+
+		var document map[string]any
+		if err := json.Unmarshal(raw, &document); err != nil {
 			t.Fatalf("decode %s: %v", path, err)
 		}
-		refs := []string{checkedIn.Drive.ClientIDRef, checkedIn.Drive.ClientSecretRef, checkedIn.Security.EncryptionKeyRef}
-		for _, backend := range checkedIn.Fallback.Backends {
-			refs = append(refs, backend.AccessKeyIDRef, backend.SecretAccessKeyRef, backend.SessionTokenRef)
-		}
-		for _, ref := range refs {
-			if ref != "" && !strings.HasPrefix(ref, "STORVIA_") {
-				t.Errorf("%s contains a credential value or non-standard reference %q; use an STORVIA_* environment reference", path, ref)
+
+		walkStrings(document, func(key, value string) {
+			if strings.HasSuffix(key, "_ref") {
+				t.Errorf("%s: field %q is a secret reference. Secrets belong in the environment "+
+					"and their names are a code convention; a checked-in config carries neither.", path, key)
 			}
+			if strings.Contains(key, "secret") || strings.Contains(key, "password") ||
+				strings.Contains(key, "access_key") || strings.Contains(key, "token") ||
+				strings.Contains(key, "encryption_key") {
+				t.Errorf("%s: field %q is secret-bearing and must not exist in a config file", path, key)
+			}
+			if value != "" && looksLikeCredential(value) {
+				t.Errorf("%s: %q holds a credential-shaped value", path, key)
+			}
+		})
+	}
+}
+
+// TestSecretEnvVarNamesAreCanonical checks the convention the code relies on.
+func TestSecretEnvVarNamesAreCanonical(t *testing.T) {
+	for _, name := range AllSecretEnvVars() {
+		if !strings.HasPrefix(name, "STORVIA_") {
+			t.Errorf("secret variable %q does not use the STORVIA_ prefix", name)
 		}
+		if !validEnvVarName(name) {
+			t.Errorf("secret variable %q is not a valid environment variable name", name)
+		}
+	}
+}
+
+// TestFallbackCredentialsAreChosenByVendor keeps an R2 backend from being pointed
+// at the AWS credentials.
+func TestFallbackCredentialsAreChosenByVendor(t *testing.T) {
+	env := map[string]string{
+		EnvSessionSigningKey:  "a-signing-key-long-enough-for-the-test",
+		EnvEncryptionKey:      strings.Repeat("a", 64),
+		EnvR2AccessKeyID:      "r2-id",
+		EnvR2SecretAccessKey:  "r2-secret",
+		EnvAWSAccessKeyID:     "aws-id",
+		EnvAWSSecretAccessKey: "aws-secret",
+	}
+
+	r2 := &Config{
+		Database: DatabaseConfig{Driver: DriverSQLite, SQLitePath: "file::memory:"},
+		Cache:    CacheConfig{Driver: DriverMemory},
+		Fallback: FallbackConfig{Enabled: true, Backends: []S3BackendConfig{
+			{ID: "r2", Vendor: VendorCloudflareR2, Bucket: "b"},
+		}},
+	}
+	resolved, err := r2.ResolveSecrets(lookupMap(env))
+	if err != nil {
+		t.Fatalf("r2 ResolveSecrets: %v", err)
+	}
+	if resolved[EnvR2AccessKeyID] != "r2-id" {
+		t.Error("an R2 backend must resolve the R2 credentials")
+	}
+	if _, present := resolved[EnvAWSAccessKeyID]; present {
+		t.Error("an R2 backend must not pull in the AWS credentials")
+	}
+
+	aws := &Config{
+		Database: DatabaseConfig{Driver: DriverSQLite, SQLitePath: "file::memory:"},
+		Cache:    CacheConfig{Driver: DriverMemory},
+		Fallback: FallbackConfig{Enabled: true, Backends: []S3BackendConfig{
+			{ID: "aws", Vendor: VendorAWSS3, Bucket: "b"},
+		}},
+	}
+	resolvedAWS, err := aws.ResolveSecrets(lookupMap(env))
+	if err != nil {
+		t.Fatalf("aws ResolveSecrets: %v", err)
+	}
+	if resolvedAWS[EnvAWSAccessKeyID] != "aws-id" {
+		t.Error("an AWS backend must resolve the AWS credentials")
+	}
+	if _, present := resolvedAWS[EnvR2AccessKeyID]; present {
+		t.Error("an AWS backend must not pull in the R2 credentials")
 	}
 }
 
@@ -521,10 +574,9 @@ func TestActiveBackendsSkipsDisabledAndIncomplete(t *testing.T) {
 	fallback := FallbackConfig{
 		Enabled: true,
 		Backends: []S3BackendConfig{
-			{ID: "ok", Vendor: VendorAWSS3, Bucket: "b", AccessKeyIDRef: "K"},
-			{ID: "disabled", Vendor: VendorAWSS3, Bucket: "b", AccessKeyIDRef: "K", Disabled: true},
-			{ID: "nobucket", Vendor: VendorAWSS3, AccessKeyIDRef: "K"},
-			{ID: "nocreds", Vendor: VendorAWSS3, Bucket: "b"},
+			{ID: "ok", Vendor: VendorAWSS3, Bucket: "b"},
+			{ID: "disabled", Vendor: VendorAWSS3, Bucket: "b", Disabled: true},
+			{ID: "nobucket", Vendor: VendorAWSS3},
 		},
 	}
 	active := fallback.ActiveBackends()

@@ -301,8 +301,17 @@ func (c *Client) availability(ctx context.Context, scope model.AvailabilityScope
 }
 
 // ConnectionID returns the Drive connection for a tenant, or "" when none exists.
+//
+// Having no Drive connection is an ordinary state for a tenant that has not connected
+// one yet, not a failure. Returning the repository's "no connection" error instead of an
+// empty ID made the coordinator's `connectionID == ""` branch unreachable, so a tenant
+// with no Drive grant got an internal error out of CreateUpload instead of a routing
+// decision.
 func (c *Client) ConnectionID(ctx context.Context, scope persistence.Scope) (string, error) {
 	connection, err := c.conns.Connection(ctx, scope)
+	if errors.Is(err, persistence.ErrNoConnection) {
+		return "", nil
+	}
 	if err != nil {
 		return "", err
 	}
@@ -313,8 +322,14 @@ func (c *Client) ConnectionID(ctx context.Context, scope persistence.Scope) (str
 }
 
 // ConnectionUsable reports whether the stored connection can be used now.
+//
+// A tenant with no connection is not usable, which is a routing input rather than an
+// error, for the same reason as ConnectionID.
 func (c *Client) ConnectionUsable(ctx context.Context, scope persistence.Scope) (bool, error) {
 	connection, err := c.conns.Connection(ctx, scope)
+	if errors.Is(err, persistence.ErrNoConnection) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}

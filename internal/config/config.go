@@ -91,10 +91,6 @@ type DatabaseConfig struct {
 	// SSLMode is passed through to the driver. Not a secret.
 	SSLMode string `json:"sslmode"`
 
-	// PasswordRef names the environment variable holding the Postgres password.
-	// It is a reference, never the password itself.
-	PasswordRef string `json:"password_ref"`
-
 	MaxOpenConns    int      `json:"max_open_conns"`
 	MaxIdleConns    int      `json:"max_idle_conns"`
 	ConnMaxLifetime Duration `json:"conn_max_lifetime"`
@@ -141,8 +137,7 @@ type CacheConfig struct {
 	Driver       string `json:"driver"`
 	RedisAddress string `json:"redis_address"`
 	// RedisPasswordRef names the environment variable holding the Redis password.
-	RedisPasswordRef string `json:"redis_password_ref"`
-	RedisDatabase    int    `json:"redis_database"`
+	RedisDatabase int `json:"redis_database"`
 
 	JanitorInterval   Duration `json:"janitor_interval"`
 	AvailabilityScope string   `json:"availability_scope"`
@@ -157,13 +152,9 @@ const (
 // AuthConfig controls application sign-in. Application identity is deliberately
 // separate from Google Drive authorization.
 type AuthConfig struct {
-	// SessionSigningKeyRef names the environment variable holding the HMAC key
-	// used to sign session tokens. The variable *name* is configuration and lives
-	// here; the key itself lives only in the environment.
-	SessionSigningKeyRef string   `json:"session_signing_key_ref"`
-	SessionCookieName    string   `json:"session_cookie_name"`
-	SessionTTL           Duration `json:"session_ttl"`
-	SecureCookie         bool     `json:"secure_cookie"`
+	SessionCookieName string   `json:"session_cookie_name"`
+	SessionTTL        Duration `json:"session_ttl"`
+	SecureCookie      bool     `json:"secure_cookie"`
 }
 
 // AdminPanelConfig controls the local development panel used to exercise the
@@ -189,8 +180,6 @@ type AdminPanelConfig struct {
 // SecurityConfig holds references to key material. Values arrive from the
 // environment and are never written back to a config file or a log.
 type SecurityConfig struct {
-	EncryptionKeyRef       string   `json:"encryption_key_ref"`
-	EncryptionKeyPrevious  string   `json:"encryption_key_previous_ref"`
 	AllowedOrigins         []string `json:"allowed_origins"`
 	AllowedEndpointSchemes []string `json:"allowed_endpoint_schemes"`
 	AllowedEndpointHosts   []string `json:"allowed_endpoint_hosts"`
@@ -247,8 +236,6 @@ func (u UploadsConfig) EffectiveMaxSize(category string) int64 {
 // Every secret is an environment reference. The narrow drive.file scope is the
 // only scope the MVP requests.
 type DriveConfig struct {
-	ClientIDRef       string   `json:"client_id_ref"`
-	ClientSecretRef   string   `json:"client_secret_ref"`
 	RedirectURI       string   `json:"redirect_uri"`
 	AdminRedirectURI  string   `json:"admin_redirect_uri"`
 	Scopes            []string `json:"scopes"`
@@ -275,18 +262,15 @@ type FallbackConfig struct {
 // the common S3 subset only. Endpoint and credentials are operator configuration,
 // which is what prevents a client from steering writes at an arbitrary host.
 type S3BackendConfig struct {
-	ID                 string   `json:"id"`
-	Vendor             string   `json:"vendor"`
-	Endpoint           string   `json:"endpoint"`
-	Region             string   `json:"region"`
-	Bucket             string   `json:"bucket"`
-	Prefix             string   `json:"prefix"`
-	AccessKeyIDRef     string   `json:"access_key_id_ref"`
-	SecretAccessKeyRef string   `json:"secret_access_key_ref"`
-	SessionTokenRef    string   `json:"session_token_ref"`
-	UsePathStyle       bool     `json:"use_path_style"`
-	Disabled           bool     `json:"disabled"`
-	MultipartAbortTTL  Duration `json:"multipart_abort_ttl"`
+	ID                string   `json:"id"`
+	Vendor            string   `json:"vendor"`
+	Endpoint          string   `json:"endpoint"`
+	Region            string   `json:"region"`
+	Bucket            string   `json:"bucket"`
+	Prefix            string   `json:"prefix"`
+	UsePathStyle      bool     `json:"use_path_style"`
+	Disabled          bool     `json:"disabled"`
+	MultipartAbortTTL Duration `json:"multipart_abort_ttl"`
 }
 
 // VendorCloudflareR2 and VendorAWSS3 are the vendors Storvia recognizes.
@@ -300,7 +284,7 @@ const (
 func (f FallbackConfig) ActiveBackends() []S3BackendConfig {
 	out := make([]S3BackendConfig, 0, len(f.Backends))
 	for _, b := range f.Backends {
-		if b.Disabled || b.Bucket == "" || b.AccessKeyIDRef == "" {
+		if b.Disabled || b.Bucket == "" {
 			continue
 		}
 		out = append(out, b)
@@ -438,9 +422,6 @@ func (c *Config) applyDefaults() {
 	if c.Cache.JanitorInterval == 0 {
 		c.Cache.JanitorInterval = Duration(time.Minute)
 	}
-	if c.Auth.SessionSigningKeyRef == "" {
-		c.Auth.SessionSigningKeyRef = "STORVIA_SESSION_SIGNING_KEY"
-	}
 	if c.Auth.SessionCookieName == "" {
 		c.Auth.SessionCookieName = "storvia_session"
 	}
@@ -570,10 +551,6 @@ func (c *Config) validateDatabase() error {
 		if c.Database.Database == "" {
 			return fmt.Errorf("config: database.database is required for the %s driver", DriverPostgres)
 		}
-		if c.Database.PasswordRef == "" {
-			return fmt.Errorf("config: database.password_ref is required for the %s driver; "+
-				"the password itself belongs in the environment, never in this file", DriverPostgres)
-		}
 		// A Postgres deployment with TLS off is a deployment mistake worth naming,
 		// because the DSN travels credentials across the wire.
 		if c.Database.SSLMode == "" || c.Database.SSLMode == "disable" {
@@ -661,9 +638,6 @@ func (c *Config) validateFallback() error {
 		if b.Bucket == "" {
 			return fmt.Errorf("config: fallback backend %q requires a bucket", b.ID)
 		}
-		if b.AccessKeyIDRef == "" || b.SecretAccessKeyRef == "" {
-			return fmt.Errorf("config: fallback backend %q requires credential references", b.ID)
-		}
 		if b.Endpoint != "" && !c.endpointAllowed(b.Endpoint) {
 			return fmt.Errorf("config: fallback backend %q endpoint is not permitted by security.allowed_endpoint_schemes/hosts", b.ID)
 		}
@@ -737,40 +711,43 @@ func (c *Config) validateUploads() error {
 // the tests all agree on what "secret" means instead of each keeping its own list.
 func (c *Config) SecretRefs() []SecretRef {
 	refs := []SecretRef{
-		{Field: "security.encryption_key", EnvVar: c.Security.EncryptionKeyRef, Required: true},
-		{Field: "auth.session_signing_key", EnvVar: c.Auth.SessionSigningKeyRef, Required: true},
-		{Field: "drive.client_id", EnvVar: c.Drive.ClientIDRef, Required: false},
-		{Field: "drive.client_secret", EnvVar: c.Drive.ClientSecretRef, Required: false},
+		{Field: "security.encryption_key", EnvVar: EnvEncryptionKey, Required: true},
+		{Field: "auth.session_signing_key", EnvVar: EnvSessionSigningKey, Required: true},
+		{Field: "drive.client_id", EnvVar: EnvGoogleClientID, Required: false},
+		{Field: "drive.client_secret", EnvVar: EnvGoogleClientSecret, Required: false},
+		{Field: "security.encryption_key_previous", EnvVar: EnvEncryptionKeyPrevious, Required: false},
 	}
-	if c.Security.EncryptionKeyPrevious != "" {
+	if c.Cache.Driver == DriverRedis {
 		refs = append(refs, SecretRef{
-			Field: "security.encryption_key_previous", EnvVar: c.Security.EncryptionKeyPrevious, Required: false,
-		})
-	}
-	if c.Cache.Driver == DriverRedis && c.Cache.RedisPasswordRef != "" {
-		refs = append(refs, SecretRef{
-			Field: "cache.redis_password", EnvVar: c.Cache.RedisPasswordRef, Required: false,
+			Field: "cache.redis_password", EnvVar: EnvRedisPassword, Required: false,
 		})
 	}
 	if c.Database.Driver == DriverPostgres {
 		refs = append(refs, SecretRef{
-			Field: "database.password", EnvVar: c.Database.PasswordRef, Required: true,
+			Field: "database.password", EnvVar: EnvDatabasePassword, Required: true,
 		})
 	}
 	for _, backend := range c.Fallback.Backends {
 		if backend.Disabled {
 			continue
 		}
+		// Credential variable names are chosen by the vendor, not by the backend
+		// identifier, so a deployment cannot point an R2 backend at the AWS
+		// credentials by mistake.
+		idVar, secretVar, tokenVar := EnvR2AccessKeyID, EnvR2SecretAccessKey, EnvR2SessionToken
+		if backend.Vendor == VendorAWSS3 {
+			idVar, secretVar, tokenVar = EnvAWSAccessKeyID, EnvAWSSecretAccessKey, ""
+		}
 		refs = append(refs,
 			SecretRef{Field: "fallback.backends[" + backend.ID + "].access_key_id",
-				EnvVar: backend.AccessKeyIDRef, Required: true},
+				EnvVar: idVar, Required: true},
 			SecretRef{Field: "fallback.backends[" + backend.ID + "].secret_access_key",
-				EnvVar: backend.SecretAccessKeyRef, Required: true},
+				EnvVar: secretVar, Required: true},
 		)
-		if backend.SessionTokenRef != "" {
+		if tokenVar != "" {
 			refs = append(refs, SecretRef{
 				Field:  "fallback.backends[" + backend.ID + "].session_token",
-				EnvVar: backend.SessionTokenRef, Required: false,
+				EnvVar: tokenVar, Required: false,
 			})
 		}
 	}
@@ -791,9 +768,11 @@ type SecretRef struct {
 
 // ValidateSecretRefs rejects a reference that is not an environment variable name.
 //
-// This is the guard that keeps the boundary honest. A developer who pastes an
-// actual AWS key into `access_key_id_ref` gets a startup error naming the field,
-// instead of a configuration that silently never authenticates.
+// This is the guard that keeps the boundary honest. A checked-in config file names no
+// secret at all, so the references come from the constants in secrets_names.go rather
+// than from configuration; this check is what stops a bad edit to that list, or a
+// reference that somehow resolves to itself, from turning into a configuration that
+// silently never authenticates.
 func ValidateSecretRefs(refs []SecretRef) error {
 	for _, ref := range refs {
 		if ref.EnvVar == "" {

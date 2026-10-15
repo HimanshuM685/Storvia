@@ -42,17 +42,17 @@ func TestShippedConfigFilesLoadAndValidate(t *testing.T) {
 			// SQLite needs no password; the signing key and encryption key are
 			// required for every deployment.
 			env: map[string]string{
-				"STORVIA_SESSION_SIGNING_KEY": "a-signing-key-long-enough-for-the-test",
-				"STORVIA_ENCRYPTION_KEY":      strings.Repeat("a", 64),
+				EnvSessionSigningKey: "a-signing-key-long-enough-for-the-test",
+				EnvEncryptionKey:     strings.Repeat("a", 64),
 			},
 		},
 		{
 			path: "config/config.production.json",
 			env: map[string]string{
-				"STORVIA_SESSION_SIGNING_KEY": "a-signing-key-long-enough-for-the-test",
-				"STORVIA_ENCRYPTION_KEY":      strings.Repeat("a", 64),
-				"STORVIA_DATABASE_PASSWORD":   "a-database-password",
-				"STORVIA_REDIS_PASSWORD":      "",
+				EnvSessionSigningKey: "a-signing-key-long-enough-for-the-test",
+				EnvEncryptionKey:     strings.Repeat("a", 64),
+				EnvDatabasePassword:  "a-database-password",
+				EnvRedisPassword:     "",
 			},
 		},
 	}
@@ -77,9 +77,9 @@ func TestShippedConfigFilesLoadAndValidate(t *testing.T) {
 // have exported.
 func TestShippedConfigFilesParseInIsolation(t *testing.T) {
 	env := map[string]string{
-		"STORVIA_SESSION_SIGNING_KEY": "a-signing-key-long-enough-for-the-test",
-		"STORVIA_ENCRYPTION_KEY":      strings.Repeat("a", 64),
-		"STORVIA_DATABASE_PASSWORD":   "a-database-password",
+		EnvSessionSigningKey: "a-signing-key-long-enough-for-the-test",
+		EnvEncryptionKey:     strings.Repeat("a", 64),
+		EnvDatabasePassword:  "a-database-password",
 	}
 
 	for _, name := range []string{"config.development.json", "config.production.json"} {
@@ -115,11 +115,15 @@ func TestShippedConfigContainsNoCredentials(t *testing.T) {
 					t.Errorf("%s: %q holds something shaped like a credential; "+
 						"secrets belong in the environment, never in a JSON config file", key, value)
 				}
-				// A secret-bearing field must name a variable, not hold a value.
+				// A secret-bearing field has no legitimate form in a checked-in
+				// config. Not even a reference to one: the variable names are a
+				// code convention, so the file has no business naming any.
 				isSecretField := strings.Contains(key, "password") ||
-					strings.Contains(key, "secret") || strings.Contains(key, "token")
-				if isSecretField && !strings.HasSuffix(key, "_ref") {
-					t.Errorf("%s: field %q is secret-bearing but not a reference", name, key)
+					strings.Contains(key, "secret") || strings.Contains(key, "token") ||
+					strings.Contains(key, "access_key")
+				if isSecretField {
+					t.Errorf("%s: field %q is secret-bearing. A checked-in config carries "+
+						"ordinary settings only; secrets live in the ignored environment.", name, key)
 				}
 			})
 		})
@@ -138,7 +142,8 @@ func TestShippedConfigContainsNoEnvironmentSubstitution(t *testing.T) {
 			raw := readRepoFile(t, "config", name)
 			if strings.Contains(raw, "${") {
 				t.Errorf("%s uses ${VAR} substitution. Ordinary settings belong in this file as "+
-					"plain values; only a *_ref field names an environment variable.", name)
+					"plain values and secrets belong in the ignored environment file; "+
+					"nothing in a checked-in config comes from the environment.", name)
 			}
 		})
 	}
@@ -152,7 +157,7 @@ func TestEverySecretRefIsDocumentedInEnvExample(t *testing.T) {
 	envExample := readRepoFile(t, ".env.example")
 	documented := envNamesIn(envExample)
 
-	for _, ref := range refsInShippedConfigs(t) {
+	for _, ref := range AllSecretEnvVars() {
 		found := false
 		for _, name := range documented {
 			if name == ref {
@@ -161,7 +166,7 @@ func TestEverySecretRefIsDocumentedInEnvExample(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Errorf("environment variable %q is referenced by a config file but not documented in .env.example", ref)
+			t.Errorf("environment variable %q is required by the code but not documented in .env.example", ref)
 		}
 	}
 }
@@ -177,7 +182,7 @@ func TestEnvExampleHasNoOrphanVariables(t *testing.T) {
 	composeOnly := map[string]bool{"POSTGRES_PASSWORD": true}
 
 	referenced := make(map[string]bool)
-	for _, ref := range refsInShippedConfigs(t) {
+	for _, ref := range AllSecretEnvVars() {
 		referenced[ref] = true
 	}
 
@@ -185,7 +190,7 @@ func TestEnvExampleHasNoOrphanVariables(t *testing.T) {
 		if referenced[name] || composeOnly[name] {
 			continue
 		}
-		t.Errorf(".env.example documents %q but no config file references it", name)
+		t.Errorf(".env.example documents %q but no code reads it", name)
 	}
 }
 
@@ -214,28 +219,6 @@ func envNamesIn(content string) []string {
 		if len(match) > 1 {
 			out = append(out, match[1])
 		}
-	}
-	return out
-}
-
-// refsInShippedConfigs collects every *_ref value from both shipped config files.
-func refsInShippedConfigs(t *testing.T) []string {
-	t.Helper()
-	var out []string
-	seen := make(map[string]bool)
-
-	for _, name := range []string{"config.development.json", "config.production.json"} {
-		raw := readRepoFile(t, "config", name)
-		var parsed map[string]any
-		if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-			t.Fatalf("%s is not valid JSON: %v", name, err)
-		}
-		walkStrings(parsed, func(key, value string) {
-			if strings.HasSuffix(key, "_ref") && value != "" && !seen[value] {
-				seen[value] = true
-				out = append(out, value)
-			}
-		})
 	}
 	return out
 }
@@ -269,9 +252,9 @@ func walkStrings(node any, visit func(key, value string)) {
 // catches a field removed from the struct but left behind in a JSON file.
 func TestNoDeadConfigFieldsInShippedFiles(t *testing.T) {
 	env := map[string]string{
-		"STORVIA_SESSION_SIGNING_KEY": "a-signing-key-long-enough-for-the-test",
-		"STORVIA_ENCRYPTION_KEY":      strings.Repeat("a", 64),
-		"STORVIA_DATABASE_PASSWORD":   "a-database-password",
+		EnvSessionSigningKey: "a-signing-key-long-enough-for-the-test",
+		EnvEncryptionKey:     strings.Repeat("a", 64),
+		EnvDatabasePassword:  "a-database-password",
 	}
 
 	for _, name := range []string{"config.development.json", "config.production.json"} {

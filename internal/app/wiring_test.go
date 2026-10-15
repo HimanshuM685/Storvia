@@ -63,8 +63,7 @@ func TestConfigRefusesFaultInjectionOutsideDevelopment(t *testing.T) {
       "environment": "production",
       "database": {"driver": "sqlite", "sqlite_path": "file::memory:"},
       "cache": {"driver": "memory"},
-      "drive": {"client_id_ref": "ID", "client_secret_ref": "SECRET",
-                "scopes": ["https://www.googleapis.com/auth/drive.file"]},
+      "drive": {"scopes": ["https://www.googleapis.com/auth/drive.file"]},
       "fallback": {"enabled": false},
       "uploads": {"max_file_size_bytes": 1024,
                   "allowed_mime_types": ["application/pdf"],
@@ -78,14 +77,6 @@ func TestConfigRefusesFaultInjectionOutsideDevelopment(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "simulate_drive_outage") {
 		t.Errorf("error = %v, want it to name the offending field", err)
-	}
-}
-
-// TestBuildWiresTheFallbackUploader checks that a configured backend produces a
-// usable adapter and that no backend produces none.
-func TestBuildWiresTheFallbackUploader(t *testing.T) {
-	if uploader := newFallbackUploader(nil, 8<<20, 0); uploader != nil {
-		t.Error("no backends must produce a nil uploader so completion reports provider_not_configured")
 	}
 }
 

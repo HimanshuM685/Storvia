@@ -22,6 +22,7 @@ type Config struct {
 	Uploads     *UploadHandler
 	Objects     *ObjectHandler
 	Connections *ConnectionHandler
+	Consent     *ConsentHandler
 	Admin       *AdminHandler
 	Health      *HealthHandler
 
@@ -73,6 +74,9 @@ func Router(cfg Config) http.Handler {
 
 	metadataRoutes := map[string]http.HandlerFunc{
 		"GET /v1/storage/status":                          cfg.Uploads.Status,
+		"GET /v1/storage/fallback/consent":                cfg.Consent.Show,
+		"POST /v1/storage/fallback/consent":               cfg.Consent.Accept,
+		"DELETE /v1/storage/fallback/consent":             cfg.Consent.Withdraw,
 		"GET /v1/storage/connections/google-drive":        cfg.Connections.Show,
 		"POST /v1/storage/connections/google-drive/start": cfg.Connections.Start,
 		"DELETE /v1/storage/connections/google-drive":     cfg.Connections.Disconnect,

@@ -318,7 +318,6 @@ func TestCreateUploadSelectsFallbackOnlyOnAnEligibleOutage(t *testing.T) {
 					Enabled: tc.backend,
 					Backends: []config.S3BackendConfig{{
 						ID: "b1", Vendor: config.VendorCloudflareR2, Bucket: "bucket",
-						AccessKeyIDRef: "K", SecretAccessKeyRef: "S",
 					}},
 				}
 				deps.FallbackConsent = func(context.Context, persistence.Scope) (bool, error) {
@@ -711,7 +710,6 @@ func TestFallbackConsentLookupFailureIsTreatedAsNoConsent(t *testing.T) {
 			Enabled: true,
 			Backends: []config.S3BackendConfig{{
 				ID: "b1", Vendor: config.VendorCloudflareR2, Bucket: "bucket",
-				AccessKeyIDRef: "K", SecretAccessKeyRef: "S",
 			}},
 		}
 		deps.FallbackConsent = func(context.Context, persistence.Scope) (bool, error) {

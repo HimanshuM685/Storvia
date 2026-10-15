@@ -25,7 +25,6 @@
     "user": "storvia",
     "database": "storvia",
     "sslmode": "require",
-    "password_ref": "STORVIA_DATABASE_PASSWORD",
     "max_open_conns": 25,
     "max_idle_conns": 10,
     "conn_max_lifetime": "30m",
@@ -36,11 +35,9 @@
     "driver": "redis",
     "redis_address": "redis:6379",
     "redis_database": 0,
-    "janitor_interval": "1m",
-    "redis_password_ref": "STORVIA_REDIS_PASSWORD"
+    "janitor_interval": "1m"
   },
   "auth": {
-    "session_signing_key_ref": "STORVIA_SESSION_SIGNING_KEY",
     "session_cookie_name": "storvia_session",
     "session_ttl": "12h",
     "secure_cookie": true
@@ -52,8 +49,6 @@
     "flow_cookie": "storvia_admin_flow"
   },
   "security": {
-    "encryption_key_ref": "STORVIA_ENCRYPTION_KEY",
-    "encryption_key_previous_ref": "STORVIA_ENCRYPTION_KEY_PREVIOUS",
     "allowed_origins": [],
     "allowed_endpoint_schemes": [
       "https"
@@ -87,8 +82,6 @@
     }
   },
   "drive": {
-    "client_id_ref": "STORVIA_GOOGLE_CLIENT_ID",
-    "client_secret_ref": "STORVIA_GOOGLE_CLIENT_SECRET",
     "redirect_uri": "https://api.storvia.example/v1/storage/connections/google-drive/callback",
     "admin_redirect_uri": "",
     "scopes": [
@@ -112,9 +105,6 @@
         "region": "auto",
         "bucket": "storvia-fallback",
         "prefix": "prod",
-        "access_key_id_ref": "STORVIA_R2_ACCESS_KEY_ID",
-        "secret_access_key_ref": "STORVIA_R2_SECRET_ACCESS_KEY",
-        "session_token_ref": "STORVIA_R2_SESSION_TOKEN",
         "use_path_style": true,
         "disabled": true,
         "multipart_abort_ttl": "24h"

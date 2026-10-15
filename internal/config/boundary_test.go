@@ -148,28 +148,28 @@ func TestValidateSecretRefsRequiresAReferenceWhenRequired(t *testing.T) {
 func TestResolveSecretsFailsFastOnAMissingSecret(t *testing.T) {
 	cfg := &Config{
 		Environment: "test",
-		Database:    DatabaseConfig{Driver: DriverPostgres, Host: "h", Port: 5432, User: "u", Database: "d", PasswordRef: "DB_PASSWORD", SSLMode: "require"},
-		Auth:        AuthConfig{SessionSigningKeyRef: "SESSION_KEY"},
-		Security:    SecurityConfig{EncryptionKeyRef: "ENC_KEY"},
+		Database:    DatabaseConfig{Driver: DriverPostgres, Host: "h", Port: 5432, User: "u", Database: "d", SSLMode: "require"},
+		Auth:        AuthConfig{},
+		Security:    SecurityConfig{},
 	}
 
 	// All present: resolves cleanly.
 	resolved, err := cfg.ResolveSecrets(lookupMap(map[string]string{
-		"DB_PASSWORD": "dbpass",
-		"SESSION_KEY": "signing-key-that-is-long-enough-here",
-		"ENC_KEY":     strings.Repeat("a", 32),
+		EnvDatabasePassword:  "dbpass",
+		EnvSessionSigningKey: "signing-key-that-is-long-enough-here",
+		EnvEncryptionKey:     strings.Repeat("a", 32),
 	}))
 	if err != nil {
 		t.Fatalf("ResolveSecrets: %v", err)
 	}
-	if resolved["DB_PASSWORD"] != "dbpass" {
-		t.Errorf("DB_PASSWORD = %q, want the resolved value", resolved["DB_PASSWORD"])
+	if resolved[EnvDatabasePassword] != "dbpass" {
+		t.Errorf("DB_PASSWORD = %q, want the resolved value", resolved[EnvDatabasePassword])
 	}
 
 	// Database password missing: must fail, and name the field.
 	_, err = cfg.ResolveSecrets(lookupMap(map[string]string{
-		"SESSION_KEY": "signing-key-that-is-long-enough-here",
-		"ENC_KEY":     strings.Repeat("a", 32),
+		EnvSessionSigningKey: "signing-key-that-is-long-enough-here",
+		EnvEncryptionKey:     strings.Repeat("a", 32),
 	}))
 	if err == nil {
 		t.Fatal("a missing required database password must fail startup")
@@ -180,8 +180,8 @@ func TestResolveSecretsFailsFastOnAMissingSecret(t *testing.T) {
 
 	// An empty string counts as missing, not as an empty credential.
 	_, err = cfg.ResolveSecrets(lookupMap(map[string]string{
-		"DB_PASSWORD": "", "SESSION_KEY": "signing-key-that-is-long-enough-here",
-		"ENC_KEY": strings.Repeat("a", 32),
+		EnvDatabasePassword: "", EnvSessionSigningKey: "signing-key-that-is-long-enough-here",
+		EnvEncryptionKey: strings.Repeat("a", 32),
 	}))
 	if err == nil {
 		t.Fatal("an empty secret value must be treated as missing")
@@ -195,28 +195,28 @@ func TestResolveSecretsOnlyRequiresWhatIsEnabled(t *testing.T) {
 		return &Config{
 			Environment: "test",
 			Database:    DatabaseConfig{Driver: DriverSQLite, SQLitePath: "file::memory:"},
-			Auth:        AuthConfig{SessionSigningKeyRef: "SESSION_KEY"},
-			Security:    SecurityConfig{EncryptionKeyRef: "ENC_KEY"},
-			Drive:       DriveConfig{ClientIDRef: "GOOGLE_ID", ClientSecretRef: "GOOGLE_SECRET"},
+			Auth:        AuthConfig{},
+			Security:    SecurityConfig{},
+			Drive:       DriveConfig{},
 			Cache:       CacheConfig{Driver: DriverMemory},
 		}
 	}
 
 	// Google credentials absent is fine: the service starts and reports it.
 	if _, err := base().ResolveSecrets(lookupMap(map[string]string{
-		"SESSION_KEY": "signing-key-that-is-long-enough-here",
-		"ENC_KEY":     strings.Repeat("a", 32),
+		EnvSessionSigningKey: "signing-key-that-is-long-enough-here",
+		EnvEncryptionKey:     strings.Repeat("a", 32),
 	})); err != nil {
 		t.Errorf("absent optional Google credentials must not fail startup: %v", err)
 	}
 
 	// Redis enabled with a password reference means the password is required.
 	withRedis := base()
-	withRedis.Cache = CacheConfig{Driver: DriverRedis, RedisAddress: "localhost:6379", RedisPasswordRef: "REDIS_PASSWORD"}
+	withRedis.Cache = CacheConfig{Driver: DriverRedis, RedisAddress: "localhost:6379"}
 	if _, err := withRedis.ResolveSecrets(lookupMap(map[string]string{
-		"SESSION_KEY":    "signing-key-that-is-long-enough-here",
-		"ENC_KEY":        strings.Repeat("a", 32),
-		"REDIS_PASSWORD": "redis-pass",
+		EnvSessionSigningKey: "signing-key-that-is-long-enough-here",
+		EnvEncryptionKey:     strings.Repeat("a", 32),
+		EnvRedisPassword:     "redis-pass",
 	})); err != nil {
 		t.Errorf("a resolved Redis password must not fail: %v", err)
 	}
@@ -227,12 +227,11 @@ func TestResolveSecretsOnlyRequiresWhatIsEnabled(t *testing.T) {
 		Enabled: true,
 		Backends: []S3BackendConfig{{
 			ID: "b1", Vendor: VendorCloudflareR2, Bucket: "bucket",
-			AccessKeyIDRef: "S3_ID", SecretAccessKeyRef: "S3_SECRET",
 		}},
 	}
 	_, err := withFallback.ResolveSecrets(lookupMap(map[string]string{
-		"SESSION_KEY": "signing-key-that-is-long-enough-here",
-		"ENC_KEY":     strings.Repeat("a", 32),
+		EnvSessionSigningKey: "signing-key-that-is-long-enough-here",
+		EnvEncryptionKey:     strings.Repeat("a", 32),
 	}))
 	if err == nil {
 		t.Fatal("an enabled backend with absent credentials must fail startup")
@@ -245,11 +244,11 @@ func TestResolveSecretsOnlyRequiresWhatIsEnabled(t *testing.T) {
 	disabled := base()
 	disabled.Fallback = FallbackConfig{
 		Enabled:  true,
-		Backends: []S3BackendConfig{{ID: "b1", Vendor: VendorCloudflareR2, Bucket: "b", Disabled: true, AccessKeyIDRef: "S3_ID", SecretAccessKeyRef: "S3_SECRET"}},
+		Backends: []S3BackendConfig{{ID: "b1", Vendor: VendorCloudflareR2, Bucket: "b", Disabled: true}},
 	}
 	if _, err := disabled.ResolveSecrets(lookupMap(map[string]string{
-		"SESSION_KEY": "signing-key-that-is-long-enough-here",
-		"ENC_KEY":     strings.Repeat("a", 32),
+		EnvSessionSigningKey: "signing-key-that-is-long-enough-here",
+		EnvEncryptionKey:     strings.Repeat("a", 32),
 	})); err != nil {
 		t.Errorf("a disabled backend must not require credentials: %v", err)
 	}
@@ -259,10 +258,10 @@ func TestResolveSecretsOnlyRequiresWhatIsEnabled(t *testing.T) {
 // resolution list from drifting apart.
 func TestSecretFieldsTracksTheSameReferences(t *testing.T) {
 	cfg := &Config{
-		Database: DatabaseConfig{Driver: DriverPostgres, Host: "h", Port: 5432, User: "u", Database: "d", PasswordRef: "DB_PASSWORD"},
-		Auth:     AuthConfig{SessionSigningKeyRef: "SESSION_KEY"},
-		Security: SecurityConfig{EncryptionKeyRef: "ENC_KEY", EncryptionKeyPrevious: "ENC_KEY_PREV"},
-		Cache:    CacheConfig{Driver: DriverRedis, RedisAddress: "a", RedisPasswordRef: "REDIS_PASSWORD"},
+		Database: DatabaseConfig{Driver: DriverPostgres, Host: "h", Port: 5432, User: "u", Database: "d", SSLMode: "require"},
+		Auth:     AuthConfig{},
+		Security: SecurityConfig{},
+		Cache:    CacheConfig{Driver: DriverRedis, RedisAddress: "a"},
 	}
 
 	refs := cfg.SecretRefs()
@@ -287,10 +286,10 @@ func TestSecretFieldsTracksTheSameReferences(t *testing.T) {
 func TestPostgresRequiresTLSInProduction(t *testing.T) {
 	raw := strings.Replace(minimalConfig(), `"driver": "sqlite", "sqlite_path": "file::memory:"`,
 		`"driver": "postgres", "host": "db", "port": 5432, "user": "storvia",
-         "database": "storvia", "password_ref": "DB_PASSWORD", "sslmode": "disable"`, 1)
+         "database": "storvia", "sslmode": "disable"`, 1)
 	raw = strings.Replace(raw, `"environment": "test"`, `"environment": "production"`, 1)
 
-	_, err := Parse([]byte(raw), lookupMap(map[string]string{"DB_PASSWORD": "pass"}))
+	_, err := Parse([]byte(raw), lookupMap(map[string]string{EnvDatabasePassword: "pass"}))
 	if err == nil {
 		t.Fatal("a production Postgres deployment with sslmode=disable must be rejected")
 	}
@@ -310,16 +309,15 @@ func TestPostgresRequiresEveryOrdinaryParameter(t *testing.T) {
 		{"no host", `"host": "db",`, "database.host"},
 		{"no user", `"user": "storvia",`, "database.user"},
 		{"no database", `"database": "storvia",`, "database.database"},
-		{"no password ref", `"password_ref": "DB_PASSWORD",`, "database.password_ref"},
 	}
 	full := `"driver": "postgres", "host": "db", "port": 5432, "user": "storvia",
-         "database": "storvia", "password_ref": "DB_PASSWORD", "sslmode": "require"`
+         "database": "storvia", "sslmode": "require"`
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			raw := strings.Replace(minimalConfig(), `"driver": "sqlite", "sqlite_path": "file::memory:"`, full, 1)
 			raw = strings.Replace(raw, tc.drop, "", 1)
-			_, err := Parse([]byte(raw), lookupMap(map[string]string{"DB_PASSWORD": "pass"}))
+			_, err := Parse([]byte(raw), lookupMap(map[string]string{EnvDatabasePassword: "pass"}))
 			if err == nil {
 				t.Fatal("want an error")
 			}
@@ -327,18 +325,6 @@ func TestPostgresRequiresEveryOrdinaryParameter(t *testing.T) {
 				t.Errorf("error = %v, want it to mention %q", err, tc.wantErr)
 			}
 		})
-	}
-}
-
-// TestAuthSigningKeyRefDefaults documents the default while keeping the variable
-// name in configuration rather than hardcoded in Go.
-func TestAuthSigningKeyRefDefaults(t *testing.T) {
-	cfg, err := Parse([]byte(minimalConfig()), lookupMap(nil))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if cfg.Auth.SessionSigningKeyRef != "STORVIA_SESSION_SIGNING_KEY" {
-		t.Errorf("SessionSigningKeyRef = %q, want the documented default", cfg.Auth.SessionSigningKeyRef)
 	}
 }
 
