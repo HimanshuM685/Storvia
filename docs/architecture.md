@@ -223,7 +223,15 @@ type Router interface {
 
 The Go service owns policy, transitions, idempotency, and tenant checks. Providers own HTTP details, OAuth token use, signing, status parsing, and provider-specific error normalization. Provider adapters must never update application rows directly.
 
-The initial implementation may expose Drive and S3/R2 through different upload mechanics behind the same service: backend-proxied Drive chunks and short-lived presigned/multipart S3 requests. Do not force both providers into a misleading common resumable protocol.
+The implementation exposes Drive and S3/R2 through **different** upload mechanics behind the same service: a Drive resumable session URI relayed to the client, and short-lived presigned/multipart URLs for the fallback. Do not force both providers into a misleading common resumable protocol.
+
+Both are **direct to provider**. No file bytes pass through the Storvia API. The
+`Provider` interface above is the original proposal and was deliberately not adopted
+verbatim: a single `UploadChunk` would have implied a proxy path, which a session-based
+transfer cannot support because the server holds no copy of the bytes. The implemented
+split is `DriveSessionPort` (create a session, read back verified metadata) and
+`FallbackUploader` (plan presigned capabilities, verify), with the coordinator owning
+every decision between them.
 
 ## 5. HTTP API proposal
 
@@ -238,7 +246,6 @@ DELETE /v1/storage/connections/google-drive
 
 POST   /v1/storage/uploads
 GET    /v1/storage/uploads/{upload_id}
-PATCH  /v1/storage/uploads/{upload_id}/chunks
 POST   /v1/storage/uploads/{upload_id}/complete
 POST   /v1/storage/uploads/{upload_id}/reconcile
 DELETE /v1/storage/uploads/{upload_id}
@@ -252,7 +259,7 @@ Rules:
 
 - All object/upload identifiers are opaque application IDs. Never accept provider IDs, bucket keys, or a client-selected provider as authority claims.
 - `POST /uploads` requires a stable `Idempotency-Key`, immutable metadata, tenant authorization, and configured fallback consent.
-- The response identifies the selected mode (`drive_proxy`, `s3_presigned_parts`, or a safe future mode) without returning refresh tokens, S3 credentials, or Drive session URLs through list/detail endpoints.
+- The response identifies the selected mode (`drive_resumable_session` or `s3_presigned_parts`) without returning refresh tokens or S3 credentials through list/detail endpoints. A Drive session URL is returned once, in the create response only, and is never persisted. without returning refresh tokens or S3 credentials through list/detail endpoints. A Drive session URL is returned once, in the create response only, and is never persisted.
 - A fallback selection response is a new upload attempt for the same logical object; it is not a second ready object.
 - `complete` is idempotent. Repeating it returns the existing verified object or its current pending/unknown status.
 - `reconcile` is authenticated and rate-limited. It checks only the selected provider and updates `outcome_unknown`; it does not create a second location.
@@ -287,11 +294,18 @@ The preflight result is not a lease on Drive. If Drive fails after initiation st
 ### Drive path
 
 1. Create or find the app folder using the stored ID and explicit recovery policy.
-2. Start a Drive resumable upload with server-generated metadata.
-3. Store the session URI encrypted, with expiry and attempt generation.
-4. Proxy chunks in the first MVP so the session URI stays server-side.
-5. On each response, use Drive's confirmed `Range`; after an ambiguous response, query session status before sending more bytes.
-6. On final success, inspect the returned file ID/size/MIME, then commit one `ready` location.
+2. Start a Drive resumable upload with server-generated metadata, parented to the app folder.
+3. **Relay the session URI to the client once and store nothing.** This step deviates
+   from the original plan, which stored the session encrypted. A Drive session URI is a
+   write capability for the file: persisting it so it survives a restart would mean
+   holding that capability at rest. The cost is real and is accepted — an interrupted
+   Drive upload cannot be resumed by Storvia, and reconciliation reports `unknown`
+   rather than guessing.
+4. The client `PUT`s each chunk with its own `Content-Range`; Storvia sees no bytes.
+5. The client reports the file ID Google returned at completion. **That ID is untrusted
+   input** and is treated as a lookup key: Storvia re-reads the file and adopts it only
+   if it is inside the app folder, is not trashed, and has the declared size.
+6. On success, commit one `ready` location.
 
 ### S3-compatible fallback path
 

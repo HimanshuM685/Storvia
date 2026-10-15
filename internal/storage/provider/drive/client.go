@@ -40,13 +40,33 @@ const ScopeDriveFile = "https://www.googleapis.com/auth/drive.file"
 // Google OAuth and Drive endpoints. They are constants rather than configuration
 // because a client must not be able to redirect an authorization code to an
 // operator-chosen host.
+//
+// Google splits its OAuth web endpoints across two hosts, and the split is not
+// obvious: the authorization endpoint is NOT under oauth2.googleapis.com.
+//
+//	oauth2.googleapis.com/token          - exchanging the code for tokens
+//	oauth2.googleapis.com/revoke         - revoking a token
+//	accounts.google.com/o/oauth2/v2/auth - sending the user to consent
+//
+// Deriving all three from one base looks tidier and is wrong: it yields
+// oauth2.googleapis.com/auth, which is not a route. Google answers it with a 404,
+// so the browser lands on an error page and the whole thing looks like a
+// configuration problem rather than a wrong constant. The two hosts are kept
+// separate here so the next reader does not "tidy" them back together.
 const (
-	authBase       = "https://oauth2.googleapis.com"
-	tokenEndpoint  = authBase + "/token"
-	authorizeURL   = authBase + "/auth"
-	revokeEndpoint = authBase + "/revoke"
+	oauthAPIBase   = "https://oauth2.googleapis.com"
+	googleAccounts = "https://accounts.google.com"
+
+	tokenEndpoint  = oauthAPIBase + "/token"
+	revokeEndpoint = oauthAPIBase + "/revoke"
+	authorizeURL   = googleAccounts + "/o/oauth2/v2/auth"
+
 	driveFilesURL  = "https://www.googleapis.com/drive/v3/files"
 	driveUploadURL = "https://www.googleapis.com/upload/drive/v3/files"
+	// driveAboutURL reports the authenticated user. It is its own constant because
+	// it is NOT under /files — appending "about" to driveFilesURL would produce
+	// /drive/v3/files/about, which is not a route.
+	driveAboutURL = "https://www.googleapis.com/drive/v3/about"
 )
 
 // Credentials are the Google OAuth client credentials, resolved from the
@@ -504,11 +524,37 @@ func hashSecret(value string) []byte {
 // scopesParam renders the scope list for an authorize URL.
 func scopesParam(scopes []string) string { return strings.Join(scopes, " ") }
 
-// parseFormURL decodes a token endpoint response body.
-func parseFormURL(body []byte) (url.Values, error) {
+// parseTokenResponse decodes a token endpoint response body.
+//
+// Google answers the token endpoint with `application/json`, not the
+// form-encoding RFC 6749 permits. Parsing it as a query string yields an empty value
+// set, so every exchange failed with "the token response contained no access token"
+// even though the token was in the body in plain sight.
+//
+// JSON is tried first because that is what Google actually sends. The form fallback is
+// kept because the spec allows it and a future provider might use it; it costs three
+// lines and removes a class of surprise.
+func parseTokenResponse(body []byte) (url.Values, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err == nil {
+		values := url.Values{}
+		for key, value := range payload {
+			switch typed := value.(type) {
+			case string:
+				values.Set(key, typed)
+			case float64, bool:
+				values.Set(key, fmt.Sprintf("%v", typed))
+			default:
+				// Anything structured is not a scalar a token response carries.
+				continue
+			}
+		}
+		return values, nil
+	}
+
 	values, err := url.ParseQuery(string(body))
 	if err != nil {
-		return nil, fmt.Errorf("drive: parse token response: %w", err)
+		return nil, fmt.Errorf("drive: the token response was neither json nor form encoded")
 	}
 	return values, nil
 }

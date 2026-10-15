@@ -80,7 +80,7 @@ describe('createUpload', () => {
           JSON.stringify({
             upload_id: 'upl_1',
             object_id: 'obj_1',
-            mode: 'drive_proxy',
+            mode: 'drive_resumable_session',
             provider: 'google_drive',
             state: 'uploading',
             chunk_size: 8388608,
@@ -99,7 +99,7 @@ describe('createUpload', () => {
     const headers = calls[0]?.init.headers as Record<string, string>;
     assert.equal(headers['Idempotency-Key'], 'stable-key-1');
     assert.equal(headers['Authorization'], 'Bearer test-token');
-    assert.equal(result.mode, 'drive_proxy');
+    assert.equal(result.mode, 'drive_resumable_session');
     assert.equal(result.provider, 'google_drive');
   });
 
@@ -355,72 +355,170 @@ describe('download', () => {
 });
 
 describe('upload helper', () => {
-  it('streams chunks and resumes from the server-confirmed offset', async () => {
-    const sentChunks: number[] = [];
-    let offset = 0;
+  it('streams a Drive resumable session and completes with the returned file id', async () => {
+    const ranges: string[] = [];
+    const chunkSize = 60;
+    const size = 100;
+    let driveFileId = '';
+    let completeBody: unknown;
 
-    const { client } = stubClient((url, init) => {
-      const method = init.method ?? 'GET';
-      // Route on the path: the complete call is a POST without its own path
-      // distinction, so the URL is what separates create from complete.
-      if (method === 'PATCH') {
-        const body = init.body as Blob;
-        sentChunks.push(body.size);
-        offset += body.size;
+    // Stand in for Google's resumable endpoint.
+    const sessionUrl = 'https://www.googleapis.com/upload/drive/v3/files?upload_id=s1';
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+
+      if (url === sessionUrl) {
+        const body = init?.body as Blob;
+        ranges.push(headers['Content-Range']);
+        // The chunk that reaches the end of the file returns the created resource;
+        // earlier ones ask for more.
+        if (headers['Content-Range'].endsWith(`/${size}`)) {
+          return new Response(JSON.stringify({ id: 'file-1', name: 'a.bin' }), { status: 200 });
+        }
+        return new Response(null, { status: 308 });
+      }
+
+      if (url.endsWith('/complete')) {
+        completeBody = JSON.parse(String(init?.body ?? '{}'));
         return new Response(
           JSON.stringify({
-            upload_id: 'upl_1',
-            object_id: 'obj_1',
-            state: 'uploading',
-            provider: 'google_drive',
-            uploaded_bytes: offset,
-            expected_bytes: 100,
-            attempt_state: 'active',
-            mutation_may_have_started: true,
-            created_at: '',
-            updated_at: '',
+            object: {
+              object_id: 'obj_1',
+              name: 'a.bin',
+              mime_type: 'application/octet-stream',
+              size_bytes: size,
+              status: 'ready',
+              provider: 'google_drive',
+              category: 'report',
+              created_at: '',
+            },
+            already_complete: false,
           }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } },
+          { status: 201, headers: { 'Content-Type': 'application/json' } },
         );
       }
-      if (url.endsWith('/complete')) {
-        return new Response(
-          JSON.stringify({
-            object_id: 'obj_1',
-            name: 'a.bin',
-            mime_type: 'application/octet-stream',
-            size_bytes: 100,
-            status: 'ready',
-            provider: 'google_drive',
-            category: 'report',
-            created_at: '',
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } },
-        );
+
+      return new Response(
+        JSON.stringify({
+          upload_id: 'upl_1',
+          object_id: 'obj_1',
+          mode: 'drive_resumable_session',
+          provider: 'google_drive',
+          state: 'uploading',
+          chunk_size: chunkSize,
+          uploaded_bytes: 0,
+          replayed: false,
+          session: { url: sessionUrl, chunk_size: chunkSize, expires_at: '' },
+        }),
+        { status: 201, headers: { 'Content-Type': 'application/json' } },
+      );
+    }) as typeof fetch;
+
+    const client = new StorviaClient({ baseUrl: 'https://storvia.test' });
+    const { object } = await client.upload(
+      { name: 'a.bin', mime_type: 'application/octet-stream', size_bytes: size, category: 'report' },
+      new Blob([new Uint8Array(size)]),
+      { idempotencyKey: 'k' },
+    );
+
+    // Every chunk must declare its byte range, or a retry corrupts the file.
+    assert.deepEqual(ranges, ['bytes 0-59/100', 'bytes 60-99/100']);
+    assert.equal(object.status, 'ready');
+
+    // Completion must carry the id Google returned, because Storvia does not keep
+    // the session and cannot learn it another way.
+    assert.deepEqual(completeBody, { drive_file_id: 'file-1' });
+  });
+
+  it('refuses to complete a Drive upload that produced no file id', async () => {
+    const sessionUrl = 'https://www.googleapis.com/upload/drive/v3/files?upload_id=s2';
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === sessionUrl) {
+        // 308 all the way through: the file never completes.
+        return new Response(null, { status: 308 });
       }
       return new Response(
         JSON.stringify({
           upload_id: 'upl_1',
           object_id: 'obj_1',
-          mode: 'drive_proxy',
+          mode: 'drive_resumable_session',
           provider: 'google_drive',
           state: 'uploading',
-          chunk_size: 60,
+          chunk_size: 100,
           uploaded_bytes: 0,
           replayed: false,
+          session: { url: sessionUrl, chunk_size: 100, expires_at: '' },
         }),
         { status: 201, headers: { 'Content-Type': 'application/json' } },
       );
-    });
+    }) as typeof fetch;
 
-    const { object } = await client.upload(
-      { name: 'a.bin', mime_type: 'application/octet-stream', size_bytes: 100, category: 'report' },
-      new Blob([new Uint8Array(100)]),
-      { idempotencyKey: 'k' },
+    const client = new StorviaClient({ baseUrl: 'https://storvia.test' });
+    await assert.rejects(
+      () =>
+        client.upload(
+          { name: 'a.bin', mime_type: 'application/octet-stream', size_bytes: 100, category: 'report' },
+          new Blob([new Uint8Array(100)]),
+          { idempotencyKey: 'k' },
+        ),
+      /did not return a file id/,
+    );
+  });
+
+  it('reports a Drive rejection with the byte range it refused', async () => {
+    const sessionUrl = 'https://www.googleapis.com/upload/drive/v3/files?upload_id=s3';
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input) === sessionUrl) {
+        return new Response('nope', { status: 403 });
+      }
+      return new Response(
+        JSON.stringify({
+          upload_id: 'upl_1',
+          object_id: 'obj_1',
+          mode: 'drive_resumable_session',
+          provider: 'google_drive',
+          state: 'uploading',
+          chunk_size: 100,
+          uploaded_bytes: 0,
+          replayed: false,
+          session: { url: sessionUrl, chunk_size: 100, expires_at: '' },
+        }),
+        { status: 201, headers: { 'Content-Type': 'application/json' } },
+      );
+    }) as typeof fetch;
+
+    const client = new StorviaClient({ baseUrl: 'https://storvia.test' });
+    await assert.rejects(
+      () =>
+        client.upload(
+          { name: 'a.bin', mime_type: 'application/octet-stream', size_bytes: 100, category: 'report' },
+          new Blob([new Uint8Array(100)]),
+          { idempotencyKey: 'k' },
+        ),
+      /byte range 0-99\/100/,
+    );
+  });
+
+  it('surfaces a reconcile outcome rather than assuming nothing landed', async () => {
+    const { client } = stubClient(() =>
+      new Response(
+        JSON.stringify({
+          upload_id: 'upl_1',
+          object_id: 'obj_1',
+          provider: 'google_drive',
+          state: 'uploading',
+          outcome: 'unknown',
+          reason: 'storvia does not hold the drive upload session',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
     );
 
-    // 100 bytes at 60 per chunk: 60 then 40.
-    assert.deepEqual(sentChunks, [60, 40]);
-    assert.equal(object.status, 'ready');
+    const result = await client.reconcileUpload('upl_1');
+    // "unknown" must not read as "safe to retry", or a client would duplicate.
+    assert.equal(result.outcome, 'unknown');
+    assert.ok(result.reason && result.reason.length > 0);
   });
 });

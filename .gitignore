@@ -32,3 +32,6 @@ sdk/ts/*.tsbuildinfo
 # Coverage and profiling output.
 coverage.out
 *.prof
+
+# Development launcher output: binaries, logs, and pids.
+logs/

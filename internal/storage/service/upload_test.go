@@ -107,17 +107,18 @@ func newTestService(t *testing.T, drive DriveAvailability, mutate func(*Dependen
 	insertTestDriveConnection(t, store)
 
 	deps := Dependencies{
-		Objects:      persistence.NewObjectRepository(store),
-		Uploads:      persistence.NewUploadRepository(store),
-		Attempts:     persistence.NewAttemptRepository(store),
-		Backends:     persistence.NewBackendRepository(store),
-		Drive:        drive,
-		UploadLimits: testUploadLimits(),
-		DriveCfg:     testDriveConfig(),
-		IDs:          idid.NewGenerator("upl"),
-		Logger:       slog.New(slog.NewJSONHandler(io.Discard, nil)),
-		Now:          time.Now,
-		Jitter:       func() float64 { return 0.5 },
+		Objects:       persistence.NewObjectRepository(store),
+		Uploads:       persistence.NewUploadRepository(store),
+		Attempts:      persistence.NewAttemptRepository(store),
+		Backends:      persistence.NewBackendRepository(store),
+		Drive:         drive,
+		DriveSessions: &fakeDriveSessions{},
+		UploadLimits:  testUploadLimits(),
+		DriveCfg:      testDriveConfig(),
+		IDs:           idid.NewGenerator("upl"),
+		Logger:        slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		Now:           time.Now,
+		Jitter:        func() float64 { return 0.5 },
 		// Never actually sleep in a test; the budget logic is asserted separately.
 		Sleep: func(context.Context, time.Duration) error { return nil },
 	}
@@ -227,8 +228,11 @@ func TestCreateUploadSelectsDriveWhenAvailable(t *testing.T) {
 	if result.Provider != model.ProviderGoogleDrive {
 		t.Errorf("provider = %q, want google_drive", result.Provider)
 	}
-	if result.Mode != model.ModeDriveProxy {
-		t.Errorf("mode = %q, want drive_proxy", result.Mode)
+	if result.Mode != model.ModeDriveResumableSession {
+		t.Errorf("mode = %q, want drive_resumable_session", result.Mode)
+	}
+	if result.Session == nil || result.Session.URL == "" {
+		t.Error("a Drive upload must hand the client a resumable session")
 	}
 	if result.FallbackReason != model.FallbackNone {
 		t.Errorf("fallback reason = %q, want none", result.FallbackReason)

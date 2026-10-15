@@ -7,6 +7,7 @@ import (
 	"log/slog"
 
 	"github.com/shovan04/storvia/internal/apperr"
+	"github.com/shovan04/storvia/internal/persistence"
 	"github.com/shovan04/storvia/internal/storage/model"
 	"github.com/shovan04/storvia/internal/storage/policy"
 	"github.com/shovan04/storvia/internal/storage/provider/drive"
@@ -48,11 +49,39 @@ func (c *contentSource) Open(ctx context.Context, object model.LogicalObject, by
 		return body, nil
 
 	case model.ProviderGoogleDrive:
-		return nil, c.providerUnavailable(object, "the drive download path is not implemented in this release")
+		fileID, err := c.driveFileID(object)
+		if err != nil {
+			return nil, err
+		}
+		body, _, _, err := c.drive.DownloadFile(ctx, c.scopeFor(object), fileID)
+		if err != nil {
+			return nil, err
+		}
+		return body, nil
 
 	default:
 		return nil, c.locationFault(object, "the object's provider is not recorded")
 	}
+}
+
+// driveFileID returns the Drive file id recorded on the object.
+func (c *contentSource) driveFileID(object model.LogicalObject) (string, error) {
+	if c.drive == nil {
+		return "", c.locationFault(object, "the drive provider is not configured on this deployment")
+	}
+	if object.ProviderFileID == nil || *object.ProviderFileID == "" {
+		return "", c.locationFault(object, "no google drive file id is recorded")
+	}
+	return *object.ProviderFileID, nil
+}
+
+// scopeFor rebuilds the tenant scope an object belongs to.
+//
+// The repository layer is deliberately not involved: an object row already carries
+// its tenant, and reaching back through a repository here would let a row from one
+// tenant be read with another's credentials if the caller got it wrong.
+func (c *contentSource) scopeFor(object model.LogicalObject) persistence.Scope {
+	return persistence.Scope{TenantID: object.TenantID, UserID: object.UserID}
 }
 
 // Delete removes an object from its recorded provider only.
@@ -69,7 +98,11 @@ func (c *contentSource) Delete(ctx context.Context, object model.LogicalObject) 
 		return client.Delete(ctx, providerObject(object, client))
 
 	case model.ProviderGoogleDrive:
-		return c.providerUnavailable(object, "the drive delete path is not implemented in this release")
+		fileID, err := c.driveFileID(object)
+		if err != nil {
+			return err
+		}
+		return c.drive.DeleteFile(ctx, c.scopeFor(object), fileID)
 
 	default:
 		return c.locationFault(object, "the object's provider is not recorded")

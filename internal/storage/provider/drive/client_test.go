@@ -288,6 +288,10 @@ func TestAuthorizeURLCarriesTheRequiredParameters(t *testing.T) {
 	if got := parsed.Query().Get("state"); got != "state-123" {
 		t.Fatalf("oauth state = %q, want the server-stored state without browser binding", got)
 	}
+
+	// This test used to assert only the query, and that gap hid a real bug: the host
+	// was wrong and every parameter was right. The endpoint itself is now covered by
+	// TestAuthorizeURLGoesToGoogle in endpoints_test.go.
 }
 
 func TestAuthorizeURLRequiresState(t *testing.T) {

@@ -16,9 +16,10 @@ import (
 type UploadMode string
 
 const (
-	// ModeDriveProxy streams chunks through the API. The Drive resumable session
-	// URI stays server-side.
-	ModeDriveProxy UploadMode = "drive_proxy"
+	// ModeDriveResumableSession uploads directly to a Drive resumable session URI.
+	// Google mints the capability and Storvia relays it, so no file bytes pass
+	// through the API.
+	ModeDriveResumableSession UploadMode = "drive_resumable_session"
 	// ModeS3PresignedParts uploads parts directly with short-lived, scoped URLs.
 	ModeS3PresignedParts UploadMode = "s3_presigned_parts"
 )
@@ -66,6 +67,11 @@ type CreateUploadResult struct {
 	UploadedBytes int64           `json:"uploaded_bytes"`
 	ExpiresAt     *time.Time      `json:"expires_at,omitempty"`
 	Parts         []PresignedPart `json:"parts,omitempty"`
+	// Session is set in Drive mode.
+	//
+	// Its URL is a write capability for this one file. Storvia returns it once and
+	// never stores it, so a replayed create-upload will not return it again.
+	Session *DriveSession `json:"session,omitempty"`
 }
 
 // CreateUpload starts a new upload.
@@ -118,17 +124,39 @@ func (c *Client) GetUpload(ctx context.Context, uploadID string) (*UploadView, e
 	return &view, nil
 }
 
-// ReconcileUpload asks the server to resolve an ambiguous outcome.
+// ReconcileResult is what the server found when it asked the provider.
+type ReconcileResult struct {
+	UploadID string `json:"upload_id"`
+	ObjectID string `json:"object_id"`
+	Provider string `json:"provider"`
+	State    string `json:"state"`
+	// Outcome is one of:
+	//
+	//	already_ready     the upload finished long ago
+	//	completed         the provider has the bytes; Storvia has recorded that
+	//	nothing_stored    the provider is certain nothing landed; safe to retry
+	//	size_mismatch     something is there but it is not what was declared
+	//	unknown           nobody can tell, which is NOT the same as nothing_stored
+	//
+	// The difference between nothing_stored and unknown matters. Only the first one
+	// tells you it is safe to start the upload again.
+	Outcome  string `json:"outcome"`
+	Reason   string `json:"reason,omitempty"`
+	Location string `json:"location,omitempty"`
+}
+
+// ReconcileUpload asks the server what actually happened to an unfinished upload.
 //
-// It inspects only the provider the upload is already pinned to. It is safe to
-// call repeatedly, and it never creates a second storage location.
-func (c *Client) ReconcileUpload(ctx context.Context, uploadID string) (*UploadView, error) {
-	var view UploadView
+// It inspects only the provider the upload is already pinned to, is safe to call
+// repeatedly, and never creates a second storage location. It reports; it does not
+// retry on your behalf.
+func (c *Client) ReconcileUpload(ctx context.Context, uploadID string) (*ReconcileResult, error) {
+	var result ReconcileResult
 	if err := c.do(ctx, http.MethodPost,
-		"/v1/storage/uploads/"+uploadID+"/reconcile", nil, &view); err != nil {
+		"/v1/storage/uploads/"+uploadID+"/reconcile", nil, &result); err != nil {
 		return nil, err
 	}
-	return &view, nil
+	return &result, nil
 }
 
 // CancelUpload abandons an upload that has not begun writing bytes.

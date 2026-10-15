@@ -44,6 +44,39 @@ type DriveAvailability interface {
 // Clock is the time source, injected so tests do not sleep.
 type Clock func() time.Time
 
+// DriveSessionResult is the resumable session handed to a client.
+//
+// DriveSessionURL is a bearer capability for exactly one file: anyone holding it can
+// write to that file until it expires. It is returned once, never persisted, and never
+// logged.
+type DriveSessionResult struct {
+	SessionURL string
+	ChunkSize  int
+	ExpiresAt  time.Time
+}
+
+// DriveSessionPort creates and verifies Drive resumable uploads.
+//
+// It is separate from DriveAvailability because the coordinator must be able to route
+// and plan without holding the ability to write to a user's Drive, and so a deployment
+// that only ever uses the fallback never needs a Drive write capability at all.
+type DriveSessionPort interface {
+	// InitiateUpload asks Drive for a resumable session scoped to the app folder.
+	InitiateUpload(ctx context.Context, scope persistence.Scope, req DriveUploadRequest) (DriveSessionResult, error)
+	// FetchMetadata reports what Drive actually stored for a file. It is the only
+	// evidence that an upload really finished, so the coordinator commits what it
+	// returns rather than what the client declared.
+	FetchMetadata(ctx context.Context, scope persistence.Scope, fileID string) (model.ObjectMetadata, error)
+}
+
+// DriveUploadRequest is what the coordinator asks Drive to create.
+type DriveUploadRequest struct {
+	ConnectionID string
+	FileName     string
+	MimeType     string
+	SizeBytes    int64
+}
+
 // Dependencies are the collaborators the upload service needs.
 type Dependencies struct {
 	Objects  *persistence.ObjectRepository
@@ -51,6 +84,10 @@ type Dependencies struct {
 	Attempts *persistence.AttemptRepository
 	Backends *persistence.BackendRepository
 	Drive    DriveAvailability
+	// DriveSessions creates resumable Drive upload sessions. It is nil when the
+	// deployment cannot write to Drive at all, which makes CreateUpload say so
+	// instead of handing a client a mode that cannot work.
+	DriveSessions DriveSessionPort
 	// UploadLimits holds the validation bounds. It is named distinctly from the
 	// upload repository because both are needed in the same methods.
 	UploadLimits config.UploadsConfig
@@ -138,9 +175,24 @@ type CreateUploadResult struct {
 	ChunkSize int
 	// Parts are short-lived capabilities for the presigned mode.
 	Parts []PresignedPartInfo
+	// Session is set for the Drive resumable mode. It is nil for every other mode.
+	//
+	// The URL is a write capability for one file. It is deliberately not part of
+	// any durable record, so a repeated request cannot recover it: a client that
+	// loses it starts a new session rather than reusing a live one.
+	Session *DriveSession
 	// UploadedBytes is the confirmed offset on a replayed upload.
 	UploadedBytes int64
 	ExpiresAt     time.Time
+}
+
+// DriveSession is the resumable session a client uploads into.
+type DriveSession struct {
+	// URL is Drive's session URI. Treat it as a secret: it grants write access to
+	// this one file until the session expires.
+	URL       string    `json:"url"`
+	ChunkSize int       `json:"chunk_size"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 // PresignedPartInfo is one client-facing upload capability.
@@ -286,10 +338,13 @@ func (s *UploadService) replay(ctx context.Context, scope persistence.Scope, upl
 
 	attempt, err := s.deps.Attempts.GetActiveForUpload(ctx, upload.ID)
 	provider := model.ProviderUnset
-	mode := model.ModeDriveProxy
 	if err == nil {
 		provider = attempt.Provider
 	}
+	// A replay reports the mode the upload was planned with. The capability itself is
+	// never repeated: handing back a live Drive session or a live presigned URL on a
+	// replay would extend the life of something meant to be single-use.
+	mode := model.ModeDriveResumableSession
 	if provider == model.ProviderS3Compatible {
 		mode = model.ModeS3PresignedParts
 	}
@@ -401,9 +456,7 @@ func (s *UploadService) routeAndSelect(ctx context.Context, scope persistence.Sc
 		FallbackReason: fallbackReason,
 	}
 	if selectedProvider == model.ProviderGoogleDrive {
-		result.Mode = model.ModeDriveProxy
-		result.ChunkSize = s.deps.UploadLimits.DriveChunkSizeBytes
-		return result, nil
+		return s.planDriveUpload(ctx, scope, object, attempt, result)
 	}
 
 	result.Mode = model.ModeS3PresignedParts

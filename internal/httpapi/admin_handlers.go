@@ -4,7 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
+	"fmt"
 	"html/template"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -44,6 +47,26 @@ type AdminHandler struct {
 	issuer      *auth.Issuer
 	sessions    auth.Lookup
 	connections AdminConnections
+	diagnostics DiagnosticsProvider
+	consent     FallbackConsenter
+	folders     FolderEnsurer
+	// log records why a connect attempt failed.
+	//
+	// The panel deliberately shows the user a generic message, because the cause can
+	// contain provider detail. That is only safe if the real reason is recorded
+	// somewhere: without this, a failed connection produced a 502 and no explanation
+	// anywhere, which is how a scope mismatch went uninvestigated for a whole session.
+	log *slog.Logger
+}
+
+// FallbackConsenter lets the development panel record the disclosure acceptance a
+// real tenant would give through the API.
+//
+// It is here so a developer can unblock themselves without curling an endpoint by
+// hand, and it is deliberately the same service the API uses rather than a shortcut
+// that writes the record directly.
+type FallbackConsenter interface {
+	Accept(ctx context.Context, scope persistence.Scope) (bool, error)
 }
 
 // NewAdminHandler builds the development-only panel handler.
@@ -51,7 +74,48 @@ func NewAdminHandler(cfg AdminPanelConfig, issuer *auth.Issuer, sessions auth.Lo
 	if cfg.FlowCookie == "" {
 		cfg.FlowCookie = "storvia_admin_flow"
 	}
-	return &AdminHandler{cfg: cfg, issuer: issuer, sessions: sessions, connections: connections}
+	return &AdminHandler{cfg: cfg, issuer: issuer, sessions: sessions, connections: connections, log: slog.Default()}
+}
+
+// FolderEnsurer prepares the app-managed Drive folder on request.
+type FolderEnsurer interface {
+	EnsureRootFolder(ctx context.Context, scope persistence.Scope) error
+}
+
+// WithLogger attaches the logger used to record connect failures.
+func (h *AdminHandler) WithLogger(log *slog.Logger) *AdminHandler {
+	if log != nil {
+		h.log = log
+	}
+	return h
+}
+
+// logConnectFailure records the real reason behind a user-facing message.
+func (h *AdminHandler) logConnectFailure(r *http.Request, stage string, err error) {
+	if h.log == nil {
+		return
+	}
+	h.log.ErrorContext(r.Context(), "admin drive connect failed",
+		"stage", stage,
+		"reason", err.Error(),
+	)
+}
+
+// WithDiagnostics attaches the live-status source and the consent action.
+//
+// Both are setters after construction because the handler is built before the
+// application wiring that produces them, and a development-only panel should not force
+// the production wiring to carry dependencies it never uses.
+func (h *AdminHandler) WithDiagnostics(d DiagnosticsProvider, c FallbackConsenter) *AdminHandler {
+	h.diagnostics = d
+	h.consent = c
+	return h
+}
+
+// WithFolderEnsurer attaches the folder-management action.
+func (h *AdminHandler) WithFolderEnsurer(f FolderEnsurer) *AdminHandler {
+	h.folders = f
+	return h
 }
 
 // Show handles GET /admin.
@@ -60,20 +124,66 @@ func (h *AdminHandler) Show(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity, signedIn := h.adminIdentity(r)
-	data := adminPageData{
+	scope := persistence.Scope{TenantID: h.cfg.TenantID, UserID: h.cfg.UserID}
+	if signedIn {
+		scope = persistence.Scope{TenantID: identity.TenantID, UserID: identity.UserID}
+	}
+
+	data := adminDashboardData{
 		SignedIn: signedIn,
 		TenantID: h.cfg.TenantID,
 		UserID:   h.cfg.UserID,
+		Now:      time.Now().UTC(),
 	}
 	if signedIn {
-		status, err := h.connections.Status(r.Context(), persistence.Scope{TenantID: identity.TenantID, UserID: identity.UserID})
+		status, err := h.connections.Status(r.Context(), scope)
 		if err != nil {
 			renderAdminError(w, "The Drive connection status could not be loaded.")
 			return
 		}
-		data.Status = &status
+		data.Status = &adminStatusView{
+			Connected:     status.Connected,
+			Status:        status.Status,
+			Subject:       status.Subject,
+			GrantedScopes: status.GrantedScopes,
+			FolderPresent: status.FolderPresent,
+			LastSuccessAt: status.LastSuccessAt,
+		}
 	}
-	renderAdminPage(w, data)
+	if h.diagnostics != nil {
+		// A diagnostics failure must not blank the page: the rest of the panel is
+		// still the most useful thing to show.
+		diag := h.diagnostics.Diagnostics(r.Context())
+		if diag.ConsentVersion == "" {
+			diag.ConsentVersion = "unavailable"
+		}
+		data.Diag = diag
+	}
+	renderAdminDashboard(w, data)
+}
+
+// AcceptFallbackConsent handles POST /admin/fallback-consent.
+//
+// Without this, exercising the outage path requires discovering an API endpoint and
+// curling it first, which is the single easiest step to miss.
+func (h *AdminHandler) AcceptFallbackConsent(w http.ResponseWriter, r *http.Request) {
+	if !h.enabled(w) {
+		return
+	}
+	if h.consent == nil {
+		renderAdminError(w, "Fallback consent is not available in this build.")
+		return
+	}
+	identity, signedIn := h.adminIdentity(r)
+	scope := persistence.Scope{TenantID: h.cfg.TenantID, UserID: h.cfg.UserID}
+	if signedIn {
+		scope = persistence.Scope{TenantID: identity.TenantID, UserID: identity.UserID}
+	}
+	if _, err := h.consent.Accept(r.Context(), scope); err != nil {
+		renderAdminError(w, "The fallback consent could not be recorded.")
+		return
+	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
 // Connect handles GET /admin/connect. It creates a temporary browser-bound
@@ -105,31 +215,63 @@ func (h *AdminHandler) Callback(w http.ResponseWriter, r *http.Request) {
 	}
 	if oauthErr := r.URL.Query().Get("error"); oauthErr != "" {
 		h.clearFlowCookie(w)
+		h.logConnectFailure(r, "google_declined", fmt.Errorf("google returned %s", oauthErr))
 		renderAdminError(w, "Google Drive authorization was not completed.")
 		return
 	}
 	flow, err := r.Cookie(h.cfg.FlowCookie)
 	if err != nil || strings.TrimSpace(flow.Value) == "" {
+		h.logConnectFailure(r, "flow_cookie", errors.New("the browser flow cookie was missing"))
 		renderAdminError(w, "The local OAuth browser flow is missing or expired. Start again.")
 		return
 	}
 	code := r.URL.Query().Get("code")
 	state := r.URL.Query().Get("state")
 	if code == "" || state == "" {
+		h.logConnectFailure(r, "incomplete_response", fmt.Errorf("code or state missing"))
 		renderAdminError(w, "Google returned an incomplete authorization response.")
 		return
 	}
 	if err := h.connections.CompleteConnectAt(r.Context(), h.scope(), code, state, flow.Value, h.cfg.RedirectURI); err != nil {
 		h.clearFlowCookie(w)
-		renderAdminError(w, "Google Drive authorization could not be completed.")
+		h.logConnectFailure(r, "complete_connect", err)
+		renderAdminError(w, "Google Drive authorization could not be completed. See the server log for the reason.")
 		return
 	}
 	if err := h.issueSession(w, r.Context()); err != nil {
 		h.clearFlowCookie(w)
+		h.logConnectFailure(r, "issue_session", err)
 		renderAdminError(w, "The Drive connection succeeded, but the local admin session could not be created.")
 		return
 	}
 	h.clearFlowCookie(w)
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
+// EnsureFolder handles POST /admin/ensure-folder.
+//
+// It exists because the app-managed folder is created at connection time, and a
+// connection made before that was implemented has no folder. Re-running it here is an
+// explicit user action rather than something that happens silently on the next upload,
+// so "create a folder and start writing there" is always a decision someone made.
+func (h *AdminHandler) EnsureFolder(w http.ResponseWriter, r *http.Request) {
+	if !h.enabled(w) {
+		return
+	}
+	if h.folders == nil {
+		renderAdminError(w, "Drive folder management is not available in this build.")
+		return
+	}
+	identity, _ := h.adminIdentity(r)
+	scope := persistence.Scope{TenantID: h.cfg.TenantID, UserID: h.cfg.UserID}
+	if identity.Valid() {
+		scope = persistence.Scope{TenantID: identity.TenantID, UserID: identity.UserID}
+	}
+	if err := h.folders.EnsureRootFolder(r.Context(), scope); err != nil {
+		h.logConnectFailure(r, "ensure_folder", err)
+		renderAdminError(w, "The Storvia Drive folder could not be prepared. See the server log.")
+		return
+	}
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
@@ -229,33 +371,6 @@ func (h *AdminHandler) renderUnauthorized(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusUnauthorized)
 	_, _ = w.Write([]byte("<!doctype html><title>Storvia admin</title><p>Sign in with Google Drive first.</p><p><a href=\"/admin\">Back to admin</a></p>"))
-}
-
-type adminPageData struct {
-	SignedIn bool
-	TenantID string
-	UserID   string
-	Status   *service.ConnectionStatus
-}
-
-var adminTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{"join": strings.Join}).Parse(`<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'">
-<title>Storvia admin</title><style>body{font:16px system-ui,sans-serif;max-width:720px;margin:3rem auto;padding:0 1rem;color:#17202a}main{border:1px solid #d5dbe0;border-radius:12px;padding:2rem}code{background:#eef1f4;padding:.15rem .3rem;border-radius:4px}.ok{color:#147d42}.warn{color:#9a5b00}button,a.button{border:0;border-radius:6px;padding:.65rem 1rem;background:#1769aa;color:white;text-decoration:none;font:inherit;cursor:pointer}form{display:inline;margin-right:.5rem}.muted{color:#59636e}</style></head>
-<body><main><h1>Storvia development admin</h1>
-<p class="muted">This panel is enabled only in the development configuration. It tests Google Drive OAuth and connection status; file transfer is not implemented yet.</p>
-{{if not .SignedIn}}<h2>Google Drive login</h2><p>Connect a test Google account using the narrow <code>drive.file</code> scope.</p><p><a class="button" href="/admin/connect">Sign in with Google Drive</a></p>
-{{else}}<h2>Drive connection</h2><dl><dt>Test tenant</dt><dd><code>{{.TenantID}}</code></dd><dt>Test user</dt><dd><code>{{.UserID}}</code></dd>{{with .Status}}<dt>Status</dt><dd class="{{if .Connected}}ok{{else}}warn{{end}}">{{.Status}}</dd><dt>Google subject</dt><dd><code>{{if .Subject}}{{.Subject}}{{else}}not connected{{end}}</code></dd><dt>Granted scope</dt><dd><code>{{join .GrantedScopes ", "}}</code></dd><dt>Storvia folder</dt><dd>{{if .FolderPresent}}present{{else}}not created yet{{end}}</dd>{{if .LastSuccessAt}}<dt>Last successful Drive call</dt><dd>{{.LastSuccessAt}}</dd>{{end}}{{end}}</dl><p><a class="button" href="/admin">Refresh status</a></p><form method="post" action="/admin/disconnect"><button type="submit">Disconnect Drive</button></form><form method="post" action="/admin/logout"><button type="submit">Log out</button></form>{{end}}
-</main></body></html>`))
-
-func renderAdminPage(w http.ResponseWriter, data adminPageData) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	if err := adminTemplate.Execute(w, data); err != nil {
-		// The template is static and parsed at init; this is only a defensive
-		// response path if future edits introduce an execution error.
-		http.Error(w, "admin page unavailable", http.StatusInternalServerError)
-	}
 }
 
 func renderAdminError(w http.ResponseWriter, message string) {

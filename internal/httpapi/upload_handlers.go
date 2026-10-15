@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"time"
 
@@ -41,7 +43,7 @@ type createUploadRequest struct {
 type createUploadResponse struct {
 	UploadID string `json:"upload_id"`
 	ObjectID string `json:"object_id"`
-	// Mode is drive_proxy or s3_presigned_parts.
+	// Mode is drive_resumable_session or s3_presigned_parts.
 	Mode string `json:"mode"`
 	// Provider is where the server will store this upload.
 	Provider string `json:"provider"`
@@ -60,6 +62,12 @@ type createUploadResponse struct {
 	// Parts are short-lived, operation-scoped capabilities. They are returned
 	// here and nowhere else.
 	Parts []service.PresignedPartInfo `json:"parts,omitempty"`
+	// Session carries the Drive resumable session in Drive mode.
+	//
+	// The URL is a write capability for this one file: anyone holding it can write to
+	// that file until it expires. It is returned once, in this response, and is never
+	// stored anywhere Storvia can replay it.
+	Session *service.DriveSession `json:"session,omitempty"`
 }
 
 // Create handles POST /v1/storage/uploads.
@@ -99,6 +107,7 @@ func (h *UploadHandler) Create(w http.ResponseWriter, r *http.Request) {
 		ChunkSize:      result.ChunkSize,
 		UploadedBytes:  result.UploadedBytes,
 		Parts:          result.Parts,
+		Session:        result.Session,
 	}
 	if !result.ExpiresAt.IsZero() {
 		response.ExpiresAt = &result.ExpiresAt
@@ -136,20 +145,6 @@ func (h *UploadHandler) Get(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusOK, upload)
 }
 
-// Chunks handles a chunk upload.
-//
-// The provider write verb is not wired yet in this milestone; the endpoint
-// reports that plainly rather than pretending to accept bytes it would drop.
-func (h *UploadHandler) Chunks(w http.ResponseWriter, r *http.Request) {
-	if _, err := scopeFrom(r); err != nil {
-		WriteProblem(w, r, err)
-		return
-	}
-	WriteProblem(w, r, apperr.New(apperr.KindProviderNotConfigured,
-		"Provider transfer not implemented",
-		"the provider chunk transfer path is not implemented in this release"))
-}
-
 // Complete handles POST /v1/storage/uploads/{upload_id}/complete.
 //
 // It is idempotent: a repeat returns the object that is already ready rather than
@@ -168,7 +163,25 @@ func (h *UploadHandler) Complete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := h.svc.CompleteUpload(r.Context(), scope, uploadID)
+	// A Drive upload is completed by reporting the file id Google returned from the
+	// final chunk. That id is untrusted: the service re-reads the file from Drive and
+	// checks its folder, size, and trashed state before adopting it.
+	var body struct {
+		DriveFileID string `json:"drive_file_id"`
+	}
+	if r.Body != nil {
+		// An empty body is valid for the fallback path, so a decode failure here is
+		// not an error; the provider-specific path reports the missing id instead.
+		_ = json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&body)
+	}
+
+	var result service.CompleteUploadResult
+	if body.DriveFileID != "" {
+		result, err = h.svc.CompleteDriveUpload(r.Context(), scope, uploadID,
+			service.CompleteDriveRequest{DriveFileID: body.DriveFileID})
+	} else {
+		result, err = h.svc.CompleteUpload(r.Context(), scope, uploadID)
+	}
 	if err != nil {
 		WriteProblem(w, r, err)
 		return
@@ -186,14 +199,28 @@ func (h *UploadHandler) Complete(w http.ResponseWriter, r *http.Request) {
 }
 
 // Reconcile handles POST /v1/storage/uploads/{upload_id}/reconcile.
+//
+// It answers "what actually happened?" for an upload that did not finish. It never
+// retries and never re-uploads: deciding to write again is not something a reconcile
+// endpoint may do on a client's behalf.
 func (h *UploadHandler) Reconcile(w http.ResponseWriter, r *http.Request) {
-	if _, err := scopeFrom(r); err != nil {
+	scope, err := scopeFrom(r)
+	if err != nil {
 		WriteProblem(w, r, err)
 		return
 	}
-	WriteProblem(w, r, apperr.New(apperr.KindProviderNotConfigured,
-		"Reconciliation not implemented",
-		"upload reconciliation is not implemented in this release"))
+	uploadID := r.PathValue("upload_id")
+	if uploadID == "" {
+		WriteProblem(w, r, apperr.Validation("upload_id is required"))
+		return
+	}
+
+	result, err := h.svc.Reconcile(r.Context(), scope, uploadID)
+	if err != nil {
+		WriteProblem(w, r, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, result)
 }
 
 // Cancel handles DELETE /v1/storage/uploads/{upload_id}.

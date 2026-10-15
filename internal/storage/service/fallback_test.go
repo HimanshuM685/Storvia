@@ -285,15 +285,55 @@ func TestCompleteSurfacesAMissingObjectAsMissingNotAsARecreate(t *testing.T) {
 // TestCompleteRequiresAFallbackUploader keeps the honest failure when the
 // fallback is switched off.
 func TestCompleteRequiresAFallbackUploader(t *testing.T) {
-	drive := &fakeDrive{connectionID: "dc-1", usable: true, configured: true}
-	svc := newFallbackService(t, drive, nil)
+	// Drive is forced unavailable so the upload is planned against the fallback, and
+	// then the fallback uploader is removed to prove completion refuses rather than
+	// committing something it cannot verify.
+	drive := &fakeDrive{
+		connectionID: "dc-1", usable: true, configured: true,
+		errors: []error{unavailable(), unavailable()},
+	}
+	// Build with a working fallback so the upload is planned against it, then remove
+	// the uploader to represent the deployment losing that capability mid-upload.
+	svc := newFallbackService(t, drive, newStubFallback())
 
-	_, err := svc.CompleteUpload(context.Background(), testScope(), "upl_missing")
+	created, err := svc.CreateUpload(context.Background(), testScope(), "idem-need-uploader", validRequest())
+	if err != nil {
+		t.Fatalf("CreateUpload: %v", err)
+	}
+	if created.Provider != model.ProviderS3Compatible {
+		t.Fatalf("provider = %v, want the fallback", created.Provider)
+	}
+
+	// The deployment loses the capability between planning and completion.
+	svc.deps.FallbackUploader = nil
+
+	_, err = svc.CompleteUpload(context.Background(), testScope(), created.UploadID)
 	if err == nil {
 		t.Fatal("completion must fail when no fallback uploader is configured")
 	}
 	if !apperr.Is(err, apperr.KindProviderNotConfigured) {
 		t.Errorf("error kind = %q, want provider_not_configured", apperr.KindOf(err))
+	}
+}
+
+// TestCompleteRefusesAnUploadThatDoesNotBelongToTheTenant is a consequence of moving
+// the provider check after the upload lookup: an upload id belonging to another tenant
+// must read as missing, not as a configuration problem.
+func TestCompleteRefusesAnUploadThatDoesNotBelongToTheTenant(t *testing.T) {
+	drive := &fakeDrive{
+		connectionID: "dc-1", usable: true, configured: true,
+		errors: []error{unavailable(), unavailable()},
+	}
+	svc := newFallbackService(t, drive, nil)
+
+	created, err := svc.CreateUpload(context.Background(), testScope(), "idem-tenant", validRequest())
+	if err != nil {
+		t.Fatalf("CreateUpload: %v", err)
+	}
+
+	other := persistence.Scope{TenantID: "tenant-b", UserID: "user-1"}
+	if _, err := svc.CompleteUpload(context.Background(), other, created.UploadID); !apperr.Is(err, apperr.KindNotFound) {
+		t.Errorf("error = %v, want not_found for another tenant's upload", err)
 	}
 }
 

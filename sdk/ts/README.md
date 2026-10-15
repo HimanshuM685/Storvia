@@ -37,12 +37,15 @@ if (result.mode === 's3_presigned_parts') {
   // Upload parts straight to the provider with result.parts.
   // Those URLs are bearer tokens: do not log or store them.
 } else {
-  // drive_proxy: stream chunks through the API.
+  // drive_resumable_session: the session URL in result.session is a write
+  // capability for this one file. PUT each chunk to it with a Content-Range.
 }
 ```
 
-The `upload` helper does the whole drive-proxy flow, including resuming from the
-server-confirmed offset:
+The `upload` helper does the whole transfer for either mode. In Drive mode it streams
+the chunks to Google's session and reports the file id Google returned, which is the
+only way Storvia can learn where the file went — it deliberately does not keep the
+session itself.
 
 ```ts
 const { object } = await client.upload(
@@ -51,6 +54,18 @@ const { object } = await client.upload(
   { idempotencyKey },
 );
 ```
+
+If a transfer is interrupted, do not simply start again. Ask first:
+
+```ts
+const result = await client.reconcileUpload(uploadId);
+if (result.outcome === 'nothing_stored') {
+  // Safe to start over. Only this outcome guarantees it.
+}
+```
+
+`unknown` means nobody can tell, and restarting on an `unknown` is exactly how a
+duplicate file gets created.
 
 ## Error handling
 

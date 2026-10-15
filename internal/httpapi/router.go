@@ -95,8 +95,6 @@ func Router(cfg Config) http.Handler {
 	// Uploads carry file bytes, so they get the longer budget. An upload that
 	// runs long is the client's pace, never evidence about Drive's health.
 	uploadRoutes := map[string]http.HandlerFunc{
-		"PATCH /v1/storage/uploads/{upload_id}/chunks":  cfg.Uploads.Chunks,
-		"POST /v1/storage/uploads/{upload_id}/chunks":   cfg.Uploads.Chunks,
 		"POST /v1/storage/uploads/{upload_id}/complete": cfg.Uploads.Complete,
 	}
 	for pattern, handler := range uploadRoutes {
@@ -125,6 +123,8 @@ func Router(cfg Config) http.Handler {
 		root.Handle("GET /admin/connect", http.HandlerFunc(cfg.Admin.Connect))
 		root.Handle("GET /admin/oauth/callback", http.HandlerFunc(cfg.Admin.Callback))
 		root.Handle("POST /admin/disconnect", http.HandlerFunc(cfg.Admin.Disconnect))
+		root.Handle("POST /admin/fallback-consent", http.HandlerFunc(cfg.Admin.AcceptFallbackConsent))
+		root.Handle("POST /admin/ensure-folder", http.HandlerFunc(cfg.Admin.EnsureFolder))
 		root.Handle("POST /admin/logout", http.HandlerFunc(cfg.Admin.Logout))
 	}
 	root.Handle("/v1/", guarded)

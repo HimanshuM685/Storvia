@@ -85,6 +85,26 @@ func (r *storeResolver) MarkStatus(ctx context.Context, connectionID, status str
 	return r.store.SetStatus(ctx, connectionID, status)
 }
 
+// SetRootFolderID records the app-managed folder on a connection.
+//
+// It is exposed on the client so the service layer can record the folder it just
+// created without reaching for the repository directly.
+func (c *Client) SetRootFolderID(ctx context.Context, connectionID, folderID string) error {
+	store, ok := c.conns.(*storeResolver)
+	if !ok {
+		return errors.New("drive: this connection store cannot persist the root folder")
+	}
+	return store.store.SetRootFolderID(ctx, connectionID, folderID)
+}
+
+// LogWarn records a non-fatal problem during connection setup.
+func (c *Client) LogWarn(ctx context.Context, message string, args ...any) {
+	if c.log == nil {
+		return
+	}
+	c.log.WarnContext(ctx, message, args...)
+}
+
 // SetRefreshToken persists a rotated refresh token.
 func (c *Client) SetRefreshToken(ctx context.Context, connectionID, refreshToken string) error {
 	store, ok := c.conns.(*storeResolver)

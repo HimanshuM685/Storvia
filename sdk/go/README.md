@@ -40,15 +40,19 @@ if err != nil {
 
 // The server chose the provider. Do not try to influence this.
 switch result.Mode {
-case storvia.ModeDriveProxy:
-    // Stream chunks through the API; the Drive session URI stays server-side.
+case storvia.ModeDriveResumableSession:
+	// The session URL in result.Session is a write capability for this one file.
+	// upload.UploadAll streams the chunks to it with per-chunk Content-Range,
+	// then upload.CompleteDrive(ctx, driveFileID) sends back the id Google returned.
 case storvia.ModeS3PresignedParts:
-    // Upload parts directly with result.Parts; those URLs are bearer tokens.
+	// Upload parts directly with result.Parts; those URLs are bearer tokens.
 }
 ```
 
-Resuming after an interruption uses `result.UploadedBytes` or, for a live upload,
-`GetUpload`. That value is the provider-confirmed offset. Resume from it; never
+Resuming: `Upload.UploadedBytes` reports what this client has sent. It is **local
+accounting, not a provider-confirmed offset** — Storvia does not hold the Drive session,
+so it cannot say what Google durably accepted. Read the comment on that method before
+relying on it.
 assume more bytes were accepted than the provider confirmed.
 
 ## Error handling

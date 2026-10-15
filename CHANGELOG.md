@@ -17,6 +17,472 @@ Related documents:
 
 ---
 
+## 2026-10-15 — The app-managed Drive folder is created, and the connect is complete
+
+### Why
+
+With OAuth finally working, the admin panel reported the connection as `connected`
+with subject `13735161528780792640` and scope `drive.file`, but then:
+
+```
+Storvia folder    not created yet
+```
+
+Every Drive upload was refused by design: `usableConnection` requires a known folder
+and reports `ClassConfiguration` without one. Folder creation had never been
+implemented.
+
+### Added
+
+**`internal/storage/provider/drive/folders.go`** — `EnsureRootFolder` (create or find)
+and `FindRootFolder` (find only). The folder is created **at connection time** rather
+than lazily on the first upload, because failing the first upload for a reason the user
+cannot act on is the worst moment to discover a missing folder.
+
+Folder creation failure is logged but does not fail the callback: the grant is stored
+and the account is connected, so discarding a working authorization would force the user
+to consent again.
+
+**Recovery policy, from `docs/architecture.md`, implemented as written:**
+
+- If more than one folder carries the Storvia name, the ambiguity is **reported, not
+  resolved**. Picking one would silently split the user's files across two places;
+  creating a third would make the ambiguity permanent. The candidate ids are returned
+  so a person can be asked.
+- Trashed folders are excluded from discovery. Reusing one would write into the user's
+  trash.
+- `FindRootFolder` never creates. If the user deleted the folder, the honest answer is
+  that it is gone and the fix is an explicit action.
+
+**`POST /admin/ensure-folder`** plus a panel button shown when the folder is missing.
+Connections made before this existed have no folder, and re-running it must be something
+a person decides.
+
+`driveAboutURL` is a separate constant for the same reason `driveUploadURL` is: `about` is
+not under `/files`.
+
+### Verified against a real Google account
+
+```
+POST /admin/ensure-folder -> 303
+root_folder_id: (empty) -> 1R5CuK1CDTr2XKFcyy2xsXmpNVsot6W1i
+```
+
+Run a second time, the id is unchanged — discovery found the existing folder rather than
+creating a duplicate. This is the **first write this project has ever made to Google
+Drive**.
+
+### Tests
+
+Five new tests: reuse-existing, create-when-absent, refuse-to-choose-between-duplicates,
+find-never-creates, and folder-work-tolerates-a-missing-folder-id. That last one guards a
+deadlock — folder work must work on a connection whose folder id is empty, since that is
+how the id gets set.
+
+`internal/storage/provider/drive` coverage: 46.8% → 61.5%.
+
+### Checks run
+
+```
+make check / check-all, sdk-ts-test (22), test-live (both live R2 tests)
+```
+
+## 2026-10-15 — The token response was parsed as form data, not JSON
+
+### Why
+
+Still failing after the identity fix, and this time the newly added logging named the
+cause: `drive: the token response contained no access token`.
+
+### Cause
+
+Google's token endpoint answers with:
+
+```
+content-type: application/json; charset=utf-8
+```
+
+The response was parsed with `url.ParseQuery`, which is form encoding. A successful
+response therefore produced an empty value set, and the exchange failed while the access
+token sat in the body in plain sight.
+
+This broke **both** paths that shared the parser: the authorization-code exchange *and*
+every subsequent refresh. Nothing had ever got far enough to exercise either.
+
+`parseFormURL` is now `parseTokenResponse`. JSON is tried first because that is what
+Google sends; the form encoding RFC 6749 permits is kept as a fallback, since it costs
+three lines and removes a class of surprise.
+
+Numbers are rendered as strings because the downstream duration parser expects
+`expires_in` as text. That is deliberate, and tested: losing `refresh_token` would make
+a connection appear to work once and then fail forever.
+
+### The first failure in the same session
+
+An earlier attempt logged `the authorization request could not be verified`. That is the
+CSRF state check rejecting a stale value — correct behaviour, caused by the server having
+been restarted between `/admin/connect` and the callback, which invalidates the in-memory
+state store. It was the previous binary's browser tab, not a new defect.
+
+### Tests
+
+`TestParseTokenResponseReadsGoogleJSON` and
+`TestParseTokenResponseStillAcceptsFormEncoding`.
+
+### Not verified
+
+Still no observed successful connect. Two consecutive real defects have now been found by
+the logging added after the first, which is the argument for keeping it.
+
+## 2026-10-15 — Connecting a Google account failed after consent
+
+### Why
+
+The admin panel sent the user to Google's consent screen, the user approved, and the
+callback answered `502 Google Drive authorization could not be completed.` for every
+account. The failure was after consent, which is the worst moment for it.
+
+### Fixed: the account was identified through the wrong Google API
+
+After the code was exchanged, Storvia fetched the user's identity from **OpenID
+Connect's userinfo endpoint**:
+
+```go
+GET https://openidconnect.googleapis.com/v1/userinfo
+```
+
+That endpoint requires an `openid` grant. Storvia requests only `drive.file`, by
+design, so the access token was always rejected there with a 401 — for every user, on
+every attempt.
+
+Identification now uses **Drive's own `about` endpoint**, which is inside the
+`drive.file` scope and so costs no additional permission:
+
+```go
+GET https://www.googleapis.com/drive/v3/about?fields=user
+```
+
+`driveAboutURL` is a separate constant because `about` is **not** under `/files`;
+appending it to `driveFilesURL` would produce `/drive/v3/files/about`, which is not a
+route — the same class of mistake as the `/files/files` upload URL fixed earlier.
+
+The subject is Google's `user.permissionId`, a stable per-account identifier. The email
+address is only a fallback; it is personal data Storvia has no reason to store.
+
+### Fixed: the callback discarded the reason entirely
+
+This is why the bug was hard to find. `AdminHandler.Callback` rendered a generic message
+and **logged nothing**, so a scope mismatch looked identical to a bad code, a replayed
+state, and a provider outage.
+
+The handler now records the cause and the failing stage. The user-facing message is still
+generic, because the cause can carry provider detail — but that is only safe if it is
+recorded somewhere. The page now also points at the log.
+
+### How it was found
+
+The token endpoint was probed directly with the real client credentials and a deliberately
+invalid code:
+
+```
+admin redirect URI -> invalid_grant: Malformed auth code.
+api   redirect URI -> invalid_grant: Malformed auth code.
+```
+
+`invalid_grant` rather than `invalid_client` or `redirect_uri_mismatch` proves the client
+ID, the client secret, **and both registered redirect URIs are correct** — which ruled
+out the whole configuration and pointed at the code after the exchange.
+
+### Tests
+
+- `TestFetchSubjectUsesDriveAboutNotOpenIDConnect` asserts the exact path, that it is not
+  under `/files`, and that the subject is the permission id.
+- `TestFetchSubjectReportsWhyItFailed` requires the provider's reason to survive.
+- `TestAdminCallbackLogsTheRealFailureReason` and
+  `TestAdminCallbackLogsAMissingFlowCookie` require the handler to log the cause and
+  stage while keeping it off the error page.
+
+### Not verified
+
+The fix has **not** been confirmed against a real access token — that needs a browser
+consent round trip. The diagnosis is certain (an `openid` grant is required for userinfo
+and Storvia does not request one), and Drive's `about` endpoint was confirmed to exist,
+but a successful connect has not yet been observed.
+
+## 2026-10-15 — Development launcher
+
+### Why
+
+Starting the service by hand — build, run, watch the log, open a browser, stop it — is
+easy to get subtly wrong, and one failure mode in particular has cost real debugging
+time more than once: **a stale process holding port 8080 makes the newly built binary
+look broken.** That was misdiagnosed as a routing fault before it was identified as an
+old process.
+
+### Added
+
+`scripts/dev.sh`, with `make dev`, `make dev-stop`, `make dev-status`, and `make dev-logs`.
+
+```
+scripts/dev.sh start      build, start with logging, open the admin panel
+scripts/dev.sh stop       stop it and restore anything that was changed
+scripts/dev.sh restart    stop then start
+scripts/dev.sh status     report what is running and where the logs are
+scripts/dev.sh logs       follow the log (Ctrl-C stops following, not the server)
+```
+
+Options: `--fresh` (new local database), `--no-open`, `--faults-off`.
+
+### What it refuses to do
+
+- **Start over a process it did not launch.** It names the holder of port 8080 and asks,
+  rather than killing a stranger.
+- **Start with a broken configuration.** The loader runs first with `-check`, so an
+  invalid config fails before any process exists to clean up.
+- **Claim success when the API died.** It waits for `/readyz` and tails the log if the
+  process exits during startup.
+
+`--faults-off` rewrites `simulate_drive_outage` so uploads take the real Drive path, and
+**restores the file on `stop`**. An override that silently persisted would make a later
+run quietly test the wrong thing.
+
+Output goes to `logs/`, which is gitignored along with the binary and the pid file.
+
+### Checks run
+
+Every command was exercised rather than assumed: start from a clean database, start
+again while running (correctly refused), stop, stop twice (idempotent), restart, status
+before and after, a missing secrets file, and a deliberately invalid configuration —
+which the validation gate rejected before starting. A stale port holder was simulated
+and correctly named.
+
+## 2026-10-15 — System-wide bug sweep, and the last stub endpoints removed
+
+### Why
+
+An instruction to fix everything found while testing the whole system. This entry
+records what was actually broken, including two bugs in code written earlier the same
+day.
+
+### Fixed: the Drive upload URL was wrong
+
+```go
+driveUploadURL = "https://www.googleapis.com/upload/drive/v3/files"  // already ends in /files
+endpoint       = driveUploadURL + "/files?uploadType=resumable"      // -> /files/files
+```
+
+Every resumable upload would have been rejected by Google with a 404. It was written
+and compiled an hour before it was caught, and only the new test suite found it, because
+nothing had yet called the real endpoint.
+
+**Lesson:** a constant ending in a resource name, concatenated with that same resource
+name, is a mistake waiting for someone to notice. The test now asserts the exact path.
+
+### Fixed: the admin connect flow could never complete
+
+`oauth2.googleapis.com/auth` is not a route. Google serves a 404 page, so the browser
+landed on it. Google splits its OAuth endpoints across two hosts:
+
+```
+accounts.google.com/o/oauth2/v2/auth   consent page   (was wrong)
+oauth2.googleapis.com/token            code exchange  (correct)
+oauth2.googleapis.com/revoke           revoke         (correct)
+```
+
+A test already existed, `TestAuthorizeURLCarriesTheRequiredParameters`, asserting six
+query parameters. All six were right. **It never asserted the host**, which is exactly how
+a wrong destination passes. A test name implying coverage is not coverage.
+
+### Fixed: a tenant with no Drive connection got an internal error
+
+`drive.Client.ConnectionID` documented that it returns `""` when no connection exists but
+propagated `ErrNoConnection` as an error, making the coordinator's `connectionID == ""`
+branch unreachable. A tenant who had never connected Drive received a wrapped internal
+error from `CreateUpload` instead of a routing decision.
+
+### Fixed: the development tenant was never created
+
+`POST /admin/fallback-consent` returned 502. Consent, connections, objects, and uploads
+all reference the tenant, and nothing inserted the row the admin panel names in
+configuration. The panel rendered perfectly and then failed on the first write.
+`TenantRepository.EnsureTenant` creates it during `Build`.
+
+### Removed: the proxy chunk endpoints
+
+`ModeDriveProxy`, `PATCH`/`POST .../chunks`, and `UploadHandler.Chunks` are gone. A
+resumable session makes proxying impossible: the server holds no copy of the bytes, so
+there is nothing to forward. An endpoint that could only ever answer "not implemented"
+advertises a capability that does not exist.
+
+### Added: reconciliation
+
+`POST /v1/storage/uploads/{id}/reconcile` previously answered "Reconciliation not
+implemented". It now asks the provider what actually landed and reports one of
+`already_ready`, `completed`, `nothing_stored`, `size_mismatch`, or `unknown`. It never
+retries and never re-uploads.
+
+The distinction between `nothing_stored` and `unknown` is the point. Only the first tells
+a client it may start over. For a Drive upload the answer is always `unknown`, because
+Storvia deliberately does not hold the resumable session and therefore cannot ask Google
+— and reporting `nothing_stored` would push a client into creating a duplicate file.
+
+### Added: Drive download and delete
+
+`contentSource` returned "not implemented" for both despite the verbs existing. Wired
+to `DownloadFile` and `DeleteFile`, with the same rule as everywhere else: the recorded
+provider only, never "try the other one".
+
+### SDKs rewritten for the session flow
+
+Both SDKs implemented the proxy flow, which is now impossible, and the TypeScript client
+decoded the complete response — `{object, already_complete}` — as a bare object.
+
+Go SDK: `UploadAll` streams to the Drive session in 256 KiB chunks, each declaring its
+own `Content-Range`; `CompleteDrive` sends the reported file id; `ReconcileUpload`
+returns a typed outcome.
+
+TypeScript SDK: the same flow via `fetch`, plus `DriveSession`, `ReconcileResult`, and a
+corrected `completeUpload`.
+
+### Tests
+
+| Area | Before | After |
+|---|---|---|
+| `internal/storage/provider/drive` | 25.9% | 46.8% |
+| `internal/httpapi` | 36.8% | 46.0% |
+
+The drive tests use a `RoundTripper` that intercepts every request, because the provider's
+endpoints are absolute constants pointing at googleapis.com and a `httptest.Server` alone
+would have let the suite talk to the real Google.
+
+New: 13 drive file-verb tests, 7 reconcile tests, 6 SDK chunking tests, 10 HTTP
+integration tests driving the real handlers over a real database.
+
+The HTTP tests caught two more things. The `storage_objects.drive_connection_id` foreign
+key rejected a create whose connection did not exist — the constraint doing its job — and
+handlers read `PathValue`, which only a `ServeMux` populates.
+
+### Checks run
+
+```
+make check / check-all   # fmt, vet, test, -race — passed
+make sdk-ts-test         # 22 pass
+make test-live           # both live tests pass against real R2
+```
+
+Server started against a fresh database and every route probed: `/admin` 200, `/healthz`
+and `/readyz` 200, the API 401 without a session, consent POST 303 from the panel, and the
+panel reporting the R2 backend reachable.
+
+### Still not verified
+
+No live Google Drive request has ever run. The Drive upload path, the consent round trip,
+and the folder creation are exercised only against stubs. PostgreSQL still has never been
+executed.
+
+## 2026-10-15 — Drive resumable uploads, and the Google authorization endpoint was wrong
+
+### Why
+
+The admin panel could not connect an account: the authorization redirect 302'd to
+`https://oauth2.googleapis.com/auth`, which is not a route. Google serves a 404 error
+page, so the browser landed on it and the flow simply failed.
+
+### Fixed: the authorization endpoint did not exist
+
+```go
+authBase     = "https://oauth2.googleapis.com"
+authorizeURL = authBase + "/auth"   // 404 - not a route
+```
+
+Google splits its OAuth web endpoints across two hosts, and the split is not obvious:
+
+```
+accounts.google.com/o/oauth2/v2/auth   - the consent page       (was wrong)
+oauth2.googleapis.com/token            - exchanging the code   (was correct)
+oauth2.googleapis.com/revoke           - revoking a token      (was correct)
+```
+
+Verified by probe: `accounts.google.com/o/oauth2/v2/auth` answers 302, while
+`oauth2.googleapis.com/auth` answers 404. The token and revoke endpoints were checked
+the way they are actually used and are fine.
+
+**Why no test caught it.** `TestAuthorizeURLCarriesTheRequiredParameters` already existed
+and checked six query parameters. All six were correct. It never asserted the **host**,
+which is why a wrong destination passed. A test that checks the query but not where the
+request goes is the exact shape that lets this through. `endpoints_test.go` now asserts
+the host and path on the constant and through the real builder.
+
+**This means the admin connect flow could never have completed**, not merely that it was
+untested.
+
+### Added: Drive file transfer
+
+Drive had OAuth and connection management and no way to move a byte.
+
+- **`internal/storage/provider/drive/files.go`** — `InitiateUpload` (creates a resumable
+  session against the app-managed folder only), `FetchFile`, `DownloadFile`,
+  `DeleteFile`, and `UploadState`, which reads back how many bytes Drive accepted so a
+  partial upload is detectable rather than assumed.
+- **New mode `drive_resumable_session`.** Drive has no S3-style presigned URLs; its
+  equivalent is a resumable session that Drive mints and Storvia relays. The client
+  PUTs chunks straight to Google and no file content traverses Storvia.
+
+Drive requires every chunk except the last to be a 256 KiB multiple. `DriveResumableChunkMultiple`
+states that and `ChunkSizeIsValid` checks it, because a granularity Drive rejects
+partway through an upload is the worst place to discover the mistake.
+
+### A decision worth stating: the session URL is not persisted
+
+The session URI is a bearer capability — anyone holding it can write to that one file.
+It is returned once, never stored, never logged, and never replayed: a repeated
+idempotent request gets the existing upload back without the capability. The test
+`TestDriveSessionIsNotStoredDurably` exists to keep it that way.
+
+That has a consequence. Storvia cannot learn the resulting file ID on its own, so the
+client reports it at completion. **That ID is untrusted input** and is treated as a
+lookup key: `CompleteDriveUpload` re-reads the file from Drive and adopts it only if it
+is inside the app-managed folder, is not trashed, and has the declared size. Without the
+folder check a client could point an upload at any other file in its account that
+happened to be the right size and Storvia would adopt it as its own.
+
+Completion refuses a size mismatch as `uncertain` rather than committing, because a
+truncated upload that became "ready" would only be discovered when someone tried to open
+the file.
+
+### Added: a development testing dashboard
+
+The old panel showed connection state and said "file transfer is not implemented yet".
+It now reports what the deployment can **actually do**, which required measuring rather
+than reading configuration — the distinction that matters, and the one that hid three
+inert dependencies in this session.
+
+It shows: the fault-injection banner, fallback enabled/vendors, **tenant consent** with
+an inline accept button, one row per backup provider with a **real reachability probe**
+against the provider, and stored-object counts.
+
+When consent is missing it explains why: configuration alone does not grant it, because
+that moves files outside the user's own Drive.
+
+### Fixed: the development tenant was never created
+
+`POST /admin/fallback-consent` returned 502. Every scoped row — consent, Drive
+connections, objects — references the tenant, and nothing ever inserted the row the
+admin panel names in configuration. `TenantRepository.EnsureTenant` now creates it during
+`Build` when the panel is enabled. The panel looked fine right up until the first write,
+which is the least useful moment to find out.
+
+### Checks run
+
+```
+make check / check-all   # fmt, vet, test, -race — passed
+make test-live           # both live tests pass against real R2
+make sdk-ts-test         # 19 pass
+```
+
+The panel was verified against a running server: consent went from "never asked" to
+"granted", and the R2 probe reported the provider reachable.
+
 ## 2026-10-15 — Fallback endpoints moved out of the checked-in configuration
 
 ### Why

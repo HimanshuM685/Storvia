@@ -29,6 +29,26 @@ build: ## Compile the API binary
 run: ## Run the API with the development config and env file
 	$(GO) run ./cmd/storvia-api -config $(CONFIG) -env $(ENV)
 
+.PHONY: dev
+dev: ## Build, start the API with logging, and open the admin panel
+	@scripts/dev.sh start
+
+.PHONY: dev-fresh
+dev-fresh: ## Start with a new local database
+	@scripts/dev.sh start --fresh
+
+.PHONY: dev-stop
+dev-stop: ## Stop the development API
+	@scripts/dev.sh stop
+
+.PHONY: dev-status
+dev-status: ## Report whether the development API is running
+	@scripts/dev.sh status
+
+.PHONY: dev-logs
+dev-logs: ## Follow the development API log
+	@scripts/dev.sh logs
+
 .PHONY: check-config
 check-config: ## Validate configuration without serving
 	$(GO) run ./cmd/storvia-api -config $(CONFIG) -env $(ENV) -check

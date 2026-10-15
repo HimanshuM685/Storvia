@@ -118,7 +118,7 @@ func (c *Client) ExchangeWithRedirect(ctx context.Context, scope Scope, code, st
 		return ExchangeResult{}, classifyTokenError(resp.StatusCode, body)
 	}
 
-	values, err := parseFormURL(body)
+	values, err := parseTokenResponse(body)
 	if err != nil {
 		return ExchangeResult{}, err
 	}
@@ -198,30 +198,81 @@ func classifyTokenError(status int, body []byte) error {
 }
 
 // fetchSubject reads the authenticated user's subject identifier.
+// fetchSubject identifies the Google account an access token belongs to.
+//
+// It asks Drive's own `about` endpoint rather than OpenID Connect's userinfo. That is
+// not a stylistic choice: the userinfo endpoint requires an `openid` grant, and
+// Storvia deliberately requests only `drive.file`. A Drive-scoped access token is
+// rejected there with a 401, so every connection failed at exactly this step — after
+// the user had already consented, which is the worst place to discover it.
+//
+// Drive's `about` is inside the `drive.file` scope, so identifying the user costs no
+// additional permission.
 func (c *Client) fetchSubject(ctx context.Context, accessToken string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://openidconnect.googleapis.com/v1/userinfo", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		driveAboutURL+"?fields=user&supportsAllDrives=true", nil)
 	if err != nil {
-		return "", fmt.Errorf("drive: build userinfo request: %w", err)
+		return "", fmt.Errorf("drive: build about request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
 	resp, err := c.cfg.HTTPClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("drive: userinfo unreachable: %w", err)
+		return "", fmt.Errorf("drive: about unreachable: %w", err)
 	}
 	defer drainAndClose(resp)
 
-	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("drive: could not identify the google account (status %d)", resp.StatusCode)
-	}
 	body, _ := readBounded(resp.Body)
+	if resp.StatusCode >= 400 {
+		// The body is worth keeping here: it is the only place the real reason
+		// (an expired token, a revoked grant, a missing scope) is visible.
+		return "", fmt.Errorf("drive: could not identify the google account (status %d: %s)",
+			resp.StatusCode, summariseGoogleError(body))
+	}
+
 	var payload struct {
-		Sub string `json:"sub"`
+		User struct {
+			// permissionId is Google's stable per-account identifier. The email
+			// address is not used: it can change, and it is personal data Storvia
+			// has no reason to store.
+			PermissionID string `json:"permissionId"`
+			EmailAddress string `json:"emailAddress"`
+			DisplayName  string `json:"displayName"`
+		} `json:"user"`
 	}
-	if err := json.Unmarshal(body, &payload); err != nil || payload.Sub == "" {
-		return "", errors.New("drive: the userinfo response did not contain a subject")
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", fmt.Errorf("drive: the about response could not be read: %w", err)
 	}
-	return payload.Sub, nil
+	if payload.User.PermissionID == "" {
+		// Fall back to the address so the connection is not lost to a field that
+		// is normally present but is not guaranteed.
+		if payload.User.EmailAddress == "" {
+			return "", errors.New("drive: the about response identified no account")
+		}
+		return payload.User.EmailAddress, nil
+	}
+	return payload.User.PermissionID, nil
+}
+
+// summariseGoogleError trims a Google error body to something loggable.
+func summariseGoogleError(body []byte) string {
+	var payload struct {
+		Error struct {
+			Message string `json:"message"`
+			Status  string `json:"status"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err == nil && payload.Error.Message != "" {
+		return payload.Error.Status + ": " + payload.Error.Message
+	}
+	trimmed := strings.TrimSpace(string(body))
+	if len(trimmed) > 200 {
+		return trimmed[:200] + "..."
+	}
+	if trimmed == "" {
+		return "no body"
+	}
+	return trimmed
 }
 
 // revoke invalidates a refresh token at Google.

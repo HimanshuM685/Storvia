@@ -5,7 +5,6 @@ import (
 	"io"
 	"log/slog"
 	"testing"
-	"time"
 
 	"github.com/shovan04/storvia/internal/persistence"
 )
@@ -50,12 +49,7 @@ func TestBuildWiresTheOutageFallbackDependencies(t *testing.T) {
 	// wrong the symptom is identical to "the tenant declined", which is exactly the
 	// failure this test exists to prevent.
 	scope := persistence.Scope{TenantID: "tenant_wiring_check", UserID: "user_wiring_check"}
-	now := time.Now().UTC()
-	if _, err := built.Store.DB().Exec(
-		`INSERT INTO tenants (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)`,
-		scope.TenantID, scope.TenantID, now, now); err != nil {
-		t.Fatalf("seed tenant: %v", err)
-	}
+	seedTenant(t, built.Store, scope.TenantID)
 
 	view, err := built.Consent.Show(context.Background(), scope)
 	if err != nil {

@@ -69,7 +69,7 @@ func (c *Client) accessToken(ctx context.Context, connection Connection) (string
 		return "", c.classifyRefreshFailure(connection, resp.StatusCode, body)
 	}
 
-	values, err := parseFormURL(body)
+	values, err := parseTokenResponse(body)
 	if err != nil {
 		return "", &policy.ProviderError{
 			Provider: c.Name(), Operation: "TokenRefresh", Class: policy.ClassUnknown, Err: err,

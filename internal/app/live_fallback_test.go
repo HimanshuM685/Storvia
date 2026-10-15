@@ -172,14 +172,10 @@ func TestLiveFallbackDriveOutageRoutesUploadToR2(t *testing.T) {
 	// row has to exist. The admin panel normally creates it through a real OAuth round
 	// trip, which this test cannot do without a Google account. The refresh token is a
 	// placeholder: Drive is forced unavailable, so the preflight never reads it.
-	// The tenant row the consent and connection records hang off is normally created
-	// by the application on first use; the in-memory database starts empty.
-	now := time.Now().UTC()
-	if _, err := built.Store.DB().Exec(
-		`INSERT INTO tenants (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)`,
-		scope.TenantID, scope.TenantID, now, now); err != nil {
-		t.Fatalf("seed the tenant: %v", err)
-	}
+	// Build already seeds the configured development tenant, so this is a no-op in
+	// practice. It is written to tolerate either case because the test must not
+	// depend on which layer happens to create the row.
+	seedTenant(t, built.Store, scope.TenantID)
 
 	seedDriveConnection(t, built.Store, scope, os.Getenv(config.EnvEncryptionKey))
 
@@ -329,5 +325,17 @@ func seedDriveConnection(t *testing.T, store *persistence.Store, scope persisten
 		time.Now().UTC(), time.Now().UTC())
 	if err != nil {
 		t.Fatalf("seed the Drive connection: %v", err)
+	}
+}
+
+// seedTenant creates a tenant row if it is absent.
+func seedTenant(t *testing.T, store *persistence.Store, tenantID string) {
+	t.Helper()
+	now := time.Now().UTC()
+	if _, err := store.DB().Exec(
+		`INSERT INTO tenants (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)
+		 ON CONFLICT (id) DO NOTHING`,
+		tenantID, tenantID, now, now); err != nil {
+		t.Fatalf("seed tenant %s: %v", tenantID, err)
 	}
 }

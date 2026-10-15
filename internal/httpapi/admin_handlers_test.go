@@ -1,8 +1,10 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -169,5 +171,63 @@ func TestAdminDisconnectRequiresSessionAndUsesConfiguredScope(t *testing.T) {
 	handler.Disconnect(response, authorized)
 	if response.Code != http.StatusSeeOther || !connections.disconnected {
 		t.Fatalf("disconnect status = %d, disconnected = %v", response.Code, connections.disconnected)
+	}
+}
+
+// TestAdminCallbackLogsTheRealFailureReason is the guard for a debugging dead end.
+//
+// The callback showed the user "Google Drive authorization could not be completed" and
+// recorded nothing anywhere. A scope mismatch in the OAuth exchange therefore looked
+// identical to a bad code, a replayed state, and a provider outage — and went
+// uninvestigated for a whole session.
+//
+// The user-facing message stays generic on purpose; the point is that the cause must
+// reach the log.
+func TestAdminCallbackLogsTheRealFailureReason(t *testing.T) {
+	var logged bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	handler, _, _ := newAdminTestHandler(t, &adminConnectionsStub{
+		completeErr: errors.New("drive: about returned 401 UNAUTHENTICATED"),
+	})
+	handler.log = logger
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/oauth/callback?code=code-test&state=state-test", nil)
+	req.AddCookie(&http.Cookie{Name: "storvia_admin_flow", Value: "flow-value"})
+	rec := httptest.NewRecorder()
+
+	handler.Callback(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if logged.Len() == 0 {
+		t.Fatal("the failure reason was discarded; nothing was logged")
+	}
+	for _, want := range []string{"complete_connect", "UNAUTHENTICATED"} {
+		if !strings.Contains(logged.String(), want) {
+			t.Errorf("log does not mention %q:\n%s", want, logged.String())
+		}
+	}
+	// The page itself must not carry the provider detail.
+	if strings.Contains(rec.Body.String(), "UNAUTHENTICATED") {
+		t.Error("the error page must not leak the provider's reason")
+	}
+}
+
+// TestAdminCallbackLogsAMissingFlowCookie covers the other silent branch.
+func TestAdminCallbackLogsAMissingFlowCookie(t *testing.T) {
+	var logged bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	handler, _, _ := newAdminTestHandler(t, &adminConnectionsStub{})
+	handler.log = logger
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/oauth/callback?code=code-test&state=state-test", nil)
+	rec := httptest.NewRecorder()
+	handler.Callback(rec, req)
+
+	if !strings.Contains(logged.String(), "flow_cookie") {
+		t.Errorf("a missing flow cookie must be logged:\n%s", logged.String())
 	}
 }

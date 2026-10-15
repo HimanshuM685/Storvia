@@ -46,12 +46,6 @@ type CompleteUploadResult struct {
 // ready rather than writing again, because a second write is precisely what the
 // no-copies rule forbids.
 func (s *UploadService) CompleteUpload(ctx context.Context, scope persistence.Scope, uploadID string) (CompleteUploadResult, error) {
-	if s.deps.FallbackUploader == nil {
-		return CompleteUploadResult{}, apperr.New(apperr.KindProviderNotConfigured,
-			"Provider transfer not implemented",
-			"upload completion is not available for the selected provider")
-	}
-
 	upload, err := s.deps.Uploads.Get(ctx, scope, uploadID)
 	if err != nil {
 		return CompleteUploadResult{}, apperr.NotFound("no such upload for this account")
@@ -74,10 +68,18 @@ func (s *UploadService) CompleteUpload(ctx context.Context, scope persistence.Sc
 		return CompleteUploadResult{}, apperr.Uncertain("this upload has no active attempt to complete")
 	}
 
-	if object.Provider != model.ProviderS3Compatible {
+	if object.Provider == model.ProviderGoogleDrive {
+		// Reachable only if a caller uses the generic entry point for a Drive
+		// upload. The HTTP handler routes Drive correctly; pointing here is more
+		// useful than a generic "not implemented".
+		return CompleteUploadResult{}, apperr.New(apperr.KindProviderNotConfigured,
+			"Drive completion needs the file id",
+			"complete a drive upload with CompleteDriveUpload, passing the file id google returned")
+	}
+	if s.deps.FallbackUploader == nil {
 		return CompleteUploadResult{}, apperr.New(apperr.KindProviderNotConfigured,
 			"Provider transfer not implemented",
-			"completion is only implemented for the S3-compatible fallback provider")
+			"upload completion is not available for the selected provider")
 	}
 	if object.BackendID == nil || object.ProviderObjectKey == nil {
 		return CompleteUploadResult{}, apperr.Internal("the object's storage location is inconsistent")

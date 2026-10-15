@@ -63,8 +63,12 @@ func TestCreateUploadSendsTheIdempotencyKey(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"upload_id": "upl_1", "object_id": "obj_1", "mode": "drive_proxy",
-			"provider": "google_drive", "state": "uploading", "chunk_size": 8388608,
+			"upload_id": "upl_1", "object_id": "obj_1", "mode": "drive_resumable_session",
+			"provider": "google_drive", "state": "uploading", "chunk_size": 262144,
+			"session": map[string]any{
+				"url":        "https://www.googleapis.com/upload/drive/v3/files?upload_id=s1",
+				"chunk_size": 262144,
+			},
 		})
 	})
 
@@ -82,8 +86,11 @@ func TestCreateUploadSendsTheIdempotencyKey(t *testing.T) {
 	if receivedBody["size_bytes"] != float64(2048) {
 		t.Errorf("size_bytes = %v, want 2048", receivedBody["size_bytes"])
 	}
-	if result.Mode != ModeDriveProxy {
-		t.Errorf("mode = %q, want drive_proxy", result.Mode)
+	if result.Mode != ModeDriveResumableSession {
+		t.Errorf("mode = %q, want drive_resumable_session", result.Mode)
+	}
+	if result.Session == nil || result.Session.URL == "" {
+		t.Error("the resumable session must be decoded from the response")
 	}
 }
 

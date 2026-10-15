@@ -260,11 +260,18 @@ func TestUploadModeValuesAreDistinct(t *testing.T) {
 	// The two modes are deliberately different values: a Drive resumable session
 	// is not an S3 presigned URL, and a client that treats them as the same will
 	// build the wrong transfer.
-	if ModeDriveProxy == ModeS3PresignedParts {
+	if ModeDriveResumableSession == ModeS3PresignedParts {
 		t.Error("the two upload modes must be distinct")
 	}
-	if string(ModeDriveProxy) != "drive_proxy" || string(ModeS3PresignedParts) != "s3_presigned_parts" {
-		t.Error("the wire values of the upload modes are part of the API contract")
+	// The wire values are part of the API contract. A client switches on these
+	// strings, so changing one silently breaks every deployed client.
+	for mode, want := range map[UploadMode]string{
+		ModeS3PresignedParts:      "s3_presigned_parts",
+		ModeDriveResumableSession: "drive_resumable_session",
+	} {
+		if string(mode) != want {
+			t.Errorf("wire value = %q, want %q", string(mode), want)
+		}
 	}
 }
 

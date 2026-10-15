@@ -23,7 +23,46 @@ export type ErrorKind =
   | 'internal';
 
 /** The transfer mechanism the server selected. The client never chooses a provider. */
-export type UploadMode = 'drive_proxy' | 's3_presigned_parts';
+export type UploadMode = 'drive_resumable_session' | 's3_presigned_parts';
+
+/**
+ * A Drive resumable upload session.
+ *
+ * `url` is a write capability for exactly one file: anyone holding it can write to
+ * that file until the session expires. Treat it as a secret. Storvia hands it out once
+ * and never stores it, so it cannot be recovered if lost.
+ */
+export interface DriveSession {
+  url: string;
+  chunk_size: number;
+  expires_at: string;
+}
+
+/** What the server found when it asked the provider about an unfinished upload. */
+export interface ReconcileResult {
+  upload_id: string;
+  object_id: string;
+  provider: string;
+  state: string;
+  /**
+   * - `already_ready` the upload finished long ago
+   * - `completed` the provider has the bytes; Storvia recorded that
+   * - `nothing_stored` the provider is certain nothing landed; safe to retry
+   * - `size_mismatch` something is there but not what was declared
+   * - `unknown` nobody can tell, which is NOT the same as `nothing_stored`
+   *
+   * Only `nothing_stored` means it is safe to start the upload again.
+   */
+  outcome: string;
+  reason?: string;
+  location?: string;
+}
+
+/** The reply from the complete endpoint. */
+interface CompleteResponse {
+  object: StorviaObject;
+  already_complete: boolean;
+}
 
 /** RFC 9457 problem details, as returned for every failure. */
 export interface Problem {
@@ -129,6 +168,8 @@ export interface CreateUploadResult {
   upload_id: string;
   object_id: string;
   mode: UploadMode;
+  /** Set in Drive mode. Its URL is a write capability for this one file. */
+  session?: DriveSession;
   provider: string;
   state: string;
   /** True when this answers an idempotent repeat rather than a new provider write. */
@@ -427,19 +468,6 @@ export class StorviaClient {
   }
 
   /**
-   * Resolves an ambiguous outcome on the provider the upload is already pinned to.
-   *
-   * Safe to call repeatedly; it never creates a second storage location.
-   */
-  reconcileUpload(uploadId: string, options?: RequestOptions): Promise<UploadView> {
-    return this.request<UploadView>(
-      'POST',
-      `/v1/storage/uploads/${encodeURIComponent(uploadId)}/reconcile`,
-      { options },
-    );
-  }
-
-  /**
    * Abandons an upload that has not begun writing bytes.
    *
    * The server refuses this once the upload may already have written data. That
@@ -453,24 +481,42 @@ export class StorviaClient {
     );
   }
 
-  /** Sends one chunk of a Drive proxy upload. */
-  async sendChunk(
+  /**
+   * Finalizes an upload.
+   *
+   * For the Drive mode, `driveFileId` is the id Google returned in the final chunk
+   * response. Storvia treats it as untrusted input and re-reads the file from Drive,
+   * adopting it only if it sits in the Storvia folder, is not trashed, and has the
+   * declared size.
+   *
+   * Idempotent: repeating it returns the existing object.
+   */
+  async completeUpload(
     uploadId: string,
-    chunk: BodyInit,
+    driveFileId?: string,
     options?: RequestOptions,
-  ): Promise<UploadView> {
-    return this.request<UploadView>(
-      'PATCH',
-      `/v1/storage/uploads/${encodeURIComponent(uploadId)}/chunks`,
-      { raw: chunk, options },
-    );
-  }
-
-  /** Finalizes an upload. Idempotent: repeating it returns the existing object. */
-  completeUpload(uploadId: string, options?: RequestOptions): Promise<StorviaObject> {
-    return this.request<StorviaObject>(
+  ): Promise<StorviaObject> {
+    const response = await this.request<CompleteResponse>(
       'POST',
       `/v1/storage/uploads/${encodeURIComponent(uploadId)}/complete`,
+      { body: driveFileId ? { drive_file_id: driveFileId } : undefined, options },
+    );
+    return response.object;
+  }
+
+  /**
+   * Asks the server what actually happened to an unfinished upload.
+   *
+   * It reports; it never retries and never re-uploads. Read the outcome before
+   * starting over: an upload that is merely unknown may well have succeeded.
+   */
+  async reconcileUpload(
+    uploadId: string,
+    options?: RequestOptions,
+  ): Promise<ReconcileResult> {
+    return this.request<ReconcileResult>(
+      'POST',
+      `/v1/storage/uploads/${encodeURIComponent(uploadId)}/reconcile`,
       { options },
     );
   }
@@ -591,20 +637,86 @@ export class StorviaClient {
     if (result.mode === 's3_presigned_parts') {
       // The presigned flow uploads straight to the provider with the returned
       // capabilities, so there is nothing for this helper to stream.
-      return { result, object: await this.completeUpload(result.upload_id, options) };
+      return { result, object: await this.completeUpload(result.upload_id, undefined, options) };
     }
 
-    const chunkSize = result.chunk_size > 0 ? result.chunk_size : 8 * 1024 * 1024;
-    let offset = result.uploaded_bytes;
+    const session = result.session;
+    if (!session || !session.url) {
+      throw new StorviaError({
+        kind: 'unavailable',
+        status: 502,
+        title: 'No Drive session',
+        detail: 'The server did not return a Drive resumable session for this upload.',
+      });
+    }
+
+    const driveFileId = await this.uploadToDriveSession(session, result.chunk_size, body);
+
+    // Google returns the created file in the final chunk response. That id is the
+    // only way Storvia can learn where the file went, because it deliberately does
+    // not keep the session itself.
+    return {
+      result,
+      object: await this.completeUpload(result.upload_id, driveFileId, options),
+    };
+  }
+
+  /**
+   * Streams a file into a Drive resumable session and returns the resulting file id.
+   *
+   * Every chunk except the last is a multiple of 256 KiB, because Drive rejects
+   * anything else, and each chunk declares its own byte range. Without that range a
+   * retry cannot be distinguished from the original and the file ends up with a
+   * hole in it.
+   */
+  private async uploadToDriveSession(
+    session: DriveSession,
+    chunkSize: number,
+    body: Blob,
+  ): Promise<string> {
+    const size = Math.max(chunkSize || session.chunk_size || 256 * 1024, 1);
+    let offset = 0;
+    let fileId: string | undefined;
 
     while (offset < body.size) {
-      const slice = body.slice(offset, Math.min(offset + chunkSize, body.size));
-      const view = await this.sendChunk(result.upload_id, slice, options);
-      // The server's confirmed offset is authoritative. Resume from it, never from
-      // an assumed value.
-      offset = view.uploaded_bytes > offset ? view.uploaded_bytes : offset + slice.size;
+      const end = Math.min(offset + size, body.size);
+      const slice = body.slice(offset, end);
+
+      const response = await fetch(session.url, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Range': `bytes ${offset}-${end - 1}/${body.size}`,
+        },
+        body: slice,
+      });
+
+      // 308 asks for more; 200 and 201 mean the file is finished and carry the
+      // created resource.
+      if (response.status === 200 || response.status === 201) {
+        const created = (await response.json()) as { id?: string };
+        fileId = created.id;
+      } else if (response.status !== 308) {
+        throw new StorviaError({
+          kind: 'unavailable',
+          status: 502,
+          title: 'Drive rejected a chunk',
+          detail:
+            `Google Drive rejected the byte range ${offset}-${end - 1}/${body.size} ` +
+            `with status ${response.status}.`,
+        });
+      }
+      offset = end;
     }
 
-    return { result, object: await this.completeUpload(result.upload_id, options) };
+    if (!fileId) {
+      throw new StorviaError({
+        kind: 'unavailable',
+        status: 502,
+        title: 'No file id',
+        detail: 'Google Drive did not return a file id, so the upload cannot be completed.',
+      });
+    }
+    return fileId;
   }
 }

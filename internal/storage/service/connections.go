@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"strings"
+
 	"github.com/shovan04/storvia/internal/apperr"
 	"github.com/shovan04/storvia/internal/persistence"
 	"github.com/shovan04/storvia/internal/storage/provider/drive"
@@ -155,8 +157,19 @@ func (d *DriveConnector) CompleteConnectAt(ctx context.Context, scope persistenc
 }
 
 func (d *DriveConnector) completeConnectAt(ctx context.Context, scope persistence.Scope, code, state, browserBinding, redirectURI string) error {
-	_, err := d.client.ExchangeWithRedirect(ctx, drive.Scope{TenantID: scope.TenantID, UserID: scope.UserID}, code, state, browserBinding, redirectURI)
+	result, err := d.client.ExchangeWithRedirect(ctx, drive.Scope{TenantID: scope.TenantID, UserID: scope.UserID}, code, state, browserBinding, redirectURI)
 	if err == nil {
+		// The app folder is created here, at connection time, rather than lazily on
+		// the first upload. Doing it later would mean the first upload could fail for
+		// a reason the user cannot act on, and it would happen at the worst moment.
+		//
+		// A failure here is logged rather than fatal: the account is connected and the
+		// grant is stored, so failing the whole callback would discard a working
+		// authorization and force the user to consent again.
+		if folderErr := d.ensureRootFolder(ctx, scope, result.Connection.ID); folderErr != nil {
+			d.client.LogWarn(ctx, "connected, but the storvia drive folder could not be prepared",
+				"reason", folderErr.Error())
+		}
 		return nil
 	}
 	if errors.Is(err, drive.ErrNotConfigured) {
@@ -166,6 +179,68 @@ func (d *DriveConnector) completeConnectAt(ctx context.Context, scope persistenc
 		return err
 	}
 	return apperr.Wrap(err, apperr.KindInternal, "Internal error", "the drive connection could not be completed")
+}
+
+// ensureRootFolder finds or creates the app-managed folder and records its id.
+func (d *DriveConnector) ensureRootFolder(ctx context.Context, scope persistence.Scope, connectionID string) error {
+	state, err := d.client.EnsureRootFolder(ctx, scope)
+	if err != nil {
+		return err
+	}
+	if state.Ambiguous {
+		// Reported, not resolved. Picking one of two folders called Storvia would
+		// silently split the user's files; making another would make it permanent.
+		return fmt.Errorf("drive: %d folders are named %q (%s); the storvia drive folder is ambiguous and was not chosen",
+			len(state.Candidates), state.Name, strings.Join(state.Candidates, ", "))
+	}
+	if state.FolderID == "" {
+		return fmt.Errorf("drive: the %q folder was not created", state.Name)
+	}
+	return d.client.SetRootFolderID(ctx, connectionID, state.FolderID)
+}
+
+// RecoverRootFolder re-runs folder discovery on an explicit user request.
+//
+// It is the recovery path when the folder has been deleted. It is not automatic,
+// because creating a replacement without being asked would move a boundary the user
+// controls without telling them.
+//
+// It will reuse an existing folder if one is found; only an explicit choice resolves an
+// ambiguous name.
+func (d *DriveConnector) RecoverRootFolder(ctx context.Context, scope persistence.Scope, connectionID string) error {
+	return d.ensureRootFolder(ctx, scope, connectionID)
+}
+
+// EnsureRootFolder creates the app-managed folder if it does not exist and records
+// its id. It is safe to call at any time; an existing folder is reused.
+func (s *ConnectionService) EnsureRootFolder(ctx context.Context, scope persistence.Scope) error {
+	connector, ok := s.connector.(FolderConnector)
+	if !ok {
+		return apperr.ProviderNotConfigured("the configured drive connector cannot manage the storvia folder")
+	}
+	connection, err := connector.ConnectionIDFor(ctx, scope)
+	if err != nil {
+		return err
+	}
+	return connector.RecoverRootFolder(ctx, scope, connection)
+}
+
+// FolderConnector is the folder-management subset of the Drive connector.
+type FolderConnector interface {
+	ConnectionIDFor(ctx context.Context, scope persistence.Scope) (string, error)
+	RecoverRootFolder(ctx context.Context, scope persistence.Scope, connectionID string) error
+}
+
+// ConnectionIDFor returns the tenant's Drive connection id.
+func (d *DriveConnector) ConnectionIDFor(ctx context.Context, scope persistence.Scope) (string, error) {
+	id, err := d.client.ConnectionID(ctx, scope)
+	if err != nil {
+		return "", apperr.Wrap(err, apperr.KindInternal, "Internal error", "the drive connection could not be resolved")
+	}
+	if id == "" {
+		return "", apperr.NotFound("no google drive connection exists for this account")
+	}
+	return id, nil
 }
 
 // Status reports the connection state.

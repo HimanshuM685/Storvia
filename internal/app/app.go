@@ -161,6 +161,27 @@ func Build(ctx context.Context, opts Options) (*App, error) {
 		RedirectURI: cfg.Drive.AdminRedirectURI,
 		Secure:      cfg.Auth.SecureCookie,
 	}, issuer, sessions, connections)
+	// The development tenant named by configuration must exist before anything can be
+	// written for it. Consent, Drive connections, and objects all reference the
+	// tenant, so without this row the panel appears to work right up until the first
+	// write, which is the least useful moment to discover it.
+	if cfg.AdminPanel.Enabled && cfg.AdminPanel.TenantID != "" {
+		if err := persistence.NewTenantRepository(store).EnsureTenant(
+			context.Background(), cfg.AdminPanel.TenantID, "Storvia development tenant"); err != nil {
+			cacheBackend.Close()
+			store.Close()
+			return nil, fmt.Errorf("app: development tenant: %w", err)
+		}
+	}
+
+	// The panel reports what the deployment can actually do, which requires the
+	// built service rather than the configuration that produced it.
+	admin = admin.WithLogger(logger).WithFolderEnsurer(connections).WithDiagnostics(
+		newDiagnostics(app, persistence.Scope{TenantID: cfg.AdminPanel.TenantID, UserID: cfg.AdminPanel.UserID},
+			backends, driveClient.FaultsEnabled()),
+		consentAccepter{consent},
+	)
+
 	app.Server = buildServer(cfg, logger, store, issuer, sessions, uploads, objects, connections, consent, admin, driveClient, cacheBackend)
 
 	app.DriveFaultsEnabled = driveClient.FaultsEnabled()
@@ -341,6 +362,7 @@ func buildServices(cfg *config.Config, store *persistence.Store, keyring secrets
 		Uploads:          uploadsRepo,
 		Attempts:         attempts,
 		Backends:         backendRepo,
+		DriveSessions:    newDriveSessions(driveClient),
 		FallbackUploader: newFallbackUploader(backends, int64(cfg.Uploads.S3PartSizeBytes), cfg.Uploads.PresignedURLTTL.Duration()),
 		Drive:            driveClient,
 		UploadLimits:     cfg.Uploads,

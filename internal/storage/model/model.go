@@ -302,6 +302,16 @@ type ObjectMetadata struct {
 	// Category is Storvia-internal metadata. It is never sent to a provider as
 	// user content.
 	Category string
+	// InAppFolder reports that the provider confirmed the object lives in the
+	// folder Storvia manages, rather than anywhere else in the account.
+	//
+	// It exists because a provider-reported object ID is untrusted input. Without
+	// this check a client could point an upload at any other file it happens to
+	// have, and Storvia would adopt it.
+	InAppFolder bool
+	// Trashed reports that the provider considers the object deleted. A trashed
+	// file must never be committed as ready.
+	Trashed bool
 }
 
 // SizeMatches reports whether a verified size equals the expected size.
@@ -361,15 +371,22 @@ type Progress struct {
 	FileID string
 }
 
-// UploadMode is the transfer mechanism advertised to a client. The two modes are
+// UploadMode is the transfer mechanism advertised to a client. The modes are
 // deliberately distinct: a Drive resumable session is not an S3 presigned URL, and
 // forcing both into one shape would mislead the client.
+//
+// There is no proxy mode. It was removed because a resumable session makes it
+// impossible: the server holds no copy of the bytes, so there is nothing to forward.
+// An endpoint that could only ever answer "not implemented" is worse than no
+// endpoint, because it advertises a capability that does not exist.
 type UploadMode string
 
 const (
-	// ModeDriveProxy streams chunks through the API so the session URI and the
-	// OAuth refresh token both stay server-side.
-	ModeDriveProxy UploadMode = "drive_proxy"
 	// ModeS3PresignedParts hands the client short-lived, operation-scoped URLs.
 	ModeS3PresignedParts UploadMode = "s3_presigned_parts"
+
+	// ModeDriveResumableSession hands the client a Drive resumable session URI to
+	// PUT chunks to. It is Drive's equivalent of an S3 presigned URL: the provider
+	// mints the capability and Storvia only relays it.
+	ModeDriveResumableSession UploadMode = "drive_resumable_session"
 )
