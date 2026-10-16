@@ -143,6 +143,17 @@ func (s *ObjectService) DeleteObject(ctx context.Context, scope persistence.Scop
 		return apperr.Wrap(err, apperr.KindInternal, "Internal error", "the deletion could not be started")
 	}
 
+	// An object that never reached a provider has nothing to remove from one. It was
+	// created and then abandoned -- an upload that was never finished, or one whose
+	// first attempt failed before anything was written. Asking a provider to delete
+	// what it never received returns a location error, which would schedule a retry
+	// that can never succeed, leaving the object pinned in `deleting` forever.
+	//
+	// This is why deleting these from the console failed rather than working.
+	if !object.ReachedProvider() {
+		return s.finishDelete(ctx, scope, object, model.ObjectDeleted)
+	}
+
 	if err := s.source.Delete(ctx, object); err != nil {
 		var providerErr *policy.ProviderError
 		if errorsAs(err, &providerErr) && providerErr.Class == policy.ClassMissing {
@@ -198,6 +209,106 @@ func (s *ObjectService) finishDelete(ctx context.Context, scope persistence.Scop
 		return apperr.Wrap(err, apperr.KindInternal, "Internal error", "the deletion could not be recorded")
 	}
 	return nil
+}
+
+// BulkDeleteResult summarises a clear-the-set request.
+//
+// It reports what happened one object at a time rather than a single boolean, because
+// a bulk delete can partly succeed: one provider can be unreachable while the rest
+// answer. Collapsing that to "failed" would hide the objects that were removed, and
+// collapsing it to "ok" would claim a file was deleted that still exists.
+type BulkDeleteResult struct {
+	Deleted int
+	Failed  []BulkDeleteFailure
+}
+
+// BulkDeleteFailure is one object that could not be deleted and why.
+type BulkDeleteFailure struct {
+	ObjectID string
+	Name     string
+	Reason   string
+}
+
+// DeleteAllObjects removes every object this account still has stored.
+//
+// It goes through DeleteObject one object at a time rather than issuing a bulk status
+// update. A delete has to reach the provider that actually holds the bytes; flipping
+// every row to `deleted` in one statement would leave the files sitting in Drive and
+// the fallback bucket with nothing in Storvia that knows about them, which is the
+// exact failure the single-object path exists to prevent.
+//
+// One failure does not stop the rest. An operator clearing a set wants as much removed
+// as the providers will allow, and nine successes with one failure reported is more
+// useful than stopping at the first hiccup.
+//
+// Each object is attempted once. A failure usually leaves the row in `deleting`, which
+// is still returned by the list, so without that the loop would retry the same failure
+// forever.
+func (s *ObjectService) DeleteAllObjects(ctx context.Context, scope persistence.Scope) (BulkDeleteResult, error) {
+	const batchSize = 200
+	// A bound rather than a promise. It exists so a bug cannot turn this into an
+	// unbounded loop; 25 batches of 200 is far more than a tenant should ever hold.
+	const maxBatches = 25
+
+	result := BulkDeleteResult{}
+	attempted := make(map[string]bool)
+
+	for batch := 0; batch < maxBatches; batch++ {
+		objects, err := s.objects.ListObjects(ctx, scope, batchSize)
+		if err != nil {
+			return result, apperr.Wrap(err, apperr.KindInternal, "Internal error",
+				"the stored objects could not be listed")
+		}
+		if len(objects) == 0 {
+			break
+		}
+
+		fresh := 0
+		for _, object := range objects {
+			if attempted[object.ID] {
+				continue
+			}
+			attempted[object.ID] = true
+			fresh++
+
+			if err := s.DeleteObject(ctx, scope, object.ID); err != nil {
+				result.Failed = append(result.Failed, BulkDeleteFailure{
+					ObjectID: object.ID,
+					Name:     object.OriginalName,
+					Reason:   deleteFailureReason(err),
+				})
+				continue
+			}
+			result.Deleted++
+		}
+
+		// Every listed object has already been attempted, so another pass would
+		// only re-list the failures.
+		if fresh == 0 {
+			break
+		}
+	}
+
+	return result, nil
+}
+
+// deleteFailureReason turns a service error into one line fit to show an operator.
+//
+// The Detail is used rather than the full Error() because the latter appends the
+// wrapped cause, which can carry provider internals. When there is no app error to
+// read a Detail from, the plain message is the best available and is still better
+// than reporting nothing.
+func deleteFailureReason(err error) string {
+	var appErr *apperr.Error
+	if errorsAs(err, &appErr) {
+		if appErr.Detail != "" {
+			return appErr.Detail
+		}
+		if appErr.Title != "" {
+			return appErr.Title
+		}
+	}
+	return err.Error()
 }
 
 // providerErrorToAppError maps a normalized provider error onto the shared error

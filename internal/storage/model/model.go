@@ -138,6 +138,20 @@ func (o *LogicalObject) Location() (Provider, error) {
 	}
 }
 
+// ReachedProvider reports whether any provider reference was ever recorded.
+//
+// It exists because status alone cannot answer this. An object that never left
+// Storvia has no provider reference at all, while one whose upload was interrupted
+// may be `uploading` and still hold a real Drive file id. Deleting the first needs no
+// provider call; deleting the second must go to the provider or it leaves a file
+// behind.
+//
+// It deliberately reads the reference fields rather than calling Location, which
+// refuses anything that is not ready.
+func (o *LogicalObject) ReachedProvider() bool {
+	return o.ProviderFileID != nil || o.ProviderObjectKey != nil
+}
+
 // Upload is the durable, idempotent record of one logical upload request. It
 // outlives any single attempt.
 type Upload struct {

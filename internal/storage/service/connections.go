@@ -49,6 +49,14 @@ type ConnectionStatus struct {
 	FolderPresent bool
 	LastSuccessAt *time.Time
 	Stale         bool
+	// Email, DisplayName and PictureURL identify the connected Google account so an
+	// operator can see who they are acting as.
+	//
+	// They are display only. ConnectionStatus is never an authorisation input, and the
+	// subject remains the identity.
+	Email       string
+	DisplayName string
+	PictureURL  string
 }
 
 // ConnectionService handles the Drive connection lifecycle.
@@ -258,6 +266,14 @@ func (d *DriveConnector) Status(ctx context.Context, scope persistence.Scope) (C
 
 	status.Status = raw.Status
 	status.Subject = raw.Subject
+	// A missing profile is not a failure: a connection made before the profile columns
+	// existed has none, and refusing to report status because of a cosmetic field would
+	// be the wrong trade.
+	if profile, err := d.client.AccountProfile(ctx, scope); err == nil {
+		status.Email = profile.Email
+		status.DisplayName = profile.DisplayName
+		status.PictureURL = profile.PictureURL
+	}
 	status.FolderPresent = raw.RootFolderID != ""
 	status.LastSuccessAt = raw.LastSuccessAt
 	status.Stale = drive.Stale(raw.LastSuccessAt, time.Now())

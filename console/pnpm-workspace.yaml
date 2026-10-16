@@ -1,0 +1,15 @@
+# The console serves no images, so sharp's native build is never needed.
+# Denying it keeps `pnpm install` clean and avoids a native toolchain requirement.
+allowBuilds:
+  sharp: false
+minimumReleaseAgeExclude:
+  - '@next/env@16.4.2'
+  - '@next/swc-darwin-arm64@16.4.2'
+  - '@next/swc-darwin-x64@16.4.2'
+  - '@next/swc-linux-arm64-gnu@16.4.2'
+  - '@next/swc-linux-arm64-musl@16.4.2'
+  - '@next/swc-linux-x64-gnu@16.4.2'
+  - '@next/swc-linux-x64-musl@16.4.2'
+  - '@next/swc-win32-arm64-msvc@16.4.2'
+  - '@next/swc-win32-x64-msvc@16.4.2'
+  - next@16.4.2

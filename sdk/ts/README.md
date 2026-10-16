@@ -3,10 +3,10 @@
 Client for the Storvia HTTP API, for browsers and Node.
 
 ```sh
-npm install
-npm run check     # type-check
-npm test          # run the test suite
-npm run build     # emit dist/
+pnpm install
+pnpm run check     # type-check
+pnpm test          # run the test suite
+pnpm run build     # emit dist/
 ```
 
 ## Creating a client

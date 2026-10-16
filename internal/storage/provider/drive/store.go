@@ -17,14 +17,23 @@ type Store interface {
 	// Resolve returns the connection for a scope with its token decrypted. It
 	// returns ErrNoConnection when the tenant has not connected Drive.
 	Resolve(ctx context.Context, scope persistence.Scope) (id, subject, refreshToken, status, rootFolderID string, err error)
-	// Upsert stores or refreshes a connection and returns its ID.
-	Upsert(ctx context.Context, scope persistence.Scope, subject, refreshToken string) (string, error)
+	// Upsert stores or refreshes a connection, and the profile of the account behind
+	// it, and returns its ID.
+	Upsert(ctx context.Context, scope persistence.Scope, subject, refreshToken string,
+		profile persistence.ConnectionProfile) (string, error)
 	// UpdateRefreshToken replaces a rotated refresh token.
 	UpdateRefreshToken(ctx context.Context, connectionID, refreshToken string) error
 	// SetStatus changes a connection's status.
 	SetStatus(ctx context.Context, connectionID, status string) error
 	// SetRootFolderID records the app-managed folder.
 	SetRootFolderID(ctx context.Context, connectionID, folderID string) error
+	// AccountProfile reports who the connected Google account is, for display.
+	//
+	// It is separate from Connection because Connection decrypts a refresh token and
+	// rendering a name has no business holding one.
+	AccountProfile(ctx context.Context, scope persistence.Scope) (persistence.ConnectionProfile, error)
+	// SaveAccountProfile persists the display columns only, never a credential.
+	SaveAccountProfile(ctx context.Context, scope persistence.Scope, profile persistence.ConnectionProfile) error
 	// ConnectionByID reads a connection for background work.
 	ConnectionByID(ctx context.Context, connectionID string) (persistence.DriveConnection, error)
 	// SetChangesCursor advances how far the change log has been processed.
@@ -73,12 +82,26 @@ func (r *storeResolver) Connection(ctx context.Context, scope persistence.Scope)
 	}, nil
 }
 
+// AccountProfile reports the connected account for display.
+func (r *storeResolver) AccountProfile(ctx context.Context, scope persistence.Scope) (persistence.ConnectionProfile, error) {
+	return r.store.AccountProfile(ctx, scope)
+}
+
+// SaveAccountProfile persists the display columns only.
+func (r *storeResolver) SaveAccountProfile(ctx context.Context, scope persistence.Scope, profile persistence.ConnectionProfile) error {
+	return r.store.SaveAccountProfile(ctx, scope, profile)
+}
+
 // SaveConnection stores or refreshes a connection.
 func (r *storeResolver) SaveConnection(ctx context.Context, connection Connection) error {
 	id, err := r.store.Upsert(ctx, persistence.Scope{
 		TenantID: connection.TenantID,
 		UserID:   connection.UserID,
-	}, connection.Subject, connection.RefreshToken)
+	}, connection.Subject, connection.RefreshToken, persistence.ConnectionProfile{
+		Email:       connection.Email,
+		DisplayName: connection.DisplayName,
+		PictureURL:  connection.PictureURL,
+	})
 	if err != nil {
 		return err
 	}

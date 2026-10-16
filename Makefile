@@ -98,16 +98,16 @@ test-live-drive: ## Run tests that read AND WRITE a real Google Drive account (n
 
 .PHONY: console
 console: ## Build the Next.js console into the Go binary's asset directory
-	@command -v npm >/dev/null || { echo "npm is not on PATH"; exit 1; }
-	cd console && npm install --silent && STORVIA_CONSOLE_EXPORT=1 npm run build
+	@command -v pnpm >/dev/null || { echo "pnpm is not on PATH"; exit 1; }
+	cd console && pnpm install --silent && STORVIA_CONSOLE_EXPORT=1 pnpm run build
 	rm -rf internal/httpapi/consoleout/assets
 	mkdir -p internal/httpapi/consoleout/assets
 	cp -R console/.next-export/. internal/httpapi/consoleout/assets/
 	@echo "console built into internal/httpapi/consoleout/assets"
 
 .PHONY: console-dev
-console-dev: ## Run the Next.js dev server against the Go API on :3001
-	cd console && npm run dev
+console-dev: ## Run the Next.js dev server against the Go API on :3001 (Turbopack)
+	cd console && pnpm run dev
 
 .PHONY: build-console
 build-console: console ## Build the API with the console embedded
@@ -132,11 +132,11 @@ check-all: fmt-check vet test test-race ## Run every Go check including the race
 
 .PHONY: sdk-ts-check
 sdk-ts-check: ## Type-check the TypeScript SDK
-	cd sdk/ts && npx tsc --noEmit --project tsconfig.json
+	cd sdk/ts && pnpm exec tsc --noEmit --project tsconfig.json
 
 .PHONY: sdk-ts-build
 sdk-ts-build: ## Build the TypeScript SDK
-	cd sdk/ts && npx tsc --project tsconfig.json
+	cd sdk/ts && pnpm exec tsc --project tsconfig.json
 
 .PHONY: sdk-ts-test
 sdk-ts-test: ## Run the TypeScript SDK tests

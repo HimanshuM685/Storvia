@@ -26,10 +26,24 @@ export function Banner({
   );
 }
 
-export function Card({ title, hint, children }: { title: string; hint?: string; children: ReactNode }) {
+export function Card({
+  title,
+  hint,
+  action,
+  children,
+}: {
+  title: ReactNode;
+  hint?: string;
+  /** An optional control shown on the same line as the title, e.g. a bulk action. */
+  action?: ReactNode;
+  children: ReactNode;
+}) {
   return (
     <section className="card">
-      <h2>{title}</h2>
+      <div className="card-head">
+        <h2>{title}</h2>
+        {action ? <div className="card-action">{action}</div> : null}
+      </div>
       {hint ? <p className="hint">{hint}</p> : null}
       {children}
     </section>

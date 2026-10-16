@@ -36,6 +36,10 @@ const nextConfig = exporting
   : {
       // No basePath and no trailingSlash in dev: the dev server owns the origin root, so
       // the console is at /. There is nothing to rewrite, because nothing is proxied.
+      // Next 16 blocks cross-origin access to its own dev resources (/_next/hmr) by
+      // default. The console is reached at 127.0.0.1 but the browser may present
+      // localhost, or vice versa, so both loopback names are allowed for hot reload.
+      allowedDevOrigins: ['127.0.0.1', 'localhost'],
       env: {
         // Where the API lives. The frontend calls it directly and Go's CORS answers.
         NEXT_PUBLIC_API_ORIGIN: process.env.STORVIA_API_ORIGIN || 'http://127.0.0.1:8080',

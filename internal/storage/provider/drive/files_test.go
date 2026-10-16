@@ -853,3 +853,99 @@ func TestInitiateDeclaresLengthInTheHeader(t *testing.T) {
 			declared)
 	}
 }
+
+// TestConnectStoresTheAccountProfile is the bug this prevents.
+//
+// The console could only ever show a configured id like "user_dev_admin" because the
+// display name, email and picture were fetched on every connect and thrown away --
+// Google's `about` call had all three on the wire.
+//
+// The test asserts they reach storage, because a field that is fetched and discarded is
+// indistinguishable from one that was never requested.
+func TestConnectStoresTheAccountProfile(t *testing.T) {
+	var resolver *stubResolver
+	client, r := newFileTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case req.URL.Path == "/token":
+			_, _ = w.Write([]byte(`{"access_token":"at","refresh_token":"rt","expires_in":3600}`))
+		case req.URL.Path == "/drive/v3/about":
+			_, _ = w.Write([]byte(`{"user":{
+				"permissionId":"perm-1",
+				"emailAddress":"shovan@example.com",
+				"displayName":"Shovan B",
+				"photoLink":"https://lh3.googleusercontent.com/a/abc123"}}`))
+		case req.URL.Path == "/drive/v3/files":
+			_, _ = w.Write([]byte(`{"id":"f1","name":"n"}`))
+		default:
+			t.Errorf("unexpected request %s %s", req.Method, req.URL.Path)
+		}
+	}))
+	resolver = r
+
+	// The state has to be remembered first, or the exchange is refused before it
+	// reaches Google -- which is the whole point of the browser binding.
+	client.RememberState("the-state", "the-binding")
+
+	_, err := client.ExchangeWithRedirect(context.Background(), Scope{TenantID: "t1", UserID: "u1"},
+		"the-code", "the-state", "the-binding", "http://127.0.0.1:8080/admin/oauth/callback")
+	if err != nil {
+		t.Fatalf("ExchangeWithRedirect: %v", err)
+	}
+
+	// Identity is still the stable identifier, not the email.
+	if resolver.saved == nil || len(resolver.saved) == 0 {
+		t.Fatal("nothing was saved")
+	}
+	if got := resolver.saved[len(resolver.saved)-1].Subject; got != "perm-1" {
+		t.Errorf("subject = %q, want perm-1: the email must not become the identity", got)
+	}
+
+	last := resolver.saved[len(resolver.saved)-1]
+	if last.DisplayName != "Shovan B" {
+		t.Errorf("display name = %q, want the value Google reported", last.DisplayName)
+	}
+	if last.Email != "shovan@example.com" {
+		t.Errorf("email = %q, want the value Google reported", last.Email)
+	}
+	if last.PictureURL != "https://lh3.googleusercontent.com/a/abc123" {
+		t.Errorf("picture = %q, want the value Google reported", last.PictureURL)
+	}
+}
+
+// TestAccountProfileIsNotIdentity is the guard on the boundary.
+//
+// An email address can change and a display name is not unique. If either ever became
+// something a connection is keyed on, an account could be impersonated or orphaned by a
+// rename.
+func TestAccountProfileIsNotIdentity(t *testing.T) {
+	var resolver *stubResolver
+	client, r := newFileTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch req.URL.Path {
+		case "/token":
+			_, _ = w.Write([]byte(`{"access_token":"at","refresh_token":"rt","expires_in":3600}`))
+		case "/drive/v3/about":
+			// An account with no display name and no photo. Neither may fail the
+			// connect: they are cosmetic.
+			_, _ = w.Write([]byte(`{"user":{"permissionId":"perm-2","emailAddress":"bare@example.com"}}`))
+		default:
+			t.Errorf("unexpected request %s %s", req.Method, req.URL.Path)
+		}
+	}))
+	resolver = r
+
+	client.RememberState("s", "b")
+	if _, err := client.ExchangeWithRedirect(context.Background(), Scope{TenantID: "t1", UserID: "u1"},
+		"c", "s", "b", "http://127.0.0.1:8080/admin/oauth/callback"); err != nil {
+		t.Fatalf("an account with no display name or picture must still connect: %v", err)
+	}
+
+	last := resolver.saved[len(resolver.saved)-1]
+	if last.Subject != "perm-2" {
+		t.Errorf("subject = %q, want perm-2", last.Subject)
+	}
+	if last.DisplayName != "" || last.PictureURL != "" {
+		t.Errorf("expected empty display fields, got %q / %q", last.DisplayName, last.PictureURL)
+	}
+}

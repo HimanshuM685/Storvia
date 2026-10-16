@@ -50,10 +50,16 @@ main { flex: 1; width: 100%; max-width: 1160px; margin: 0 auto; padding: 28px; }
   padding: 22px;
   margin-bottom: 18px;
 }
-.card > h2 {
+.card > h2, .card-head h2 {
   font-size: 12.5px; text-transform: uppercase; letter-spacing: 0.1em;
   color: var(--muted); margin: 0 0 16px; font-weight: 600;
 }
+/* A card head is a title and an optional control on one line, so "Delete all" sits
+   with the heading it belongs to rather than floating in the table body. */
+.card-head { display: flex; align-items: center; gap: 12px; }
+.card-head h2 { margin-bottom: 16px; }
+.card-head .card-action { margin-left: auto; margin-bottom: 16px; }
+.card-head .card-action > * { margin-left: 8px; }
 .card p.hint { color: var(--muted); font-size: 13.5px; margin: -8px 0 16px; }
 
 .row { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
@@ -79,6 +85,7 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 button.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); font-weight: 500; }
 button.danger { background: transparent; color: var(--bad); border: 1px solid rgba(242,84,91,0.45); font-weight: 500; }
 button.link { background: none; border: 0; color: var(--accent); padding: 0; font-weight: 500; text-decoration: underline; }
+button.btn-sm { padding: 5px 12px; font-size: 12.5px; }
 
 .pill {
   display: inline-flex; align-items: center; gap: 6px;
@@ -108,6 +115,17 @@ tbody tr:last-child td { border-bottom: 0; }
 td.actions { white-space: nowrap; }
 td.actions > * { margin-right: 10px; }
 
+/* Stored objects. The second line of a cell is the detail, deliberately quieter than
+   the name so the eye lands on the file first. */
+.obj-name { font-weight: 600; }
+.obj-detail { color: var(--muted); font-size: 12px; margin-top: 3px; }
+.obj-ref {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+  color: var(--muted); max-width: 220px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.obj-count { color: var(--muted); font-weight: 500; text-transform: none; letter-spacing: 0; }
+
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
 .muted { color: var(--muted); }
 .small { font-size: 12.5px; }
@@ -134,4 +152,80 @@ td.actions > * { margin-right: 10px; }
 @media (max-width: 640px) {
   main { padding: 18px; }
   .topbar { padding: 14px 18px; }
+}
+
+/* ---------------------------------------------------------------------------
+   The signed-in account.
+
+   An operator has to be able to see which Google account they are about to upload
+   from. The earlier navbar showed "user_dev_admin @ tenant_dev_admin", which are
+   deployment labels: they read identically no matter which account is connected,
+   so they answer none of the questions the person looking at them has.
+   --------------------------------------------------------------------------- */
+
+.account { position: relative; }
+
+.account-trigger {
+  display: inline-flex; align-items: center; gap: 9px;
+  background: transparent; color: var(--text);
+  border: 1px solid var(--line); border-radius: 999px;
+  padding: 4px 11px 4px 4px; cursor: pointer; font: inherit;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.account-trigger:hover { background: var(--panel-2); border-color: #333a4a; }
+
+.account-name {
+  font-size: 13.5px; max-width: 190px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.chevron { color: var(--muted); flex: none; }
+
+.avatar {
+  flex: none; border-radius: 50%; object-fit: cover;
+  background: var(--panel-2); display: inline-grid; place-items: center;
+  width: 26px; height: 26px; font-weight: 650; color: var(--text);
+  border: 1px solid var(--line);
+}
+.avatar-lg { width: 44px; height: 44px; }
+.avatar-fallback {
+  /* Tinted per-account would need a hash; a single neutral tone is honest and
+     does not imply the colour means something. */
+  background: linear-gradient(135deg, #2b3550, #3d2f5c);
+  letter-spacing: 0.02em;
+}
+
+.account-scrim { position: fixed; inset: 0; z-index: 40; }
+
+.account-panel {
+  position: absolute; right: 0; top: calc(100% + 8px); z-index: 50;
+  width: 300px; padding: 16px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 12px; box-shadow: 0 18px 44px rgba(0, 0, 0, 0.5);
+}
+
+.account-head { display: flex; gap: 12px; align-items: center; margin-bottom: 14px; }
+.account-ident { min-width: 0; }
+.account-display {
+  font-weight: 600; font-size: 14px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.account-email {
+  color: var(--muted); font-size: 12.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.account-facts {
+  margin: 0 0 14px; padding: 12px 0;
+  border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+  display: grid; gap: 9px;
+}
+.account-facts > div { display: grid; grid-template-columns: 116px 1fr; gap: 10px; }
+.account-facts dt { color: var(--muted); font-size: 12px; }
+.account-facts dd { margin: 0; font-size: 12px; overflow-wrap: anywhere; }
+
+.account-signout { width: 100%; }
+
+@media (max-width: 640px) {
+  .account-name { max-width: 110px; }
+  .account-panel { width: min(300px, calc(100vw - 36px)); }
 }

@@ -1,88 +1,237 @@
 'use client';
 
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { api, downloadUrl, formatBytes } from '@/lib/api';
 import type { ObjectView } from '@/lib/types';
-import { Banner, Card } from './ui';
+import { Banner, Card, Pill } from './ui';
 
-export function ObjectTable({ objects }: { objects: ObjectView[] }) {
+type Tone = 'on' | 'off' | 'warn' | 'bad' | 'drive';
+
+/**
+ * What each stored-object state is called in front of a person.
+ *
+ * The API returns the raw enum (`ready`, `uploading`, `missing`, ...), which is the right
+ * thing to send and the wrong thing to show. Each state gets a plain-language name and a
+ * tone, so the table reads as a status rather than as a database column.
+ */
+const STATUS: Record<string, { label: string; tone: Tone }> = {
+  ready: { label: 'Stored', tone: 'on' },
+  pending: { label: 'Waiting', tone: 'warn' },
+  uploading: { label: 'Uploading', tone: 'warn' },
+  deleting: { label: 'Deleting', tone: 'warn' },
+  failed: { label: 'Failed', tone: 'bad' },
+  missing: { label: 'Missing', tone: 'bad' },
+  deleted: { label: 'Deleted', tone: 'off' },
+};
+
+function statusOf(status: string): { label: string; tone: Tone } {
+  return STATUS[status] ?? { label: status, tone: 'off' };
+}
+
+/** The provider a file lives on, in words rather than as an enum. */
+function providerLabel(provider: string): string {
+  if (provider === 'google_drive') return 'Google Drive';
+  if (provider === 's3_compatible') return 'Fallback storage';
+  return provider || 'Unknown';
+}
+
+/**
+ * A provider reference is only worth showing once the file actually reached a provider.
+ *
+ * Before that the recorded value is the *planned* identity, which for Drive happens to be
+ * the object's own id. Showing it would look like a real Drive file id and send anyone
+ * checking it on a hunt for a file that does not exist yet.
+ */
+function referenceOf(object: ObjectView): string {
+  if (object.status !== 'ready' && object.status !== 'missing') return '';
+  return object.provider_ref ?? '';
+}
+
+function messageOf(error: unknown): string {
+  const err = error as { message?: string };
+  return err?.message ?? 'The delete failed.';
+}
+
+export function ObjectTable({
+  objects,
+  onChanged,
+}: {
+  objects: ObjectView[];
+  /** Re-reads the console state. Reloading the page instead would lose the scroll
+   *  position and any open panel, for a change that only touches this table. */
+  onChanged?: () => void | Promise<void>;
+}) {
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [clearing, setClearing] = useState(false);
 
-  async function remove(id: string) {
-    if (!window.confirm('Delete this object from the provider?')) return;
-    setBusyId(id);
+  const counts = useMemo(() => {
+    let stored = 0;
+    let working = 0;
+    let problem = 0;
+    for (const object of objects) {
+      if (object.status === 'ready') stored += 1;
+      else if (object.status === 'pending' || object.status === 'uploading' || object.status === 'deleting')
+        working += 1;
+      else problem += 1;
+    }
+    return { stored, working, problem };
+  }, [objects]);
+
+  async function refresh() {
+    if (onChanged) await onChanged();
+    else window.location.reload();
+  }
+
+  async function remove(object: ObjectView) {
+    const where = providerLabel(object.provider);
+    if (!window.confirm(`Delete “${object.name}” from ${where}?\n\nThis removes the file at the provider and cannot be undone.`)) {
+      return;
+    }
+    setBusyId(object.id);
     setError(null);
+    setNotice(null);
     try {
-      await api.deleteObject(id);
-      window.location.reload();
+      await api.deleteObject(object.id);
+      setNotice(`Deleted “${object.name}”.`);
+      await refresh();
     } catch (e) {
-      const err = e as { message?: string };
-      setError(err.message ?? 'The delete failed.');
+      setError(messageOf(e));
     } finally {
       setBusyId(null);
     }
   }
 
+  async function removeAll() {
+    if (
+      !window.confirm(
+        `Delete all ${objects.length} stored objects from their providers?\n\nThis cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+    setClearing(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await api.deleteAllObjects();
+      const failed = result.failed ?? [];
+      if (failed.length === 0) {
+        setNotice(`Deleted ${result.deleted} ${result.deleted === 1 ? 'object' : 'objects'}.`);
+      } else {
+        // Report both halves. "Deleted everything" would be false, and staying silent
+        // about the failures would leave files in Drive the operator believes are gone.
+        const detail = failed
+          .map((failure) => `${failure.Name || failure.ObjectID} — ${failure.Reason}`)
+          .join('; ');
+        setError(`Deleted ${result.deleted}, but ${failed.length} could not be removed: ${detail}`);
+      }
+      await refresh();
+    } catch (e) {
+      setError(messageOf(e));
+    } finally {
+      setClearing(false);
+    }
+  }
+
+  const summary = [
+    `${counts.stored} stored`,
+    counts.working > 0 ? `${counts.working} in progress` : null,
+    counts.problem > 0 ? `${counts.problem} need attention` : null,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+
   return (
-    <Card title="Stored objects">
-      {error ? <Banner tone="error">{error}</Banner> : null}
+    <Card
+      title={
+        objects.length > 0 ? (
+          <>
+            Stored objects <span className="obj-count">({summary})</span>
+          </>
+        ) : (
+          'Stored objects'
+        )
+      }
+      hint="Files held on your behalf. Each row is one file; deleting removes it from the provider that holds it, not just from this list."
+      action={
+        objects.length > 0 ? (
+          <button className="danger btn-sm" disabled={clearing} onClick={() => void removeAll()}>
+            {clearing ? 'Deleting…' : 'Delete all'}
+          </button>
+        ) : null
+      }
+    >
+      {error ? (
+        <Banner tone="error" title="Some files were not deleted.">
+          {error}
+        </Banner>
+      ) : null}
+      {notice ? <Banner tone="ok">{notice}</Banner> : null}
 
       {objects.length === 0 ? (
-        <p className="muted">Nothing stored yet. Upload something above.</p>
+        <p className="muted">
+          Nothing stored yet. Upload a file above and it will appear here with where it landed.
+        </p>
       ) : (
         <table>
           <thead>
             <tr>
-              <th>Name</th>
-              <th>Size</th>
-              <th>Provider</th>
-              <th>Status</th>
-              <th>Provider ref</th>
-              <th>Stored</th>
-              <th aria-label="Actions" />
+              <th scope="col">File</th>
+              <th scope="col">Stored in</th>
+              <th scope="col">Status</th>
+              <th scope="col">Added</th>
+              <th scope="col" aria-label="Actions" />
             </tr>
           </thead>
           <tbody>
-            {objects.map((object) => (
-              <tr key={object.id}>
-                <td>
-                  {object.name}
-                  <div className="muted mono small">{object.logical_key}</div>
-                </td>
-                <td>{formatBytes(object.size)}</td>
-                <td>
-                  <span className={`pill ${object.provider === 'google_drive' ? 'drive' : 'on'}`}>
-                    {object.provider === 'google_drive' ? 'Google Drive' : object.provider}
-                  </span>
-                </td>
-                <td>
-                  <span
-                    className={`pill ${
-                      object.status === 'ready' ? 'on' : object.status === 'failed' ? 'bad' : 'warn'
-                    }`}
-                  >
-                    {object.status}
-                  </span>
-                </td>
-                <td className="mono">{object.provider_ref || '—'}</td>
-                <td className="muted small">{new Date(object.created_at).toLocaleString()}</td>
-                <td className="actions">
-                  {object.downloadable ? (
-                    <a className="mono" href={downloadUrl(object.id)}>
-                      download
-                    </a>
-                  ) : null}
-                  <button
-                    className="link"
-                    disabled={busyId === object.id}
-                    onClick={() => void remove(object.id)}
-                  >
-                    delete
-                  </button>
-                </td>
-              </tr>
-            ))}
+            {objects.map((object) => {
+              const status = statusOf(object.status);
+              const reference = referenceOf(object);
+              const busy = busyId === object.id || clearing;
+              return (
+                <tr key={object.id} title={`Object id: ${object.id}`}>
+                  <td>
+                    <div className="obj-name">{object.name}</div>
+                    <div className="obj-detail">
+                      {object.category || object.mime_type || 'file'}
+                      {object.size ? ` · ${formatBytes(object.size)}` : ''}
+                    </div>
+                  </td>
+                  <td>
+                    <Pill tone={object.provider === 'google_drive' ? 'drive' : 'off'}>
+                      {providerLabel(object.provider)}
+                    </Pill>
+                    {reference ? (
+                      <div className="obj-ref" title={reference}>
+                        {reference}
+                      </div>
+                    ) : (
+                      <div className="obj-detail">not at a provider yet</div>
+                    )}
+                  </td>
+                  <td>
+                    <Pill tone={status.tone}>{status.label}</Pill>
+                  </td>
+                  <td className="muted small">{new Date(object.created_at).toLocaleString()}</td>
+                  <td className="actions">
+                    {object.downloadable ? (
+                      <a className="mono" href={downloadUrl(object.id)}>
+                        Download
+                      </a>
+                    ) : null}
+                    <button
+                      className="danger btn-sm"
+                      disabled={busy}
+                      onClick={() => void remove(object)}
+                    >
+                      {busyId === object.id ? 'Deleting…' : 'Delete'}
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       )}

@@ -2935,3 +2935,390 @@ stale       -> "the browser that started it is not the one that returned"
   above are there to make it a one-attempt operation if it fails.
 - PostgreSQL migrations and the Redis session store remain unproven.
 - No commit was created.
+
+---
+
+## 2026-10-15 — The navbar shows who is signed in
+
+The console navbar read `user_dev_admin @ tenant_dev_admin`. Those are deployment labels:
+they look identical no matter which Google account is connected, so they answer none of
+the questions the person reading them has — most of all *whose Drive am I about to upload
+into*.
+
+### The profile was already on the wire
+
+The connect flow calls Drive's `about` to learn the account's subject. That response
+carries `displayName`, `emailAddress` and `photoLink`, and `fetchSubject` decoded them and
+threw all three away — with a comment explaining why the email was deliberately not
+stored, on the reasoning that "Storvia has no reason to store" personal data.
+
+That reasoning was correct while nothing displayed it. It is not now, so the decision is
+reversed, with the important part kept: **`permissionId` remains the identity.** An email
+address can change and a display name is not unique, so neither is safe to key a
+connection on, and nothing authorises from either. They are presentation, stored beside
+the identity and never used as it.
+
+### Storage
+
+`0003_account_profile.sql`, both dialects: `account_email`, `account_name`,
+`account_picture` on `drive_connections`. Absent values are stored as NULL rather than an
+empty string, so "Google did not tell us" stays distinguishable from "Google said blank".
+Applied automatically on start — confirmed present in the development database.
+
+`AccountProfile` is deliberately **not** part of `Resolve`. `Resolve` decrypts a refresh
+token, and the console rendering a name has no reason to hold a usable credential, so the
+display path never asks for one.
+
+### The interface
+
+`AccountMenu` replaces the inline id and the Sign out button:
+
+- Avatar from Google's photo link, falling back to initials (`SB` for "Shovan Biswas") if
+  there is no picture or the image 404s. `referrerPolicy="no-referrer"`.
+- Name in the trigger; clicking opens a panel with the name, email, Google account id and
+  tenant, and Sign out.
+- Sign out moved into the panel and stays a **navigation** to Go: the session lives there,
+  so only Go can end it and only Go's origin can clear the cookie.
+
+The label chain is display name → email → configured user id, with the id as a last resort
+rather than the default. `TestAccountLabelFallsBackInOrder` pins it.
+
+### One bug, found by the backfill
+
+Existing connections have no stored profile, so `AccountProfile` now fetches it live once
+and saves it — a cosmetic field should not require a reconnect. The first attempt silently
+did nothing.
+
+> **I had made the request and broken it.** I changed `fields=user` to
+> `user(displayName,emailAddress,photoLink),user` "to be explicit". That expression returns
+> a user object with only `permissionId` populated, so the fetch succeeded, decoded to
+> nothing, and the backfill saved an empty profile. No error, no log line.
+
+`fields=user` already returns the user's default fields, which are exactly these three.
+Reverted, with a comment saying so, because the wrong expression is plausible enough that
+someone will try it again.
+
+Two of my own guesses during this were also wrong and were corrected by the code: the
+`Upsert` signature edit silently failed to match on the first attempt, and I then edited
+the wrong test file for the redirect-URI fixture. I also implemented `accountInitials` in
+Go *and* `initialsFor` in TypeScript — two implementations of one rule that had already
+disagreed about casing. The Go one was dead code and is gone; the frontend owns it.
+
+### Verified against the real account
+
+```
+console state account:
+  tenant_id:    tenant_dev_admin
+  user_id:      user_dev_admin
+  display_name: Shovan Mondal
+  email:        shovan04.rerf.cse.01@gmail.com
+  picture_url:  https://lh3.googleusercontent.com/a/ACg8ocL3mvm…=s64
+  subject:      13735161528780792640
+  label:        Shovan Mondal
+```
+
+The navbar now reads **Shovan Mondal** with their picture. `user_id` is still the tenant
+scope, not an identity, and is only used if there is no name and no email.
+
+Tests: `TestConnectStoresTheAccountProfile` (the profile reaches storage from a real
+`about` response, and the subject is still `permissionId`),
+`TestAccountProfileIsNotIdentity` (an account with no name or picture still connects), and
+`TestAccountLabelFallsBackInOrder`.
+
+`make check`, `make check-all`, `make console`, `make sdk-ts-test` (22/22), and the console
+typecheck all pass.
+
+### Not done
+
+- The navbar has been verified by reading the served bundle and the live API response. The
+  menu has still never been opened in a browser.
+- No commit was created.
+
+---
+
+## 2026-10-16 — Deleted objects were still being listed, and the delete button never worked
+
+### Why
+
+The console's Stored objects table was wrong in three ways at once, all reported from
+one page: it showed objects the user had already deleted, its status column was a raw
+enum, and pressing Delete on a row did nothing.
+
+### Fixed
+
+**Deleted objects were listed forever.** `deleted_at` is the marker that takes an object
+out of the stored set, and both `ListObjects` and the diagnostics count filter on
+`deleted_at IS NULL`. But `UpdateStatus` only ever wrote `status`, never `deleted_at`, so
+a deleted object and a live one were indistinguishable in a query. Ten objects the user
+had already deleted were still in the table.
+
+- `internal/persistence/repository.go` `UpdateStatus` now stamps `deleted_at` when the
+  new status is `deleted` or `missing`. Both are stamped because both mean "no longer
+  part of the stored set"; `missing` is only ever set by the delete path, when the
+  provider has already lost the file.
+- `ListObjects` now filters `deleted_at IS NULL`. This was already the filter the code
+  intended to have — it was simply never written.
+- `TestUpdateStatusStampsDeletedAt`, `TestListObjectsExcludesDeleted`.
+
+**The existing rows needed repairing, not just new ones.** Stamping the column going
+forward leaves every object deleted before the fix still listed, which is the user's
+actual situation. Migration `0004_backfill_deleted_at` (both dialects) stamps
+`deleted_at = updated_at` for rows already in `deleted` or `missing` with a NULL marker.
+It is scoped to terminal statuses only, so it cannot resurrect anything.
+`TestBackfillMigrationStampsPreviouslyDeletedObjects` migrates to version 3 first and
+inserts the dead rows afterwards, so the fixture genuinely predates the backfill, and
+asserts a live row is left alone.
+
+Applied to the development database: the console now lists 14 objects, not 24.
+
+**Deleting an object that never reached a provider failed.** `contentSource.Delete` fell
+to its default branch for an object with no provider reference, which is a
+`locationFault`, which is retryable, so the object sat in `deleting` forever and the
+button appeared broken. There is nothing to delete at the provider for such an object —
+the correct answer is to finish the delete locally.
+`model.LogicalObject.ReachedProvider()` reads `ProviderFileID`/`ProviderObjectKey` (not
+the status, which is circular: deciding this is what the delete does).
+`DeleteObject` short-circuits to `finishDelete` when it is false, with no provider call.
+`TestDeleteOfAnObjectThatNeverReachedAProviderIsLocal`.
+
+**The per-row delete button never reached the API.** `api.deleteObject` used the relative
+path `/console/api/objects/{id}`. In development the console is on `:3001` and the API on
+`:8080`, so the request went to the Next.js dev server, which has no such route: a 404.
+Every other call in the client uses `${API_BASE}`. This was the actual cause of "the
+delete button does not work", and no amount of backend work would have fixed it.
+
+### Added: clearing every stored object
+
+`DeleteAllObjects` in `internal/storage/service/objects.go`, the
+`DELETE /console/api/objects` route, and a button in the table header. It exists so an
+operator does not delete twenty rows by hand, and it reports both halves of the outcome:
+`{deleted, failed[]}` with a reason per failure. Claiming success when a file is still in
+Drive would be worse than useless. Batched at 200 rows, capped at 25 batches.
+`TestDeleteAllObjectsClearsEveryStoredObject`,
+`TestDeleteAllObjectsReportsFailuresWithoutStopping`, and
+`TestConsoleDeleteAllObjectsClearsTheList` (through the HTTP layer, asserting on the list
+the console renders rather than only on the response body).
+
+### The Stored objects table
+
+`console/components/ObjectTable.tsx` rewritten. It was showing the raw enum
+(`pending`, `uploading`, `missing`) and the opaque `logical_key` (`upl_…`), which is an
+internal id, not something a person can act on.
+
+- Status is a plain word with a tone: Stored, Waiting, Uploading, Deleting, Failed,
+  Missing.
+- The provider is a name, not `google_drive`. The provider reference is shown only once
+  the file actually reached a provider — before that the recorded value is the *planned*
+  identity, which for Drive is the object's own id, and showing it would send anyone
+  checking it looking for a file that does not exist yet.
+- A count summary, and the hint that deleting removes the file from the provider that
+  holds it, not just from the list.
+- Both deletes confirm with the actual consequence and refresh in place instead of
+  reloading the page.
+- `Card` gained an optional `action` slot so the button sits with its heading.
+
+### Is the full path stored? No.
+
+Answered directly because it was asked: **no path is stored, and there is no folder
+hierarchy.** `storage_objects` has no path or folder column.
+
+- `logical_key` is an opaque object id (`upl_…`), which is also the value of `id`.
+- `original_name` is the bare filename.
+- Drive puts every file **flat** into the single `Storvia/` root folder created at
+  connection time (`parents: [connection.RootFolderID]`). Google Drive has a real folder
+  hierarchy and Storvia does not use it.
+- The fallback key is server-generated and flat:
+  `storvia/tenants/{tenant}/objects/{logical_key}`.
+
+So the provider reference shown in the new column is the whole of Storvia's record of
+where a file lives. Folder support is a design decision that changes the Drive write path
+and the schema, so it is offered rather than built silently.
+
+### Verified
+
+`make check` and `make check-all` (including the race detector) pass. Console `tsc
+--noEmit` clean, `next lint` is not configured and prompts interactively, so no lint
+result is claimed. The console dev server compiles the new components and serves them.
+The new routes were confirmed live against the restarted server: `DELETE
+/console/api/objects` answers 401 without a session (route exists) where an unregistered
+path answers 404. The backfill was applied to the development database and verified by
+query: 10 rows stamped, listing drops from 24 to 14.
+
+### Not done
+
+- The OAuth round trip has still never been completed in a browser, so neither the table
+  nor the delete buttons have been clicked by a person. The UI is verified by the dev
+  server compiling and serving it, by types, and by the API layer's own tests.
+- The console production export (`next build` → `.next-export`, embedded in the release
+  binary) was not rebuilt; the dev server was left running. Nothing structural changed,
+  but the export is unverified.
+- PostgreSQL migration `0004` has never run; only the SQLite dialect was executed.
+- No commit was created.
+
+---
+
+## 2026-10-16 — pnpm and Turbopack; the hydration warning was a browser extension
+
+### The hydration error was not our bug
+
+A dev reported a hydration mismatch on the console. The diff was the whole story:
+
+```
+<html lang="en"
+- crxlauncher-bridged=""
+- crxlauncher="">
+    ...
+at chrome-extension://kiilhncajadbgbmdbdcopdpnmdhlbdle/assets/js/content.js
+```
+
+A browser extension was injecting attributes onto `<html>` after the server-rendered HTML
+was sent and before React hydrated. React's own message lists this as a cause it cannot
+patch, and the attributes are not set by any code in this repository. No change to the
+component tree was warranted.
+
+It is silenced rather than left to cry wolf, though. `suppressHydrationWarning` is set on
+`<html>` in `console/app/layout.tsx` with a comment saying why. It is scoped to the root
+element only, so a real mismatch in the body still surfaces — which is the point: the
+warning was drowning the console in noise, and the noise made a non-bug look like a defect.
+
+### pnpm
+
+npm is replaced by pnpm throughout: the console, the TypeScript SDK, `scripts/dev.sh`, and
+the `Makefile` targets (`console`, `console-dev`, `sdk-ts-check`, `sdk-ts-build`).
+`package-lock.json` is deleted from both packages and `pnpm-lock.yaml` committed.
+`packageManager` is pinned in both `package.json` files so the version is not a matter of
+whoever runs it.
+
+pnpm does not run dependency build scripts by default, which surfaced as
+`ERR_PNPM_IGNORED_BUILDS` on `sharp` — Next.js's optional image dependency. The console
+serves no images and never imports `next/image`, so its native build is not needed;
+`console/pnpm-workspace.yaml` sets `allowBuilds: sharp: false`, which keeps `pnpm install`
+clean without a native toolchain requirement.
+
+**One behavioural difference found by running it.** npm and pnpm forward extra script
+arguments differently: `pnpm run dev -- --port 3001` passes a literal `--` through and Next
+reads `--port` as a directory name, so the dev server failed to start with
+`Invalid project directory provided`. pnpm forwards arguments after the script name
+directly. `scripts/dev.sh` now calls `pnpm run dev --port "$CONSOLE_PORT"`. This was only
+caught by restarting the server and reading the log, which is the same lesson as the delete
+button earlier in the week: the difference between "the command was written correctly" and
+"the command works".
+
+### Turbopack
+
+`console`'s `dev` script is now `next dev --turbopack`. Confirmed running from the console
+log (`▲ Next.js 15.1.6 (Turbopack)`).
+
+`build` is **not** turbopack, and this is deliberate: Next 15.1.6 accepts `--turbopack` only
+on `next dev`, and `next build --turbopack` exits with `unknown option '--turbopack'`.
+Turbopack for the production build did not exist as a stable flag in this version, so the
+static export still uses webpack. The flag was not added to `build` after a failed attempt
+left it there.
+
+### Verified
+
+`scripts/dev.sh restart` brings up the API on `:8080` and the Turbopack console on `:3001`,
+and `GET /` returns 200. `make console` builds the static export and embeds it;
+`make build-console` builds the API with `-tags consoleassets`, so the release path is now
+built rather than assumed — this also closes the export-not-rebuilt gap recorded in the
+previous entry. `make check-all` passes with the race detector, `make sdk-ts-test` is 22/22,
+`make sdk-ts-check` and the console typecheck are clean. `bash -n scripts/dev.sh` passes.
+
+### Not done
+
+- No ESLint configuration exists; `pnpm lint` still prompts interactively, so no lint
+  result is claimed.
+- `next dev --turbopack` is a development speed-up only. It changes no behaviour, and no
+  claim is made that it was benchmarked.
+- No commit was created.
+
+---
+
+## 2026-10-16 — Next.js 16, and the error boundaries the app did not have
+
+### "missing required error components, refreshing..."
+
+The console dev server served Next's own fallback page:
+
+```html
+<pre>missing required error components, refreshing...</pre>
+```
+
+Found in `next/dist/server/base-server.js`: when the server cannot match a page to a
+render result, it returns this stub, which then polls the server and calls
+`location.reload()` until it answers 200. The browser reloads on a loop and the
+application never gets to show anything — including whatever went wrong.
+
+The application had **no error boundaries at all**. `app/` contained only `layout.tsx`,
+`page.tsx`, and `globals.css`. Next requires `app/error.tsx` and `app/global-error.tsx`;
+without them there is nothing to render when a render fails, which is the condition that
+produces the stub.
+
+- `app/global-error.tsx` — the root boundary. It owns its own `<html>`/`<body>` because
+  it replaces the root layout, so its styling is inline and cannot depend on the layout's
+  CSS having loaded. It offers `reset()`, and shows `error.digest` when there is one.
+- `app/error.tsx` — the route boundary, rendered inside the root layout so it uses the
+  design system. Its message is deliberately explicit that this is a console fault and
+  that nothing was deleted: the console is an operator tool pointed at real files, and
+  "something went wrong" with no reassurance is worse than useless here.
+- `app/not-found.tsx` — the console is a single page, so any other address is a mistyped
+  URL.
+
+Both messages are generic on purpose. An error boundary is where you tell an operator
+something is wrong and give them a way out, not where you diagnose it; the dev overlay
+carries the detail.
+
+### Verified by throwing, not by reading
+
+A temporary route that throws was added, requested, and removed. The response was a 500
+showing the error and **zero** occurrences of `missing required error components`. The
+boundary files existing is not evidence that Next accepts them; the absence of the stub
+page is.
+
+`GET /nonsense` returns 404 through `_not-found`, which is now a built route
+(`console/.next-export/_not-found`) rather than Next's default.
+
+### Next.js 16.4.2, React 19.3.1
+
+`next` 15.1.6 → 16.4.2, `react`/`react-dom` 19.0.0 → 19.3.1, `@types/react` and
+`@types/react-dom` → 19.3.0. `@types/react@19.3.1` does not exist; the registry's latest
+is 19.3.0.
+
+**Turbopack is now the default for dev *and* build**, so the explicit `--turbopack` flag
+added earlier in the day is gone from the scripts. This reverses the previous entry's
+finding that `next build --turbopack` was unavailable: that was a 15.x limitation, and in
+16 `next build` uses Turbopack by default. `--webpack` remains available if it is ever
+needed. The static export still builds and embeds.
+
+**`next lint` was removed in 16** and the `lint` script is dropped. Nothing referenced it.
+
+**`tsconfig.json`**: Next 16 rewrites it on first build and requires
+`"jsx": "react-jsx"`; it had been `preserve`, which Next 16 no longer accepts. The
+rewrite also reformatted the whole file to expanded JSON, so it was rewritten back to the
+repository's compact style with the semantic change and a comment recording why.
+
+**`allowedDevOrigins`** is set to `127.0.0.1` and `localhost` for dev. Next 16 blocks
+cross-origin access to its own dev resources, and `/_next/hmr` was refused:
+
+```
+⚠ Blocked cross-origin request to Next.js dev resource /_next/hmr from "127.0.0.1".
+```
+
+The console is reached at `127.0.0.1` but a browser may present `localhost` or vice
+versa, so both loopback names are allowed. Without this, hot reload is broken in a way
+that only shows up as a console warning.
+
+### Verified
+
+`make check-all` passes with the race detector. `make console` builds the static export on
+Turbopack and embeds it; `make build-console` builds the API with `-tags consoleassets`.
+`make sdk-ts-check`, `make sdk-ts-test` (22/22), and the console typecheck are clean.
+`scripts/dev.sh restart` brings up the API and the console, `GET /` returns 200 with the
+console's own title, and the cross-origin HMR warning is gone.
+
+### Not done
+
+- `next lint` no longer exists and no ESLint configuration was added in its place, so no
+  lint result is claimed.
+- The console still has never been used by a person. Nothing here changes that.
+- No commit was created.

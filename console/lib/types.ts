@@ -46,7 +46,17 @@ export type ObjectView = {
 
 export type State = {
   signed_in: boolean;
-  account: { tenant_id: string; user_id: string; subject?: string };
+  account: {
+    tenant_id: string;
+    user_id: string;
+    /** The connected Google account. Display only -- subject is the identity. */
+    display_name?: string;
+    email?: string;
+    picture_url?: string;
+    subject?: string;
+    /** What the navbar shows when there is no display name. */
+    label?: string;
+  };
   connection: Connection;
   storage: StorageInfo;
   consent: { granted: boolean; granted_at?: string };
@@ -54,6 +64,21 @@ export type State = {
   faults: { enabled: boolean };
   objects: ObjectView[];
   diagnostics?: Record<string, unknown> | null;
+};
+
+/** One object a bulk delete could not remove, and why. */
+export type BulkDeleteFailure = {
+  ObjectID: string;
+  Name: string;
+  Reason: string;
+};
+
+/** The result of clearing every stored object. Reports both outcomes, because a bulk
+ *  delete can partly succeed and claiming otherwise would mislead the operator. */
+export type DeleteAllResult = {
+  deleted: number;
+  /** Null when nothing failed: Go marshals a nil slice as null, not an empty array. */
+  failed?: BulkDeleteFailure[] | null;
 };
 
 export type UploadResult = {

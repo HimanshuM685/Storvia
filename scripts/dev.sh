@@ -211,7 +211,7 @@ stop_console() {
 
   if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
     # The recorded pid is the next-server that holds the port. Killing just it leaves the
-    # npm wrapper alive to respawn, so the children go first.
+    # package-manager wrapper alive to respawn, so the children go first.
     pkill -P "$pid" 2>/dev/null || true
     kill "$pid" 2>/dev/null || true
     sleep 0.3
@@ -251,7 +251,7 @@ claim_port() {
   hint "this is the stale-process trap: an old process makes the new one look broken"
   read -r -p "     stop it and continue? [y/N] " reply
   if [[ "${reply:-}" =~ ^[Yy]$ ]]; then
-    # Kill the process group where possible: `npm run dev` spawns a child, and killing
+    # Kill the process group where possible: `pnpm run dev` spawns a child, and killing
     # only the parent would leave the child holding the port.
     pkill -P "$holder" 2>/dev/null || true
     kill "$holder" 2>/dev/null || true
@@ -283,29 +283,32 @@ start_api() {
 
 # start_console launches the Next.js dev server in the background.
 #
-# It is started after the API, because its rewrites proxy to the API origin and a failing
-# proxy would look like a broken frontend.
+# It is started after the API because the console calls it cross-origin, and a console
+# that starts first would render its failure state before the API it needs is listening.
 start_console() {
   [[ "$WITH_CONSOLE" -eq 0 ]] && return 0
-  if ! command -v npm >/dev/null 2>&1; then
-    warn "npm is not on PATH; skipping the console dev server."
+  if ! command -v pnpm >/dev/null 2>&1; then
+    warn "pnpm is not on PATH; skipping the console dev server."
     warn "the API still serves the built console at $CONSOLE_URL"
     return 0
   fi
   if [[ ! -d "$REPO_ROOT/console/node_modules" ]]; then
     info "Installing console dependencies"
-    (cd "$REPO_ROOT/console" && npm install --silent) || {
-      warn "npm install failed; skipping the console dev server."
+    (cd "$REPO_ROOT/console" && pnpm install --silent) || {
+      warn "pnpm install failed; skipping the console dev server."
       return 0
     }
   fi
 
-  info "Starting the Next.js console on port $CONSOLE_PORT"
+  info "Starting the Next.js console on port $CONSOLE_PORT (Turbopack)"
   : >"$CONSOLE_LOG_FILE"
-  (cd "$REPO_ROOT/console" && npm run dev -- --port "$CONSOLE_PORT") \
+  # pnpm forwards extra arguments to the script without an `--` separator, and treats a
+  # literal `--` as a positional directory. Passing `-- --port` therefore tries to open a
+  # directory named `--port`.
+  (cd "$REPO_ROOT/console" && pnpm run dev --port "$CONSOLE_PORT") \
     >>"$CONSOLE_LOG_FILE" 2>&1 &
-  local npm_pid=$!
-  # `npm run dev` nests npm -> sh -> next dev -> next-server, so the process holding the
+  local pnpm_pid=$!
+  # `pnpm run dev` nests pnpm -> sh -> next dev -> next-server, so the process holding the
   # port is a grandchild and is not in $! or its direct children. The port owner is what
   # has to be recorded: it is both the thing that proves the console came up and the
   # thing that has to be stopped.
@@ -314,13 +317,13 @@ start_console() {
     owner="$(port_owner "$CONSOLE_PORT")"
     if [[ -n "$owner" ]]; then
       echo "$owner" >"$CONSOLE_PID_FILE"
-      ok "pid $owner (launched via npm $npm_pid), logging to $CONSOLE_LOG_FILE"
+      ok "pid $owner (launched via pnpm $pnpm_pid), logging to $CONSOLE_LOG_FILE"
       return 0
     fi
-    kill -0 "$npm_pid" 2>/dev/null || break
+    kill -0 "$pnpm_pid" 2>/dev/null || break
     sleep 0.25
   done
-  echo "$npm_pid" >"$CONSOLE_PID_FILE"
+  echo "$pnpm_pid" >"$CONSOLE_PID_FILE"
   return 1
 }
 

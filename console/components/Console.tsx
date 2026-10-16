@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import type { State } from '@/lib/types';
-import { apiUrl } from '@/lib/api';
+import { AccountMenu } from './AccountMenu';
 import { DrivePanel } from './DrivePanel';
 import { ObjectTable } from './ObjectTable';
 import { OperatorControls, RoutingSummary } from './OperatorControls';
@@ -39,17 +39,10 @@ export function Console({ initial, reload }: { initial: State; reload: () => Pro
         <h1>Storvia console</h1>
         <Pill tone={state.routing.forced ? 'warn' : 'drive'}>{target}</Pill>
         <span className="spacer" />
-        <span className="who">
-          {state.account.user_id} @ {state.account.tenant_id}
-        </span>
         <button className="ghost" onClick={() => void refresh()}>
           Refresh
         </button>
-        {/* A plain form post to Go. The session lives there, so the console does not
-            get a vote in ending it. */}
-        <form method="post" action={apiUrl('/console/sign-out')}>
-          <button className="ghost">Sign out</button>
-        </form>
+        <AccountMenu account={state.account} />
       </header>
 
       <main>
@@ -68,7 +61,7 @@ export function Console({ initial, reload }: { initial: State; reload: () => Pro
 
         <OperatorControls state={state} onChanged={() => void refresh()} />
 
-        <ObjectTable objects={state.objects} />
+        <ObjectTable objects={state.objects} onChanged={() => void refresh()} />
 
         {state.diagnostics && Object.keys(state.diagnostics).length > 0 ? (
           <Card title="Diagnostics">

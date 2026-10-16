@@ -138,7 +138,7 @@ func (c *Client) ExchangeWithRedirect(ctx context.Context, scope Scope, code, st
 		}
 	}
 
-	subject, err := c.fetchSubject(ctx, accessToken)
+	profile, err := c.fetchAccountProfile(ctx, accessToken)
 	if err != nil {
 		return ExchangeResult{}, err
 	}
@@ -146,7 +146,10 @@ func (c *Client) ExchangeWithRedirect(ctx context.Context, scope Scope, code, st
 	connection := Connection{
 		TenantID:     scope.TenantID,
 		UserID:       scope.UserID,
-		Subject:      subject,
+		Subject:      profile.Subject,
+		Email:        profile.Email,
+		DisplayName:  profile.DisplayName,
+		PictureURL:   profile.PictureURL,
 		RefreshToken: refreshToken,
 		Status:       StatusConnected,
 	}
@@ -209,16 +212,46 @@ func classifyTokenError(status int, body []byte) error {
 // Drive's `about` is inside the `drive.file` scope, so identifying the user costs no
 // additional permission.
 func (c *Client) fetchSubject(ctx context.Context, accessToken string) (string, error) {
+	profile, err := c.fetchAccountProfile(ctx, accessToken)
+	if err != nil {
+		return "", err
+	}
+	return profile.Subject, nil
+}
+
+// AccountProfile is who the connected Google account is.
+//
+// Subject is the identity and the other fields are presentation. Keeping them apart
+// matters: an email address can change and a display name is not unique, so neither is
+// safe to key a connection on, while permissionId is stable for the life of the grant.
+type AccountProfile struct {
+	Subject     string
+	Email       string
+	DisplayName string
+	PictureURL  string
+}
+
+// fetchAccountProfile reads the authenticated user.
+//
+// It is one request. The console shows who is signed in, and this is the call that
+// already happens to learn the subject -- the profile was on the wire and being
+// discarded, which is why the console could only ever show a configured id.
+func (c *Client) fetchAccountProfile(ctx context.Context, accessToken string) (AccountProfile, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		// `fields=user` already returns displayName, emailAddress and photoLink along
+		// with permissionId -- they are the user's default fields. An explicit
+		// sub-selection (user(displayName,...),user) was tried and returned a user
+		// object with only permissionId populated, so the profile came back empty and
+		// the console had no name to show.
 		driveAboutURL+"?fields=user&supportsAllDrives=true", nil)
 	if err != nil {
-		return "", fmt.Errorf("drive: build about request: %w", err)
+		return AccountProfile{}, fmt.Errorf("drive: build about request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
 	resp, err := c.cfg.HTTPClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("drive: about unreachable: %w", err)
+		return AccountProfile{}, fmt.Errorf("drive: about unreachable: %w", err)
 	}
 	defer drainAndClose(resp)
 
@@ -226,32 +259,47 @@ func (c *Client) fetchSubject(ctx context.Context, accessToken string) (string, 
 	if resp.StatusCode >= 400 {
 		// The body is worth keeping here: it is the only place the real reason
 		// (an expired token, a revoked grant, a missing scope) is visible.
-		return "", fmt.Errorf("drive: could not identify the google account (status %d: %s)",
+		return AccountProfile{}, fmt.Errorf("drive: could not identify the google account (status %d: %s)",
 			resp.StatusCode, summariseGoogleError(body))
 	}
 
 	var payload struct {
 		User struct {
-			// permissionId is Google's stable per-account identifier. The email
-			// address is not used: it can change, and it is personal data Storvia
-			// has no reason to store.
+			// permissionId is Google's stable per-account identifier and is the only
+			// field used as identity. The others are display only: an email address can
+			// change and a display name is not unique, so neither is safe to key a
+			// connection on.
 			PermissionID string `json:"permissionId"`
 			EmailAddress string `json:"emailAddress"`
 			DisplayName  string `json:"displayName"`
+			PhotoLink    string `json:"photoLink"`
 		} `json:"user"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", fmt.Errorf("drive: the about response could not be read: %w", err)
+		return AccountProfile{}, fmt.Errorf("drive: the about response could not be read: %w", err)
 	}
 	if payload.User.PermissionID == "" {
 		// Fall back to the address so the connection is not lost to a field that
 		// is normally present but is not guaranteed.
 		if payload.User.EmailAddress == "" {
-			return "", errors.New("drive: the about response identified no account")
+			return AccountProfile{}, errors.New("drive: the about response identified no account")
 		}
-		return payload.User.EmailAddress, nil
+		return AccountProfile{Subject: payload.User.EmailAddress}, nil
 	}
-	return payload.User.PermissionID, nil
+
+	profile := AccountProfile{
+		Subject:     payload.User.PermissionID,
+		Email:       payload.User.EmailAddress,
+		DisplayName: payload.User.DisplayName,
+		PictureURL:  payload.User.PhotoLink,
+	}
+	// A display name is preferred because a person recognises a name faster than an
+	// address, but neither is required: an account can have neither, and the console
+	// falls back rather than the connect being refused over a cosmetic field.
+	if len(profile.DisplayName) > 200 {
+		profile.DisplayName = profile.DisplayName[:200]
+	}
+	return profile, nil
 }
 
 // summariseGoogleError trims a Google error body to something loggable.

@@ -199,11 +199,20 @@ type State struct {
 }
 
 // AccountInfo describes the signed-in operator.
+// AccountInfo is who is signed in.
+//
+// DisplayName and Email come from the connected Google account. They are presentation:
+// Subject is the identity, and the console never decides anything from either of them.
 type AccountInfo struct {
-	TenantID string `json:"tenant_id"`
-	UserID   string `json:"user_id"`
-	Email    string `json:"email,omitempty"`
-	Subject  string `json:"subject,omitempty"`
+	TenantID    string `json:"tenant_id"`
+	UserID      string `json:"user_id"`
+	DisplayName string `json:"display_name,omitempty"`
+	Email       string `json:"email,omitempty"`
+	PictureURL  string `json:"picture_url,omitempty"`
+	Subject     string `json:"subject,omitempty"`
+	// Label is what the navbar shows when there is no display name: something a person
+	// recognises, rather than a configured id.
+	Label string `json:"label,omitempty"`
 }
 
 // Connection is the Drive connection state.
@@ -311,6 +320,10 @@ func (c *Console) State(w http.ResponseWriter, r *http.Request) {
 		Stale:         connection.Stale,
 	}
 	state.Account.Subject = connection.Subject
+	state.Account.DisplayName = connection.DisplayName
+	state.Account.Email = connection.Email
+	state.Account.PictureURL = connection.PictureURL
+	state.Account.Label = accountLabel(connection.DisplayName, connection.Email, scope.UserID)
 
 	granted, err := c.consent.ConsentGranted(r.Context(), scope)
 	if err != nil {
@@ -365,6 +378,20 @@ func (c *Console) State(w http.ResponseWriter, r *http.Request) {
 		state.Diag = c.diagnostics.Diagnostics(r.Context())
 	}
 	c.writeJSON(w, http.StatusOK, state)
+}
+
+// accountLabel is what the console shows for the signed-in account.
+//
+// A display name, then the email address, then the configured user id. Showing
+// "user_dev_admin" to an operator who is signed in as a real Google account tells them
+// nothing about whose account they are about to upload a file from.
+func accountLabel(displayName, email, userID string) string {
+	for _, candidate := range []string{displayName, email} {
+		if trimmed := strings.TrimSpace(candidate); trimmed != "" {
+			return trimmed
+		}
+	}
+	return userID
 }
 
 func deref(value *string) string {
@@ -501,6 +528,30 @@ func (c *Console) DeleteObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.writeJSON(w, http.StatusOK, map[string]string{"deleted": objectID})
+}
+
+// DeleteAllObjects clears every object this account still has stored.
+//
+// It is the console's "clear the set" action, so it exists to stop an operator
+// deleting twenty rows by hand. It removes nothing on its own: the work, including
+// reaching the provider that holds each file, is the service's, and the per-object
+// endpoint does exactly the same thing.
+func (c *Console) DeleteAllObjects(w http.ResponseWriter, r *http.Request) {
+	scope, ok := c.requireSession(w, r)
+	if !ok {
+		return
+	}
+
+	result, err := c.objects.DeleteAllObjects(r.Context(), scope)
+	if err != nil {
+		c.fail(w, err)
+		return
+	}
+
+	c.writeJSON(w, http.StatusOK, map[string]any{
+		"deleted": result.Deleted,
+		"failed":  result.Failed,
+	})
 }
 
 // DownloadContent streams an object's bytes, for checking that what was uploaded is

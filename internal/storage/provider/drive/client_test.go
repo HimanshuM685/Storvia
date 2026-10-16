@@ -46,6 +46,11 @@ type stubResolver struct {
 	err          error
 	saved        []Connection
 	markedStatus []string
+	// The profile fields the last SaveConnection carried, so a test can assert that
+	// what Google reported about the account actually reached storage.
+	email       string
+	displayName string
+	picture     string
 }
 
 func (s *stubResolver) Connection(_ context.Context, _ persistence.Scope) (Connection, error) {
@@ -56,6 +61,7 @@ func (s *stubResolver) Connection(_ context.Context, _ persistence.Scope) (Conne
 }
 
 func (s *stubResolver) SaveConnection(_ context.Context, c Connection) error {
+	s.email, s.displayName, s.picture = c.Email, c.DisplayName, c.PictureURL
 	s.saved = append(s.saved, c)
 	return nil
 }
@@ -72,6 +78,21 @@ func (s *stubResolver) ConnectionByID(_ context.Context, id string) (Connection,
 func (s *stubResolver) SetChangesCursor(_ context.Context, _, cursor string) error {
 	value := cursor
 	s.connection.ChangesCursor = &value
+	return nil
+}
+
+// AccountProfile is display-only, so a stub that returns nothing is a faithful
+// "connected before the profile existed" rather than a special case.
+func (s *stubResolver) AccountProfile(_ context.Context, _ persistence.Scope) (persistence.ConnectionProfile, error) {
+	return persistence.ConnectionProfile{
+		Email:       s.email,
+		DisplayName: s.displayName,
+		PictureURL:  s.picture,
+	}, nil
+}
+
+func (s *stubResolver) SaveAccountProfile(_ context.Context, _ persistence.Scope, profile persistence.ConnectionProfile) error {
+	s.email, s.displayName, s.picture = profile.Email, profile.DisplayName, profile.PictureURL
 	return nil
 }
 

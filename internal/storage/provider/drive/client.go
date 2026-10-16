@@ -158,6 +158,13 @@ type ConnectionResolver interface {
 	ConnectionByID(ctx context.Context, connectionID string) (Connection, error)
 	// SetChangesCursor advances how far the change log has been processed.
 	SetChangesCursor(ctx context.Context, connectionID, cursor string) error
+	// AccountProfile reports the connected account's display details.
+	//
+	// It is separate from Connection because Connection decrypts a refresh token, and
+	// rendering a name has no reason to hold a usable credential.
+	AccountProfile(ctx context.Context, scope persistence.Scope) (persistence.ConnectionProfile, error)
+	// SaveAccountProfile persists the display columns only, never a credential.
+	SaveAccountProfile(ctx context.Context, scope persistence.Scope, profile persistence.ConnectionProfile) error
 }
 
 // Connection is the stored Drive connection for a tenant.
@@ -173,6 +180,14 @@ type Connection struct {
 	// the first poll succeeds, which is what makes the first poll start from the
 	// newest change rather than from the beginning of time.
 	ChangesCursor *string
+	// Email, DisplayName and PictureURL describe the connected Google account so the
+	// console can show who is signed in.
+	//
+	// None of them is identity. Subject is; these can be absent and can change, and
+	// nothing may key or authorise on them.
+	Email       string
+	DisplayName string
+	PictureURL  string
 }
 
 // Connection status values.
@@ -588,4 +603,55 @@ func parseTokenResponse(body []byte) (url.Values, error) {
 		return nil, fmt.Errorf("drive: the token response was neither json nor form encoded")
 	}
 	return values, nil
+}
+
+// AccountProfile reports who the connected Google account is, for display.
+//
+// A missing profile is not an error: it means the connection predates the profile
+// columns, and the console falls back to the configured id rather than refusing to sign
+// in over a cosmetic field.
+func (c *Client) AccountProfile(ctx context.Context, scope persistence.Scope) (AccountProfile, error) {
+	stored, err := c.conns.AccountProfile(ctx, scope)
+	if err != nil {
+		return AccountProfile{}, err
+	}
+
+	profile := AccountProfile{
+		Email:       stored.Email,
+		DisplayName: stored.DisplayName,
+		PictureURL:  stored.PictureURL,
+	}
+	if profile.DisplayName != "" || profile.Email != "" {
+		return profile, nil
+	}
+
+	// Nothing stored. That means this connection was made before the profile columns
+	// existed, and the fix is one live call rather than making the operator reconnect
+	// to fix a cosmetic field.
+	//
+	// It happens once: the next read finds the columns populated and returns. A failure
+	// is not reported, because an account with no name is still a perfectly usable
+	// connection.
+	connection, err := c.usableConnection(ctx, scope)
+	if err != nil {
+		return profile, nil
+	}
+	accessToken, err := c.accessToken(ctx, connection)
+	if err != nil {
+		return profile, nil
+	}
+	fetched, err := c.fetchAccountProfile(ctx, accessToken)
+	if err != nil {
+		return profile, nil
+	}
+	_ = c.conns.SaveAccountProfile(ctx, scope, persistence.ConnectionProfile{
+		Email:       fetched.Email,
+		DisplayName: fetched.DisplayName,
+		PictureURL:  fetched.PictureURL,
+	})
+	return AccountProfile{
+		Email:       fetched.Email,
+		DisplayName: fetched.DisplayName,
+		PictureURL:  fetched.PictureURL,
+	}, nil
 }

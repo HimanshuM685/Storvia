@@ -325,6 +325,71 @@ func TestDeleteIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestDeleteOfAnObjectThatNeverReachedAProviderIsLocal.
+//
+// An object can be created and then abandoned -- an upload that was never finished, or
+// one whose first attempt failed before anything was written. It has no provider
+// reference at all.
+//
+// Deleting it used to call the provider anyway, which returned a location error because
+// there was nothing to point at. The delete then failed and scheduled a retry that could
+// never succeed, so the object was stuck in `deleting` forever and the console's delete
+// button did nothing. There is no provider copy to remove, so the delete is a local
+// state transition.
+func TestDeleteOfAnObjectThatNeverReachedAProviderIsLocal(t *testing.T) {
+	source := &fakeSource{}
+	objectService, svc, scope, objectID := newAbandonedObject(t, source)
+
+	if err := objectService.DeleteObject(context.Background(), scope, objectID); err != nil {
+		t.Fatalf("DeleteObject: %v", err)
+	}
+	if source.deleted != 0 {
+		t.Errorf("the provider was called %d times, want 0: there is nothing there to delete", source.deleted)
+	}
+
+	deleted, err := svc.deps.Objects.Get(context.Background(), scope, objectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted.Status != model.ObjectDeleted {
+		t.Errorf("status = %q, want deleted", deleted.Status)
+	}
+	if deleted.DeletedAt == nil {
+		t.Error("deleted_at was not stamped; the row would still look live")
+	}
+}
+
+// newAbandonedObject builds the object a failed upload leaves behind.
+//
+// CreateUpload is not used: it records a planned provider identity before the mutation
+// so a retry knows what it was aiming at. The abandoned row is what exists when routing
+// never got that far -- no provider, no connection, no file id, no object key. That is
+// the shape nine objects in the development database actually had.
+func newAbandonedObject(t *testing.T, source ContentSource) (*ObjectService, *UploadService, persistence.Scope, string) {
+	t.Helper()
+
+	drive := &fakeDrive{connectionID: "dc-1", usable: true, configured: true}
+	svc := newTestService(t, drive, nil)
+	scope := testScope()
+	const objectID = "obj_abandoned"
+
+	if err := svc.deps.Objects.Create(context.Background(), scope, model.LogicalObject{
+		ID:           objectID,
+		TenantID:     scope.TenantID,
+		UserID:       scope.UserID,
+		LogicalKey:   objectID,
+		OriginalName: "abandoned.txt",
+		MIMEType:     "text/plain",
+		Category:     "document",
+		ExpectedSize: 12,
+		Status:       model.ObjectPending,
+	}); err != nil {
+		t.Fatalf("Create abandoned object: %v", err)
+	}
+
+	return NewObjectService(svc.deps.Objects, svc.deps.Uploads, source), svc, scope, objectID
+}
+
 func TestDeleteIsTenantScoped(t *testing.T) {
 	source := &fakeSource{}
 	objectService, svc, scope, objectID := newObjectService(t, source)
@@ -402,5 +467,100 @@ func TestNonNormalizedProviderErrorDoesNotLeak(t *testing.T) {
 	}
 	if appErr.Cause == nil {
 		t.Error("the cause must be retained for the log")
+	}
+}
+
+// TestDeleteAllObjectsClearsEveryStoredObject.
+//
+// This is the console's clear-the-set action. It has to remove the objects that did
+// reach a provider and the ones that never did, and it has to leave the deleted rows
+// out of the listing afterwards -- otherwise the operator presses the button and the
+// table does not change.
+func TestDeleteAllObjectsClearsEveryStoredObject(t *testing.T) {
+	source := &fakeSource{}
+	objectService, svc, scope, readyID := newObjectService(t, source)
+	makeReady(t, svc, scope, readyID, model.ProviderGoogleDrive)
+
+	ctx := context.Background()
+	for _, id := range []string{"obj_abandoned_1", "obj_abandoned_2"} {
+		if err := svc.deps.Objects.Create(ctx, scope, model.LogicalObject{
+			ID:           id,
+			TenantID:     scope.TenantID,
+			UserID:       scope.UserID,
+			LogicalKey:   id,
+			OriginalName: id + ".txt",
+			MIMEType:     "text/plain",
+			Category:     "document",
+			ExpectedSize: 12,
+			Status:       model.ObjectPending,
+		}); err != nil {
+			t.Fatalf("Create %s: %v", id, err)
+		}
+	}
+
+	result, err := objectService.DeleteAllObjects(ctx, scope)
+	if err != nil {
+		t.Fatalf("DeleteAllObjects: %v", err)
+	}
+	if result.Deleted != 3 {
+		t.Errorf("deleted %d objects, want 3", result.Deleted)
+	}
+	if len(result.Failed) != 0 {
+		t.Errorf("failures = %+v, want none", result.Failed)
+	}
+
+	// The listing is what the console renders, so it must now be empty.
+	remaining, err := svc.deps.Objects.ListObjects(ctx, scope, 50)
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Errorf("%d objects still listed after a clear, want 0: %+v", len(remaining), remaining)
+	}
+}
+
+// TestDeleteAllObjectsReportsFailuresWithoutStopping.
+//
+// A provider can refuse one object while the rest delete cleanly. The operator needs to
+// know both facts: what was removed and what was not, or they will assume the table is
+// clear when a file is still sitting in Drive.
+func TestDeleteAllObjectsReportsFailuresWithoutStopping(t *testing.T) {
+	source := &fakeSource{deleteErr: &policy.ProviderError{
+		Provider: string(model.ProviderGoogleDrive), Operation: "delete", Class: policy.ClassUnavailable}}
+	objectService, svc, scope, readyID := newObjectService(t, source)
+	makeReady(t, svc, scope, readyID, model.ProviderGoogleDrive)
+
+	ctx := context.Background()
+	// The abandoned object needs no provider call, so it deletes even while Drive is
+	// refusing the ready one.
+	if err := svc.deps.Objects.Create(ctx, scope, model.LogicalObject{
+		ID:           "obj_abandoned",
+		TenantID:     scope.TenantID,
+		UserID:       scope.UserID,
+		LogicalKey:   "obj_abandoned",
+		OriginalName: "abandoned.txt",
+		MIMEType:     "text/plain",
+		Category:     "document",
+		ExpectedSize: 12,
+		Status:       model.ObjectPending,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	result, err := objectService.DeleteAllObjects(ctx, scope)
+	if err != nil {
+		t.Fatalf("DeleteAllObjects: %v", err)
+	}
+	if result.Deleted != 1 {
+		t.Errorf("deleted %d objects, want 1 (the abandoned one)", result.Deleted)
+	}
+	if len(result.Failed) != 1 {
+		t.Fatalf("failures = %+v, want exactly the one Drive refused", result.Failed)
+	}
+	if result.Failed[0].ObjectID != readyID {
+		t.Errorf("failure names %q, want %q", result.Failed[0].ObjectID, readyID)
+	}
+	if result.Failed[0].Reason == "" {
+		t.Error("the failure has no reason; an operator cannot act on a blank one")
 	}
 }

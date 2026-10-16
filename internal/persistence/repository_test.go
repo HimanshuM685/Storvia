@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/shovan04/storvia/internal/config"
+	"github.com/shovan04/storvia/internal/storage/model"
 )
 
 // newTestStore opens an isolated on-disk SQLite database per test.
@@ -582,5 +583,81 @@ func TestPlaceholderRebindDoesNotTouchQuestionMarksInsideLiterals(t *testing.T) 
 	got := postgres.Rebind(query)
 	if got != "SELECT * FROM t WHERE a = $1 AND b = 'literal'" {
 		t.Errorf("rebind = %s", got)
+	}
+}
+
+// TestUpdateStatusStampsDeletedAt.
+//
+// The soft delete used to record only a status. Every query that did not happen to
+// repeat the `status != 'deleted'` check then treated the row as live -- which is how
+// the console came to list objects the user had deleted and diagnostics came to count
+// them as stored.
+//
+// deleted_at is now written with the status, so a deleted row is marked by the write
+// that deleted it rather than by each reader remembering to look.
+func TestUpdateStatusStampsDeletedAt(t *testing.T) {
+	store := newTestStore(t)
+	repo := NewObjectRepository(store)
+	ctx := context.Background()
+	scope := testScope()
+
+	if err := repo.Create(ctx, scope, newObject("obj_1", "key-1").model()); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// A non-delete transition must not stamp it: `missing` and `deleting` are not
+	// deletions, and a row that merely passed through them is still live.
+	if err := repo.UpdateStatus(ctx, scope, "obj_1", 1, model.ObjectUploading); err != nil {
+		t.Fatalf("UpdateStatus(uploading): %v", err)
+	}
+	if got, err := repo.Get(ctx, scope, "obj_1"); err != nil {
+		t.Fatalf("Get: %v", err)
+	} else if got.DeletedAt != nil {
+		t.Errorf("uploading object has deleted_at = %v, want nil", got.DeletedAt)
+	}
+
+	if err := repo.UpdateStatus(ctx, scope, "obj_1", 2, model.ObjectDeleted); err != nil {
+		t.Fatalf("UpdateStatus(deleted): %v", err)
+	}
+	got, err := repo.Get(ctx, scope, "obj_1")
+	if err != nil {
+		t.Fatalf("Get after delete: %v", err)
+	}
+	if got.DeletedAt == nil {
+		t.Error("deleted object has deleted_at = nil; the delete is not recorded in the row")
+	}
+}
+
+// TestListObjectsExcludesDeleted.
+//
+// The console showed deleted objects because the list query filtered only by tenant.
+// A deleted object is not stored, and listing it invites the operator to act on
+// something that is already gone.
+func TestListObjectsExcludesDeleted(t *testing.T) {
+	store := newTestStore(t)
+	repo := NewObjectRepository(store)
+	ctx := context.Background()
+	scope := testScope()
+
+	for _, id := range []string{"obj_live", "obj_gone"} {
+		if err := repo.Create(ctx, scope, newObject(id, "key-"+id).model()); err != nil {
+			t.Fatalf("Create %s: %v", id, err)
+		}
+	}
+	if err := repo.UpdateStatus(ctx, scope, "obj_gone", 1, model.ObjectDeleted); err != nil {
+		t.Fatalf("UpdateStatus: %v", err)
+	}
+
+	objects, err := repo.ListObjects(ctx, scope, 50)
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	for _, object := range objects {
+		if object.ID == "obj_gone" {
+			t.Error("a deleted object was listed; the console would offer to delete it again")
+		}
+	}
+	if len(objects) != 1 {
+		t.Errorf("listed %d objects, want 1 (the live one)", len(objects))
 	}
 }

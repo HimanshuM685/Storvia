@@ -23,14 +23,19 @@ type DriveConnection struct {
 	// PlaintextRefreshToken is set only by ConnectionByID, which reads a connection
 	// for the Drive adapter. Nothing else should populate or read it.
 	PlaintextRefreshToken string
-	KeyReference          string
-	GrantedScopes         string
-	RootFolderID          *string
-	ChangesCursor         *string
-	Status                string
-	LastSuccessAt         *time.Time
-	CreatedAt             time.Time
-	UpdatedAt             time.Time
+	// Email, DisplayName and PictureURL describe the connected Google account for
+	// display. They are not identity and not authorisation inputs.
+	AccountEmail   string
+	AccountName    string
+	AccountPicture string
+	KeyReference   string
+	GrantedScopes  string
+	RootFolderID   *string
+	ChangesCursor  *string
+	Status         string
+	LastSuccessAt  *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // DriveConnectionRepository stores Drive connections.
@@ -90,11 +95,22 @@ func (r *DriveConnectionRepository) Resolve(ctx context.Context, scope Scope) (i
 	return id, subject, string(plaintext), status, folderID.String, nil
 }
 
-// Upsert stores or refreshes a connection.
+// ConnectionProfile describes the connected Google account.
 //
-// The refresh token is encrypted here, on the way in. Nothing upstream has to
-// remember to do it, and nothing downstream can read it in the clear.
-func (r *DriveConnectionRepository) Upsert(ctx context.Context, scope Scope, subject, refreshToken string) (string, error) {
+// It is display data, not identity and not authorisation input. Subject remains the
+// identity: an email address can change and a display name is not unique, so neither is
+// safe to key a connection on.
+type ConnectionProfile struct {
+	Email       string
+	DisplayName string
+	PictureURL  string
+}
+
+// Upsert stores or refreshes a connection, and the profile of the account behind it.
+//
+// The refresh token is encrypted here, on the way in. Nothing upstream has to remember
+// to do it, and nothing downstream can read it in the clear.
+func (r *DriveConnectionRepository) Upsert(ctx context.Context, scope Scope, subject, refreshToken string, profile ConnectionProfile) (string, error) {
 	if r.keyring == nil {
 		return "", errors.New("persistence: a keyring is required to store a refresh token")
 	}
@@ -109,13 +125,18 @@ func (r *DriveConnectionRepository) Upsert(ctx context.Context, scope Scope, sub
 
 	existingID, _, _, _, _, err := r.Resolve(ctx, scope)
 	if err == nil && existingID != "" {
+		// The profile is refreshed on every connect. Google's display name changes
+		// without anything else changing, and a stale name in the console is worse than
+		// no name at all.
 		query := r.store.Rebind(`UPDATE drive_connections SET
 			encrypted_refresh_token = ?, key_reference = ?, google_subject = ?,
+			account_email = ?, account_name = ?, account_picture = ?,
 			status = 'connected', updated_at = ?
 			WHERE id = ? AND tenant_id = ? AND user_id = ?`)
 		_, err := r.store.db.ExecContext(ctx, query, encrypted,
-			r.keyring.ActiveReference(), subject, time.Now().UTC(),
-			existingID, scope.TenantID, scope.UserID)
+			r.keyring.ActiveReference(), subject,
+			nullIfEmpty(profile.Email), nullIfEmpty(profile.DisplayName), nullIfEmpty(profile.PictureURL),
+			time.Now().UTC(), existingID, scope.TenantID, scope.UserID)
 		if err != nil {
 			return "", fmt.Errorf("persistence: update drive connection: %w", err)
 		}
@@ -133,10 +154,13 @@ func (r *DriveConnectionRepository) Upsert(ctx context.Context, scope Scope, sub
 	now := time.Now().UTC()
 	query := r.store.Rebind(`INSERT INTO drive_connections (
 		id, tenant_id, user_id, google_subject, encrypted_refresh_token, key_reference,
-		granted_scopes, status, created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, 'connected', ?, ?)`)
+		granted_scopes, status, account_email, account_name, account_picture,
+		created_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, 'connected', ?, ?, ?, ?, ?)`)
 	_, err = r.store.db.ExecContext(ctx, query, id, scope.TenantID, scope.UserID, subject,
-		encrypted, r.keyring.ActiveReference(), "https://www.googleapis.com/auth/drive.file", now, now)
+		encrypted, r.keyring.ActiveReference(), "https://www.googleapis.com/auth/drive.file",
+		nullIfEmpty(profile.Email), nullIfEmpty(profile.DisplayName), nullIfEmpty(profile.PictureURL),
+		now, now)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return "", ErrConflict
@@ -293,4 +317,57 @@ func (r *DriveConnectionRepository) ConnectedConnectionIDs(ctx context.Context) 
 		return nil, fmt.Errorf("persistence: list connected drives: %w", err)
 	}
 	return ids, nil
+}
+
+// AccountProfile reads who the connected Google account is.
+//
+// It is separate from Resolve on purpose. Resolve decrypts a credential, and the console
+// showing a name has no reason to hold a usable refresh token -- so the display path
+// never asks for one.
+func (r *DriveConnectionRepository) AccountProfile(ctx context.Context, scope Scope) (ConnectionProfile, error) {
+	row := r.store.db.QueryRowContext(ctx, r.store.Rebind(`SELECT
+		account_email, account_name, account_picture
+		FROM drive_connections
+		WHERE tenant_id = ? AND user_id = ?
+		ORDER BY updated_at DESC LIMIT 1`), scope.TenantID, scope.UserID)
+
+	var email, name, picture sql.NullString
+	err := row.Scan(&email, &name, &picture)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ConnectionProfile{}, ErrNoConnection
+	}
+	if err != nil {
+		return ConnectionProfile{}, fmt.Errorf("persistence: read the account profile: %w", err)
+	}
+	return ConnectionProfile{
+		Email:       email.String,
+		DisplayName: name.String,
+		PictureURL:  picture.String,
+	}, nil
+}
+
+// nullIfEmpty stores an absent value as NULL rather than an empty string, so "Google did
+// not tell us" stays distinguishable from "Google told us it is blank".
+func nullIfEmpty(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+// SaveAccountProfile updates only the display columns.
+//
+// It deliberately does not touch the refresh token: backfilling a name must never
+// re-encrypt, rewrite or even read a credential. A connection that predates the profile
+// columns gets a name without anything else moving.
+func (r *DriveConnectionRepository) SaveAccountProfile(ctx context.Context, scope Scope, profile ConnectionProfile) error {
+	_, err := r.store.db.ExecContext(ctx, r.store.Rebind(`UPDATE drive_connections SET
+		account_email = ?, account_name = ?, account_picture = ?, updated_at = ?
+		WHERE tenant_id = ? AND user_id = ?`),
+		nullIfEmpty(profile.Email), nullIfEmpty(profile.DisplayName), nullIfEmpty(profile.PictureURL),
+		time.Now().UTC(), scope.TenantID, scope.UserID)
+	if err != nil {
+		return fmt.Errorf("persistence: save the account profile: %w", err)
+	}
+	return nil
 }

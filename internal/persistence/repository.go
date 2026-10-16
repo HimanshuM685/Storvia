@@ -194,10 +194,34 @@ func (r *ObjectRepository) CommitReady(ctx context.Context, scope Scope, objectI
 
 // UpdateStatus moves an object to a new lifecycle status.
 func (r *ObjectRepository) UpdateStatus(ctx context.Context, scope Scope, objectID string, expectedRowVersion int64, status model.ObjectStatus) error {
-	query := r.store.Rebind(`UPDATE storage_objects SET status = ?, row_version = row_version + 1, updated_at = ?
+	// deleted_at is stamped here rather than left for the reader to infer from
+	// status. A soft delete that records only a status is indistinguishable from a
+	// live row to every query that does not happen to repeat the check -- which is
+	// how the console came to list deleted objects and diagnostics came to count
+	// them as stored.
+	//
+	// `missing` is stamped too, because both it and `deleted` mean the object is no
+	// longer part of the stored set: `missing` is what a delete records when the
+	// provider says the file is already absent. They stay distinct in the row, so
+	// the difference is still there to read, but neither is a stored object.
+	//
+	// It is deliberately not cleared on any other transition. `deleting` is not a
+	// deletion, and a row that was deleted stays deleted.
+	deletedAt := "NULL"
+	if status == model.ObjectDeleted || status == model.ObjectMissing {
+		deletedAt = "?"
+	}
+
+	args := []any{string(status), time.Now().UTC()}
+	if deletedAt != "NULL" {
+		args = append(args, time.Now().UTC())
+	}
+	args = append(args, objectID, scope.TenantID, scope.UserID, expectedRowVersion)
+
+	query := r.store.Rebind(`UPDATE storage_objects SET status = ?, deleted_at = ` + deletedAt + `,
+		row_version = row_version + 1, updated_at = ?
 	WHERE id = ? AND tenant_id = ? AND user_id = ? AND row_version = ?`)
-	result, err := r.store.db.ExecContext(ctx, query, string(status), time.Now().UTC(),
-		objectID, scope.TenantID, scope.UserID, expectedRowVersion)
+	result, err := r.store.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("persistence: update object status: %w", err)
 	}
@@ -622,7 +646,7 @@ func (r *ObjectRepository) ListObjects(ctx context.Context, scope Scope, limit i
 		       provider, status, provider_object_key, provider_file_id, backend_id,
 		       created_at, updated_at
 		FROM storage_objects
-		WHERE tenant_id = ?
+		WHERE tenant_id = ? AND deleted_at IS NULL
 		ORDER BY created_at DESC, id DESC
 		LIMIT ?`), scope.TenantID, limit)
 	if err != nil {

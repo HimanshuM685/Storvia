@@ -1,4 +1,4 @@
-import type { RoutingChoice, State, UploadResult } from './types';
+import type { DeleteAllResult, RoutingChoice, State, UploadResult } from './types';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -88,9 +88,14 @@ export const api = {
   disconnect: () => request<{ disconnected: boolean }>(`${API_BASE}/disconnect`, json({})),
 
   deleteObject: (id: string) =>
-    request<{ deleted: string }>(`/console/api/objects/${encodeURIComponent(id)}`, {
+    request<{ deleted: string }>(`${API_BASE}/objects/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     }),
+
+  /** Deletes every stored object. The response reports both what went and what did
+   *  not, because a bulk delete can partly succeed. */
+  deleteAllObjects: () =>
+    request<DeleteAllResult>(`${API_BASE}/objects`, { method: 'DELETE' }),
 
   upload: (file: File, onProgress?: (fraction: number) => void) =>
     new Promise<UploadResult>((resolve, reject) => {
@@ -134,6 +139,21 @@ export const api = {
 
 export function downloadUrl(objectId: string): string {
   return `${API_BASE}/objects/${encodeURIComponent(objectId)}/content`;
+}
+
+/**
+ * initialsFor is the avatar fallback for an account with no picture.
+ *
+ * It takes the first letter of the first and last words, so "Shovan Biswas" reads as
+ * SB rather than S — which is how people expect an avatar to look.
+ */
+export function initialsFor(label: string): string {
+  const words = label.trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return '?';
+  const first = [...words[0]][0] ?? '';
+  if (words.length === 1) return first.toUpperCase() || '?';
+  const last = [...words[words.length - 1]][0] ?? '';
+  return (first + last).toUpperCase() || '?';
 }
 
 export function formatBytes(value: number | undefined): string {
