@@ -30,6 +30,17 @@ export type Connection = {
   last_success_at?: string;
 };
 
+export type FallbackDisclosure = {
+  version: string;
+  destination: string;
+  region: string;
+  operator_access: string;
+  encryption: string;
+  retention: string;
+  deletion: string;
+  disconnect: string;
+};
+
 export type ObjectView = {
   id: string;
   name: string;
@@ -59,7 +70,7 @@ export type State = {
   };
   connection: Connection;
   storage: StorageInfo;
-  consent: { granted: boolean; granted_at?: string };
+  consent: { granted: boolean; granted_at?: string; disclosure: FallbackDisclosure };
   routing: RoutingInfo;
   faults: { enabled: boolean };
   objects: ObjectView[];

@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/shovan04/storvia/internal/config"
 	"github.com/shovan04/storvia/internal/persistence"
 )
 
@@ -69,5 +70,41 @@ func TestConsentGateHonoursTheConfiguredRequirement(t *testing.T) {
 	ok, err = strict(context.Background(), persistence.Scope{TenantID: "t1"})
 	if err != nil || !ok {
 		t.Errorf("with consent required and granted, the gate = %v/%v, want true", ok, err)
+	}
+}
+
+func TestConsentViewIncludesTheDeploymentDisclosure(t *testing.T) {
+	store := &stubConsentStore{}
+	disclosure := DisclosureForFallback(config.FallbackConfig{
+		Backends: []config.S3BackendConfig{{
+			Vendor: config.VendorCloudflareR2,
+			Region: "eu",
+			Bucket: "tenant-fallback",
+		}},
+	})
+
+	view, err := NewConsentService(store, disclosure).Show(context.Background(), persistence.Scope{TenantID: "t1"})
+	if err != nil {
+		t.Fatalf("Show: %v", err)
+	}
+	if view.Disclosure.Version != persistence.CurrentDisclosureVersion {
+		t.Fatalf("disclosure version = %q, want %q", view.Disclosure.Version, persistence.CurrentDisclosureVersion)
+	}
+	if view.Disclosure.Destination != `Cloudflare R2 bucket "tenant-fallback"` {
+		t.Errorf("destination = %q, want the configured provider and bucket", view.Disclosure.Destination)
+	}
+	if view.Disclosure.Region != "eu" {
+		t.Errorf("region = %q, want eu", view.Disclosure.Region)
+	}
+	for name, value := range map[string]string{
+		"operator_access": view.Disclosure.OperatorAccess,
+		"encryption":      view.Disclosure.Encryption,
+		"retention":       view.Disclosure.Retention,
+		"deletion":        view.Disclosure.Deletion,
+		"disconnect":      view.Disclosure.Disconnect,
+	} {
+		if value == "" {
+			t.Errorf("disclosure.%s is empty", name)
+		}
 	}
 }

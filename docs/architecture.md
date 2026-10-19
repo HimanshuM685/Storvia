@@ -193,8 +193,10 @@ class of mistake impossible rather than merely discouraged:
   Sensitive attribute names are replaced with a marker before any record is written,
   including inside groups and through `With`.
 - `config` refuses configuration that would be unsafe or non-functional: the broad
-  Drive scope, a non-allow-listed endpoint, a retry budget that cannot fit its own
-  attempts, and enabling fallback while the disclosure is unaccepted.
+  Drive scope, a non-allow-listed endpoint, and a retry budget that cannot fit its own
+  attempts. Per-tenant disclosure acceptance is evaluated at runtime, not at config
+  load, so a deployment may enable the required-consent gate without pretending to
+  know any tenant's state.
 - `idid` mints unguessable opaque identifiers. No identifier encodes a tenant, a user,
   a file name, or a sequence number.
 - `secrets` encrypts refresh tokens on the way into the database and decrypts them

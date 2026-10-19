@@ -415,6 +415,16 @@ func TestConsentEndpointsRoundTrip(t *testing.T) {
 	if !containsJSONField(show.Body.Bytes(), "granted", false) {
 		t.Errorf("a tenant that never asked must not be granted: %s", show.Body.String())
 	}
+	var shown service.ConsentView
+	if err := json.Unmarshal(show.Body.Bytes(), &shown); err != nil {
+		t.Fatalf("decode consent disclosure: %v", err)
+	}
+	if shown.Disclosure.Version != persistence.CurrentDisclosureVersion {
+		t.Errorf("disclosure version = %q, want %q", shown.Disclosure.Version, persistence.CurrentDisclosureVersion)
+	}
+	if shown.Disclosure.Destination == "" || shown.Disclosure.Deletion == "" {
+		t.Errorf("consent response omitted the user-facing disclosure: %+v", shown.Disclosure)
+	}
 
 	accept := request(t, h.consent.Accept, http.MethodPost, "/v1/storage/fallback/consent", nil)
 	if accept.Code != http.StatusOK {

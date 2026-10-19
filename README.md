@@ -144,10 +144,11 @@ the console at `/console/` in that mode, same origin, no CORS.
 
 ### Routing
 
-Uploads go to the user's Google Drive. If Drive cannot be used — not connected, or the
-availability check fails — the upload goes to the configured fallback provider instead.
-That is automatic; no switch is involved. The fallback only records a disclosure when the
-deployment sets `fallback.consent_required` to true.
+Uploads go to the user's Google Drive. If Drive's bounded availability check reports an
+eligible outage before any provider mutation, the upload goes to the configured fallback
+provider instead. A missing connection, revoked grant, quota or rate-limit response, and
+other classified failures are not outages and do not open fallback. That is automatic; no
+client switch is involved.
 
 ---
 
@@ -301,8 +302,10 @@ The rule is enforced by tests against the real committed files, not by code revi
   reprints the value it rejected.
 
 The loader also refuses configuration that would be unsafe: the broad `drive` scope, a
-non-allow-listed endpoint, a retry budget that cannot fit its own attempts, and
-enabling fallback while the outage disclosure is unaccepted.
+non-allow-listed endpoint, and a retry budget that cannot fit its own attempts. When
+`fallback.consent_required` is true, the per-tenant runtime gate remains closed until
+that tenant accepts the current disclosure; configuration validation does not pretend
+to know any tenant's acceptance state.
 
 ### Outage fallback
 
@@ -327,6 +330,11 @@ GET    /v1/storage/fallback/consent   # current state
 POST   /v1/storage/fallback/consent   # accept the current disclosure
 DELETE /v1/storage/fallback/consent   # withdraw
 ```
+
+The `GET` response includes the exact versioned disclosure being accepted, including the
+configured fallback destination and region, operator access, encryption responsibility,
+retention, deletion, and Drive-disconnect behavior. Clients should render that nested
+`disclosure` object rather than linking to a separately maintained copy.
 
 ### Google OAuth setup
 

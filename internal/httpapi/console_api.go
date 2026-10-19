@@ -37,6 +37,7 @@ type Console struct {
 	diagnostics DiagnosticsProvider
 	folders     FolderEnsurer
 	objects_    *persistence.ObjectRepository
+	reconcile   ReconciliationController
 
 	// routing is the live Drive-vs-fallback switch. It may be nil, in which case the
 	// console reports that forcing is unavailable rather than pretending it works.
@@ -58,6 +59,7 @@ type Console struct {
 // ConsentController reads and changes fallback consent.
 type ConsentController interface {
 	ConsentGranted(ctx context.Context, scope persistence.Scope) (bool, error)
+	ConsentDisclosure() service.FallbackDisclosure
 	GrantConsent(ctx context.Context, scope persistence.Scope) error
 	WithdrawConsent(ctx context.Context, scope persistence.Scope) error
 }
@@ -240,8 +242,9 @@ type StorageInfo struct {
 
 // ConsentInfo is the fallback-consent state.
 type ConsentInfo struct {
-	Granted   bool       `json:"granted"`
-	GrantedAt *time.Time `json:"granted_at,omitempty"`
+	Granted    bool                       `json:"granted"`
+	GrantedAt  *time.Time                 `json:"granted_at,omitempty"`
+	Disclosure service.FallbackDisclosure `json:"disclosure"`
 }
 
 // RoutingInfo is the Drive-vs-fallback control.
@@ -274,6 +277,12 @@ type ObjectView struct {
 	Provider     string    `json:"provider"`
 	Status       string    `json:"status"`
 	ProviderRef  string    `json:"provider_ref,omitempty"`
+	// Reconciliation fields describe the same pinned provider attempt. They are
+	// separate from Status because an object can be uploading while its provider
+	// result is ambiguous.
+	ReconciliationState    string `json:"reconciliation_state,omitempty"`
+	ReconciliationAttempts int    `json:"reconciliation_attempts"`
+	ReconciliationError    string `json:"reconciliation_error,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	Downloadable bool      `json:"downloadable"`
 }
@@ -330,7 +339,10 @@ func (c *Console) State(w http.ResponseWriter, r *http.Request) {
 		c.fail(w, err)
 		return
 	}
-	state.Consent = ConsentInfo{Granted: granted}
+	state.Consent = ConsentInfo{
+		Granted:    granted,
+		Disclosure: c.consent.ConsentDisclosure(),
+	}
 
 	// The storage status carries the "can this account upload right now" answer, which
 	// is the thing an operator actually wants to see next to the connection state.
@@ -356,7 +368,7 @@ func (c *Console) State(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, object := range objects {
-		state.Objects = append(state.Objects, ObjectView{
+		view := ObjectView{
 			ID:         object.ID,
 			Name:       object.OriginalName,
 			LogicalKey: object.LogicalKey,
@@ -371,13 +383,113 @@ func (c *Console) State(w http.ResponseWriter, r *http.Request) {
 			ProviderRef:  firstNonEmpty(deref(object.ProviderFileID), deref(object.ProviderObjectKey)),
 			CreatedAt:    object.CreatedAt,
 			Downloadable: object.Status == model.ObjectReady,
-		})
+			ReconciliationState: string(object.Status),
+		}
+		if c.reconcile != nil {
+			reconciliation, err := c.reconcile.Status(r.Context(), scope, object.ID)
+			if err != nil {
+				// A status read is observability. Keep the object row visible and put
+				// the safe, capped reason in the row rather than hiding all objects
+				// behind one failed provider inspection.
+				view.ReconciliationError = safeConsoleDetail(err)
+			} else {
+				view.ReconciliationState = reconciliation.State
+				view.ReconciliationAttempts = reconciliation.Attempts
+				view.ReconciliationError = reconciliation.Error
+			}
+		}
+		state.Objects = append(state.Objects, view)
 	}
 
 	if c.diagnostics != nil {
 		state.Diag = c.diagnostics.Diagnostics(r.Context())
 	}
 	c.writeJSON(w, http.StatusOK, state)
+}
+
+// requireReconciliationConsent gates both inspection and force-reconcile. The
+// operator must have accepted the current outage-fallback disclosure before the
+// console exposes a recovery control, even though the backend must never issue a
+// second provider write while reconciling.
+func (c *Console) requireReconciliationConsent(w http.ResponseWriter, r *http.Request, scope persistence.Scope) bool {
+	if c.consent == nil {
+		c.writeJSON(w, http.StatusNotImplemented, map[string]string{
+			"error": "Reconciliation consent is not available in this build.",
+		})
+		return false
+	}
+	granted, err := c.consent.ConsentGranted(r.Context(), scope)
+	if err != nil {
+		c.fail(w, err)
+		return false
+	}
+	if !granted {
+		c.writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":  "Reconciliation requires acceptance of the outage-fallback disclosure.",
+			"detail": "Accept the current disclosure before inspecting or forcing reconciliation.",
+		})
+		return false
+	}
+	return true
+}
+
+// ReconciliationStatus returns the pinned provider and current recovery evidence for
+// one object. The backend implementation is responsible for tenant-scoped lookup.
+func (c *Console) ReconciliationStatus(w http.ResponseWriter, r *http.Request) {
+	scope, ok := c.requireSession(w, r)
+	if !ok {
+		return
+	}
+	if !c.requireReconciliationConsent(w, r, scope) {
+		return
+	}
+	if c.reconcile == nil {
+		c.writeJSON(w, http.StatusNotImplemented, map[string]string{
+			"error": "Reconciliation is not available in this build.",
+		})
+		return
+	}
+	objectID := r.PathValue("object_id")
+	if objectID == "" {
+		c.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "No object was named."})
+		return
+	}
+	status, err := c.reconcile.Status(r.Context(), scope, objectID)
+	if err != nil {
+		c.fail(w, err)
+		return
+	}
+	c.writeJSON(w, http.StatusOK, status)
+}
+
+// ForceReconcile asks the backend to inspect the already-pinned provider. The
+// operation is idempotent by backend contract: repeating it returns the durable
+// result and never plans or starts a new provider write.
+func (c *Console) ForceReconcile(w http.ResponseWriter, r *http.Request) {
+	scope, ok := c.requireSession(w, r)
+	if !ok {
+		return
+	}
+	if !c.requireReconciliationConsent(w, r, scope) {
+		return
+	}
+	if c.reconcile == nil {
+		c.writeJSON(w, http.StatusNotImplemented, map[string]string{
+			"error": "Reconciliation is not available in this build.",
+		})
+		return
+	}
+	objectID := r.PathValue("object_id")
+	if objectID == "" {
+		c.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "No object was named."})
+		return
+	}
+	status, err := c.reconcile.ForceReconcile(r.Context(), scope, objectID)
+	if err != nil {
+		c.fail(w, err)
+		return
+	}
+	c.writeJSON(w, http.StatusOK, status)
 }
 
 // accountLabel is what the console shows for the signed-in account.

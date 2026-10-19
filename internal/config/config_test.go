@@ -227,18 +227,14 @@ func TestValidateRejectsImpossibleRetryBudget(t *testing.T) {
 	}
 }
 
-func TestValidateRejectsFallbackWithoutDisclosureAcceptance(t *testing.T) {
+func TestValidateAllowsFallbackWithDisclosureRequired(t *testing.T) {
 	raw := strings.Replace(minimalConfig(), `"fallback": {"enabled": false}`,
 		`"fallback": {"enabled": true, "consent_required": true, "backends": [
            {"id": "b1", "vendor": "cloudflare_r2", "bucket": "b"}
          ]}`, 1)
 
-	_, err := Parse([]byte(raw), lookupMap(map[string]string{EnvR2Endpoint: r2TestEndpoint}))
-	if err == nil {
-		t.Fatal("fallback must refuse to enable while the outage disclosure is unaccepted")
-	}
-	if !strings.Contains(err.Error(), "consent") {
-		t.Errorf("error = %v, want it to mention consent", err)
+	if _, err := Parse([]byte(raw), lookupMap(map[string]string{EnvR2Endpoint: r2TestEndpoint})); err != nil {
+		t.Fatalf("fallback with required consent must be valid configuration: %v", err)
 	}
 }
 

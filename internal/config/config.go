@@ -740,9 +740,6 @@ func (c *Config) validateFallback() error {
 	if !c.Fallback.Enabled {
 		return nil
 	}
-	if c.Fallback.ConsentRequired {
-		return fmt.Errorf("config: fallback.consent_required must be false; Storvia refuses to enable outage uploads until the disclosure is accepted")
-	}
 	if len(c.Fallback.Backends) == 0 {
 		return fmt.Errorf("config: fallback.enabled requires at least one backend")
 	}

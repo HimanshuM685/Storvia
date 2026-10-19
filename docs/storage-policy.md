@@ -81,7 +81,7 @@ These are initial engineering values, not provider guarantees or measured produc
 
 ## 5. Privacy and scope boundaries
 
-Disclose the fallback destination, regions, operator access, encryption, retention, costs, and deletion/disconnect behavior before enabling outage uploads. No file can be advertised as "only ever on your Drive" when fallback is enabled.
+Disclose the fallback destination, regions, operator access, encryption, retention, costs, and deletion/disconnect behavior before enabling outage uploads. Storvia's authenticated `GET /v1/storage/fallback/consent` response serves the current versioned disclosure, including the configured destination and region, so clients can show the exact copy before acceptance. No file can be advertised as "only ever on your Drive" when fallback is enabled.
 
 Account creation may remain usable without Drive consent, but new storage uploads require a connected Drive account. Proposed disconnect behavior: stop new Drive requests and new uploads, leave user-owned Drive files untouched, and keep already-created fallback files manageable under the application's published retention/deletion policy. No new S3 writes are justified by disconnect itself.
 

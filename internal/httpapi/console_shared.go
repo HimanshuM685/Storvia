@@ -55,6 +55,28 @@ type FolderEnsurer interface {
 	EnsureRootFolder(ctx context.Context, scope persistence.Scope) error
 }
 
+// ReconciliationStatus is the operator-safe view of one object's pinned recovery
+// state. The backend owns the lookup from object to upload/attempt and guarantees
+// that ForceReconcile is a same-provider, idempotent observation/commit operation;
+// the console never writes to a provider itself.
+type ReconciliationStatus struct {
+	ObjectID string `json:"object_id"`
+	Provider string `json:"provider"`
+	State    string `json:"state"`
+	Attempts int    `json:"attempts"`
+	Error    string `json:"error,omitempty"`
+	Outcome  string `json:"outcome,omitempty"`
+}
+
+// ReconciliationController is the backend service boundary used by the admin
+// console. Both methods must scope all reads and state changes to scope. POST is
+// intentionally object-based: the backend resolves the durable upload and active
+// attempt, so the browser cannot choose a provider or create a second write.
+type ReconciliationController interface {
+	Status(ctx context.Context, scope persistence.Scope, objectID string) (ReconciliationStatus, error)
+	ForceReconcile(ctx context.Context, scope persistence.Scope, objectID string) (ReconciliationStatus, error)
+}
+
 // AdminDiagnostics is everything the panel reports about the running process.
 //
 // It exists so an operator can answer "why did that upload go where it did" without

@@ -81,8 +81,9 @@ Exit checks:
 
 - [x] The owner agreed that fallback is outage-only and that no copies are retained.
 - [ ] Data protection/privacy review accepts that an outage upload can be stored
-      outside the user's Drive. `fallback.consent_required` is hard-coded to `true`
-      in the loader until this is accepted, which is the code-level stand-in.
+      outside the user's Drive. `fallback.consent_required` is a deployment setting;
+      when true, the per-tenant runtime gate requires acceptance of the current
+      versioned disclosure before an outage upload.
 
 ### M1 — Go foundation and policy engine
 
@@ -239,7 +240,9 @@ Deliverables:
 - [x] Strict CORS allow-list; no provider credential is ever exposed.
 - [x] Key rotation support in the keyring.
 - [ ] Emergency disablement runbooks.
-- [ ] User-facing disclosure of fallback storage, region, retention, deletion.
+- [x] User-facing versioned disclosure of fallback storage, region, retention, deletion,
+      operator access, encryption responsibility, and disconnect behavior through the
+      authenticated consent response.
 - [ ] Dependency and license review.
 
 Pilot gate:

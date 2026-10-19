@@ -6,12 +6,8 @@ import (
 	"github.com/shovan04/storvia/internal/storage/service"
 )
 
-// ConsentHandler exposes the tenant's outage-fallback consent.
-//
-// The disclosure itself is not served from here. It is a document a tenant has to be
-// shown and agree to, and a client that wants to render it should link to whatever
-// copy the deployment publishes; the endpoint reports the version so a client can
-// tell whether its cached copy is still the one that was agreed to.
+// ConsentHandler exposes the tenant's outage-fallback consent and the exact
+// deployment disclosure associated with the current disclosure version.
 type ConsentHandler struct {
 	svc *service.ConsentService
 }

@@ -3322,3 +3322,230 @@ console's own title, and the cross-origin HMR warning is gone.
   lint result is claimed.
 - The console still has never been used by a person. Nothing here changes that.
 - No commit was created.
+
+---
+
+## 2026-10-17 — Semantic extraction of the Storvia documentation corpus
+
+### Why
+
+The requested graphify chunk needed a durable semantic representation of the 16
+documentation and configuration files covering Storvia's storage contract, architecture,
+security rules, implementation status, references, container setup, and SDK behavior.
+
+### Changed
+
+- Added `graphify-out/.graphify_chunk_01.json` with 88 concept nodes, 83 edges, and 3
+  hyperedges.
+- Every requested absolute source path is represented verbatim in the extraction.
+- Node IDs retain the full repository-relative path stem and use only lowercase
+  alphanumeric characters and underscores.
+- Design rationale is attached to relevant concept nodes. Edges use the requested
+  EXTRACTED/INFERRED confidence rubric, and no phantom cross-language calls were added.
+- The graph records the confirmed Drive-first, outage-only fallback, single-location,
+  same-provider reconciliation, tenant-isolation, secret-boundary, and verification-status
+  relationships without changing application code.
+
+### Bug found and fixed
+
+The first schema validation found that `SECURITY.md` had been inspected but had no
+source-backed node. Four security concepts and their relationships were added before the
+successful validation.
+
+The final ID audit also found shortened prefixes for `console/pnpm-workspace.yaml` and
+`docker-compose.yml`. Those IDs were corrected to retain the complete file stems before
+the final validation.
+
+### Checks actually run
+
+```text
+python3 schema validation before SECURITY fix -> failed: SECURITY.md was not represented
+python3 schema validation after fix          -> valid JSON; 88 nodes, 83 edges, 3 hyperedges; all 16 source files represented
+make check                                   -> not runnable in this environment: `gofmt: command not found` and `go: command not found`
+python3 final ID/schema validation           -> passed; file exists; 88 nodes, 83 edges, 3 hyperedges; ID stems and endpoints valid
+```
+
+### Not done
+
+- No graph clustering, HTML visualization, or full graph merge was requested.
+- No application behavior or provider/database path was changed or newly verified.
+- No commit was created.
+
+### Next step
+
+Use the chunk as the semantic input for the graphify merge or query workflow when the
+remaining corpus extraction is assembled.
+
+---
+
+## 2026-10-18 — Full Storvia knowledge graph generated
+
+### Why
+
+The graphify pipeline was continued from the documentation chunk and completed for the
+current repository so the code, policies, architecture notes, and SDK documentation can
+be navigated together.
+
+### Changed
+
+- Detected 178 supported files and approximately 201,233 words: 162 code files and 16
+  documentation/configuration files.
+- Merged deterministic AST extraction (2,254 nodes, 8,456 edges) with the semantic chunk
+  (88 nodes, 83 edges, 3 hyperedges), producing a 2,394-node, 8,400-edge graph.
+- Clustered the graph into 122 communities and replaced generic community labels with
+  plain-language names such as `Storage Contract and Policy`, `Drive OAuth Flow`, and
+  `No-Copy Storage Rules`.
+- Generated `graphify-out/graph.html`, `graphify-out/graph.json`,
+  `graphify-out/GRAPH_REPORT.md`, `graphify-out/manifest.json`, and
+  `graphify-out/cost.json`.
+
+### Bugs and integrity findings
+
+- The persisted `.graphify_python` path pointed to an unavailable interpreter after the
+  first continuation. The graphify tool was re-resolved through `uv` before labeling and
+  export.
+- The read-only graph health check found 671 dangling-endpoint edges, 85 directed
+  same-endpoint collapses, and 102 undirected same-endpoint collapses. The graph remains
+  usable, but these extraction/AST endpoint mismatches are deliberately visible in the
+  report rather than being hidden.
+- Semantic-agent usage was not exposed by the runtime result, so graphify's cost tracker
+  records 0 input and 0 output tokens for this run. No token total is claimed as measured.
+
+### Checks actually run
+
+```text
+graphify detect                 -> 178 files, ~201,233 words; 0 sensitive files skipped
+AST extraction                  -> 2,254 nodes, 8,456 edges
+semantic merge                  -> 88 nodes, 83 edges, 3 hyperedges
+graph build and clustering      -> 2,394 nodes, 8,400 edges, 122 communities
+graph health diagnostic         -> warning: 671 dangling, 85 directed collapsed, 102 undirected collapsed
+graphify export html            -> graph.html written
+manifest/cost finalization      -> manifest saved for 178 files; 1 run recorded
+```
+
+### Not done
+
+- No Go, frontend, Docker, or live-provider test was run as part of graphify.
+- No Neo4j, FalkorDB, SVG, GraphML, wiki, Obsidian, or MCP export was requested.
+- No commit was created.
+
+### Next step
+
+Open `graphify-out/graph.html`, or use `graphify query` against the existing graph to
+trace a cross-community question. Investigate the dangling/collapsed edge findings before
+treating every structural relationship as complete.
+
+---
+
+## 2026-10-19 — Serve the exact fallback disclosure through consent
+
+### Why
+
+The review found that the consent endpoint reported only a disclosure version while
+the actual disclosure lived outside the application. A client could therefore ask a
+tenant to accept fallback storage without having a reliable, deployment-specific copy
+of the destination, region, operator access, encryption responsibility, retention,
+deletion, and disconnect terms.
+
+### Changed
+
+- Added `service.FallbackDisclosure` and included it in every `ConsentView` returned by
+  `GET`, `POST`, and `DELETE /v1/storage/fallback/consent`.
+- Application wiring derives the destination and region from the active configured
+  S3-compatible backend. The disclosure names the configured provider and bucket but
+  never includes credentials, tokens, signed URLs, or other secret material.
+- Added conservative wording for operator access, HTTPS transport, provider-side
+  encryption responsibility, retention, provider deletion semantics, and Drive
+  disconnect behavior. The wording explicitly preserves the no-copy/no-backup
+  contract.
+- Updated the console state and `OperatorControls` to render the same versioned
+  disclosure before the operator changes the consent control.
+- Corrected README routing language so only eligible pre-mutation Drive availability
+  failures open fallback; missing connection and classified account/provider errors do
+  not.
+- Fixed configuration validation so `fallback.consent_required: true` is accepted and
+  enforced by the per-tenant runtime gate. Configuration loading no longer tries to
+  evaluate a tenant's consent record.
+- Marked the user-facing disclosure deliverable complete in the implementation plan.
+
+### Tests and checks actually run
+
+```text
+gofmt -w affected Go files                         -> success
+go test ./internal/storage/service ./internal/httpapi ./internal/app ./internal/config -> pass
+go test ./...                                      -> pass
+go vet ./...                                       -> pass
+go test -race ./...                               -> pass
+pnpm typecheck (console)                          -> pass
+pnpm build (console)                              -> pass
+make console                                      -> pass; embedded export rebuilt
+```
+
+The first `make check-all` attempt did not complete: the ignored embedded console
+assets were absent and the repository has no tracked `cmd/` directory, so its stale
+`GOFILES` list reported `lstat ./cmd: no such file or directory` and `go vet` stopped at
+the missing embed pattern. After `make console`, direct `go vet ./...` and the full Go
+test commands passed. No live provider, PostgreSQL, Redis, or browser test was run.
+
+### Deliberately not changed
+
+The product decision about whether `fallback.consent_required` must be true in every
+deployment remains open. This change makes the disclosure available in both optional
+and required-consent deployments and makes the documented required-consent setting
+actually usable; it does not silently promote optional consent to a new requirement.
+
+### Next step
+
+Settle and document the production consent requirement, then verify PostgreSQL,
+multi-instance Redis sessions, an above-8 MiB Drive upload, and the console flow in a
+real browser before pilot approval.
+
+---
+
+## 2026-10-19 — Full knowledge graph rebuilt after the fallback-disclosure changes
+
+### Why
+
+The repository graph was rebuilt after the fallback disclosure and consent-validation
+changes so the code, current documentation, implementation status, and verification
+gaps remain navigable together.
+
+### Changed
+
+- Re-extracted the current corpus of 178 supported files and approximately 203,035
+  words: 162 code files and 16 documentation files.
+- Rebuilt the graph with 2,340 nodes, 8,444 edges, and 118 detected communities.
+- Preserved 118 plain-language community labels and regenerated the interactive HTML,
+  GraphRAG JSON, report, manifest, and cost record under `graphify-out/`.
+- The new graph was smaller than the prior 2,394-node graph, so graphify's shrink guard
+  refused the first export. The explicit force export was then used because this was a
+  requested full rebuild; the shrink and missing-node warning were not hidden.
+
+### Checks actually run
+
+```text
+graphify import/detection                       -> 178 files; 203,035 words; 0 sensitive skipped
+semantic extraction                             -> 103 nodes; 133 edges; 3 hyperedges; 11 cache hits; 5 re-extracted docs
+manifest/cost finalization                       -> 178 files stamped; token usage recorded as 0/0 because subagent usage was unavailable
+```
+
+The AST pass warned that the optional `tree_sitter_sql` dependency is not installed,
+so eight SQL files contributed no AST symbols. The graph remains usable, but SQL
+relationships are under-represented. The health warnings are also retained in
+`graphify-out/GRAPH_REPORT.md`.
+
+### Deliberately not done
+
+- No directed rebuild, Obsidian vault, wiki, Neo4j, FalkorDB, GraphML, SVG, MCP, or
+  watch export was requested.
+- No application behavior or provider/database verification was performed by this
+  graph run.
+- The generated report's token cost is 0/0 because the task runtime did not expose
+  subagent usage; no token estimate was invented.
+
+### Next step
+
+Use `graphify query` against `graphify-out/graph.json` to trace the cross-community
+relationship between `Scope`, tenant isolation, consent, routing, and provider-pinned
+object operations. Investigate the SQL-parser gap and graph health warnings before
+treating every structural relationship as complete.

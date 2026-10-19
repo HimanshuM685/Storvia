@@ -81,7 +81,8 @@ func (r *ObjectRepository) Get(ctx context.Context, scope Scope, objectID string
 const objectColumns = `id, tenant_id, user_id, logical_key, original_name, mime_type, category,
 	expected_size, verified_size, checksum_algorithm, verified_checksum,
 	provider, drive_connection_id, backend_id, provider_file_id, provider_object_key,
-	status, fallback_reason, selected_at, verified_at, row_version, created_at, updated_at, deleted_at`
+	status, fallback_reason, selected_at, verified_at, reconciliation_state, pinned_provider,
+	last_reconcile_at, reconcile_attempts, last_error_class, row_version, created_at, updated_at, deleted_at`
 
 func (r *ObjectRepository) scanOne(ctx context.Context, query string, args ...any) (model.LogicalObject, error) {
 	row := r.store.db.QueryRowContext(ctx, query, args...)
@@ -92,6 +93,10 @@ func (r *ObjectRepository) scanOne(ctx context.Context, query string, args ...an
 		checksumAlg sql.NullString
 		checksum    sql.NullString
 		fallbackWhy sql.NullString
+		pinned      sql.NullString
+		reconcileState sql.NullString
+		lastReconcileAt sql.NullTime
+		lastErrorClass sql.NullString
 		deletedAt   sql.NullTime
 		selectedAt  sql.NullTime
 		verifiedAt  sql.NullTime
@@ -102,7 +107,8 @@ func (r *ObjectRepository) scanOne(ctx context.Context, query string, args ...an
 		&object.MIMEType, &object.Category, &object.ExpectedSize, &object.VerifiedSize,
 		&checksumAlg, &checksum, &provider, &object.DriveConnectionID, &object.BackendID,
 		&object.ProviderFileID, &object.ProviderObjectKey, &object.Status, &fallbackWhy,
-		&selectedAt, &verifiedAt, &object.RowVersion, &object.CreatedAt, &object.UpdatedAt, &deletedAt,
+		&selectedAt, &verifiedAt, &reconcileState, &pinned, &lastReconcileAt, &object.ReconcileAttempts,
+		&lastErrorClass, &object.RowVersion, &object.CreatedAt, &object.UpdatedAt, &deletedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.LogicalObject{}, ErrNotFound
@@ -115,6 +121,16 @@ func (r *ObjectRepository) scanOne(ctx context.Context, query string, args ...an
 	object.VerifiedChecksum = checksum.String
 	object.FallbackReason = model.FallbackReason(fallbackWhy.String)
 	object.Provider = model.Provider(provider.String)
+	object.PinnedProvider = model.Provider(pinned.String)
+	object.ReconciliationState = model.ReconciliationState(reconcileState.String)
+	object.LastErrorClass = lastErrorClass.String
+	if object.ReconciliationState == "" {
+		object.ReconciliationState = model.ReconciliationNone
+	}
+	if lastReconcileAt.Valid {
+		value := lastReconcileAt.Time
+		object.LastReconcileAt = &value
+	}
 	if selectedAt.Valid {
 		value := selectedAt.Time
 		object.SelectedAt = &value
@@ -140,19 +156,35 @@ func (r *ObjectRepository) SelectLocation(ctx context.Context, scope Scope, obje
 		provider = ?, drive_connection_id = ?, backend_id = ?,
 		provider_file_id = CASE WHEN ? = 'google_drive' THEN ? ELSE provider_file_id END,
 		provider_object_key = CASE WHEN ? = 's3_compatible' THEN ? ELSE provider_object_key END,
-		fallback_reason = ?, selected_at = ?, status = 'uploading', row_version = row_version + 1, updated_at = ?
+		fallback_reason = ?, pinned_provider = ?, reconciliation_state = 'none', selected_at = ?, status = 'uploading', row_version = row_version + 1, updated_at = ?
 	WHERE id = ? AND tenant_id = ? AND user_id = ? AND row_version = ?`)
 
 	now := time.Now().UTC()
 	result, err := r.store.db.ExecContext(ctx, query,
 		string(provider), connectionID, backendID,
 		string(provider), identity, string(provider), identity,
-		nullable(string(reason)), now, now,
+		nullable(string(reason)), string(provider), now, now,
 		objectID, scope.TenantID, scope.UserID, expectedRowVersion)
 	if err != nil {
 		return fmt.Errorf("persistence: select location: %w", err)
 	}
 	return checkAffected(result, "select location")
+}
+
+// MarkReconciliation records one operator or worker reconciliation attempt.
+// The update is scoped and does not mutate the provider location.
+func (r *ObjectRepository) MarkReconciliation(ctx context.Context, scope Scope, objectID string, state model.ReconciliationState, errorClass string) error {
+	query := r.store.Rebind(`UPDATE storage_objects SET
+		reconciliation_state = ?, last_reconcile_at = ?, reconcile_attempts = reconcile_attempts + 1,
+		last_error_class = ?, updated_at = ?
+	WHERE id = ? AND tenant_id = ? AND user_id = ?`)
+	now := time.Now().UTC()
+	result, err := r.store.db.ExecContext(ctx, query, string(state), now, nullable(errorClass), now,
+		objectID, scope.TenantID, scope.UserID)
+	if err != nil {
+		return fmt.Errorf("persistence: mark reconciliation: %w", err)
+	}
+	return checkAffected(result, "mark reconciliation")
 }
 
 // CommitReady records the single verified provider location.
@@ -644,7 +676,8 @@ func (r *ObjectRepository) ListObjects(ctx context.Context, scope Scope, limit i
 	rows, err := r.store.db.QueryContext(ctx, r.store.Rebind(`
 		SELECT id, logical_key, original_name, mime_type, category, expected_size,
 		       provider, status, provider_object_key, provider_file_id, backend_id,
-		       created_at, updated_at
+		       reconciliation_state, pinned_provider, last_reconcile_at, reconcile_attempts,
+		       last_error_class, created_at, updated_at
 		FROM storage_objects
 		WHERE tenant_id = ? AND deleted_at IS NULL
 		ORDER BY created_at DESC, id DESC
@@ -663,10 +696,15 @@ func (r *ObjectRepository) ListObjects(ctx context.Context, scope Scope, limit i
 			key      sql.NullString
 			fileID   sql.NullString
 			backend  sql.NullString
+			reconcileState sql.NullString
+			pinned sql.NullString
+			lastReconcileAt sql.NullTime
+			lastErrorClass sql.NullString
 		)
 		if err := rows.Scan(&object.ID, &object.LogicalKey, &object.OriginalName,
 			&object.MIMEType, &object.Category, &size, &provider, &object.Status,
-			&key, &fileID, &backend, &object.CreatedAt, &object.UpdatedAt); err != nil {
+			&key, &fileID, &backend, &reconcileState, &pinned, &lastReconcileAt,
+			&object.ReconcileAttempts, &lastErrorClass, &object.CreatedAt, &object.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("persistence: scan object: %w", err)
 		}
 		object.ExpectedSize = size.Int64
@@ -674,6 +712,16 @@ func (r *ObjectRepository) ListObjects(ctx context.Context, scope Scope, limit i
 		object.ProviderObjectKey = nullableString(key)
 		object.ProviderFileID = nullableString(fileID)
 		object.BackendID = nullableString(backend)
+		object.ReconciliationState = model.ReconciliationState(reconcileState.String)
+		if object.ReconciliationState == "" {
+			object.ReconciliationState = model.ReconciliationNone
+		}
+		object.PinnedProvider = model.Provider(pinned.String)
+		object.LastErrorClass = lastErrorClass.String
+		if lastReconcileAt.Valid {
+			value := lastReconcileAt.Time
+			object.LastReconcileAt = &value
+		}
 		out = append(out, object)
 	}
 	if err := rows.Err(); err != nil {

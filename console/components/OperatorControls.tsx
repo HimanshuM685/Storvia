@@ -87,6 +87,26 @@ export function OperatorControls({ state, onChanged }: Props) {
           </Banner>
         </div>
       ) : null}
+
+      <details style={{ marginTop: 16 }}>
+        <summary>Read the outage-fallback disclosure (version {consent.disclosure.version})</summary>
+        <dl className="small" style={{ marginTop: 12 }}>
+          <dt>Destination</dt>
+          <dd>{consent.disclosure.destination}</dd>
+          <dt>Region</dt>
+          <dd>{consent.disclosure.region}</dd>
+          <dt>Operator access</dt>
+          <dd>{consent.disclosure.operator_access}</dd>
+          <dt>Encryption</dt>
+          <dd>{consent.disclosure.encryption}</dd>
+          <dt>Retention</dt>
+          <dd>{consent.disclosure.retention}</dd>
+          <dt>Deletion</dt>
+          <dd>{consent.disclosure.deletion}</dd>
+          <dt>Disconnect</dt>
+          <dd>{consent.disclosure.disconnect}</dd>
+        </dl>
+      </details>
     </Card>
   );
 }

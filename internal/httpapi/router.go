@@ -176,6 +176,8 @@ func Router(cfg Config) http.Handler {
 			"POST /console/api/folder":                     cfg.Console.EnsureFolder,
 			"POST /console/api/disconnect":                 cfg.Console.Disconnect,
 			"GET /console/api/objects/{object_id}/content": cfg.Console.DownloadContent,
+			"GET /console/api/objects/{object_id}/reconcile": cfg.Console.ReconciliationStatus,
+			"POST /console/api/objects/{object_id}/reconcile": cfg.Console.ForceReconcile,
 			"DELETE /console/api/objects":                  cfg.Console.DeleteAllObjects,
 			"DELETE /console/api/objects/{object_id}":      cfg.Console.DeleteObject,
 		} {

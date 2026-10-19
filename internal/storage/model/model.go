@@ -53,6 +53,19 @@ const (
 	ObjectMissing        ObjectStatus = "missing"
 )
 
+// ReconciliationState records the operator-visible reconciliation workflow.
+type ReconciliationState string
+
+const (
+	ReconciliationNone      ReconciliationState = "none"
+	ReconciliationPending   ReconciliationState = "pending"
+	ReconciliationRunning   ReconciliationState = "running"
+	ReconciliationCompleted ReconciliationState = "completed"
+	ReconciliationUnknown   ReconciliationState = "unknown"
+	ReconciliationMissing   ReconciliationState = "missing"
+	ReconciliationFailed    ReconciliationState = "failed"
+)
+
 // AttemptState is the lifecycle state of one provider upload attempt.
 type AttemptState string
 
@@ -110,6 +123,14 @@ type LogicalObject struct {
 	FallbackReason FallbackReason
 	SelectedAt     *time.Time
 	VerifiedAt     *time.Time
+	// PinnedProvider is the provider selected before a mutation may have started.
+	// It is kept separately from Provider so the operator can see the no-failover
+	// decision even while the object is still unresolved.
+	PinnedProvider      Provider
+	ReconciliationState ReconciliationState
+	LastReconcileAt     *time.Time
+	ReconcileAttempts   int
+	LastErrorClass      string
 
 	RowVersion int64
 	CreatedAt  time.Time

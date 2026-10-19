@@ -481,7 +481,7 @@ func buildServices(cfg *config.Config, store *persistence.Store, keyring secrets
 		WithJobs(persistence.NewJobRepository(store), logger)
 	connectionService := service.NewConnectionService(service.NewDriveConnector(driveClient))
 
-	appConsent := service.NewConsentService(consentRepo)
+	appConsent := service.NewConsentService(consentRepo, service.DisclosureForFallback(cfg.Fallback))
 
 	return uploads, objectService, connectionService, appConsent, nil
 }

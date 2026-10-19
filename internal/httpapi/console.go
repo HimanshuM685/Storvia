@@ -23,6 +23,7 @@ type ConsoleOptions struct {
 	Diagnostics DiagnosticsProvider
 	Folders     FolderEnsurer
 	Objects_    *persistence.ObjectRepository
+	Reconcile   ReconciliationController
 	Routing     RoutingControl
 	Faults      *FaultSwitch
 	Logger      *slog.Logger
@@ -49,6 +50,7 @@ func NewConsole(cfg AdminPanelConfig, opts ConsoleOptions) *Console {
 		diagnostics: opts.Diagnostics,
 		folders:     opts.Folders,
 		objects_:    opts.Objects_,
+		reconcile:   opts.Reconcile,
 		routing:     opts.Routing,
 		faults:      opts.Faults,
 		log:         log,

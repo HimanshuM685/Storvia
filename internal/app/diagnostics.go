@@ -184,6 +184,13 @@ func (c consentController) ConsentGranted(ctx context.Context, scope persistence
 	return view.Granted, nil
 }
 
+func (c consentController) ConsentDisclosure() service.FallbackDisclosure {
+	if c.svc == nil {
+		return service.DefaultFallbackDisclosure()
+	}
+	return c.svc.Disclosure()
+}
+
 func (c consentController) GrantConsent(ctx context.Context, scope persistence.Scope) error {
 	if c.svc == nil {
 		return errors.New("app: the consent service is not configured")
